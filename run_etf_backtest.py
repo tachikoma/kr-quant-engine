@@ -37,6 +37,13 @@ load_dotenv()
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
 ENABLE_TICKER_NAME_LOOKUP = os.environ.get("ENABLE_TICKER_NAME_LOOKUP", "0") == "1"
 
+# KRX 인증 정보 검증
+if not HAS_KRX_CREDENTIALS:
+    print("⚠️  경고: KRX_ID 또는 KRX_PW 환경 변수가 설정되지 않았습니다.")
+    print("   .env 파일을 생성하고 KRX 인증 정보를 설정해주세요.")
+    print("   예: cp .env.sample .env && nano .env")
+    print()
+
 INITIAL_CASH = 1_000_000
 OUTPUT_DIR = Path("outputs_etf_only")
 
@@ -147,15 +154,43 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 
 def get_price(ticker: str) -> pd.DataFrame:
-    return normalize_ohlcv(stock.get_market_ohlcv_by_date(START, END, ticker), ticker)
+    try:
+        return normalize_ohlcv(stock.get_market_ohlcv_by_date(START, END, ticker), ticker)
+    except Exception as e:
+        print(f"❌ 오류: 종목 {ticker} 데이터 조회 실패: {str(e)}")
+        raise RuntimeError(f"Cannot fetch price data for ticker {ticker}") from e
 
 
 def get_index_data() -> pd.DataFrame:
-    idx = stock.get_index_ohlcv_by_date(START, END, KOSPI_INDEX_CODE)
+    """KOSPI 지수 데이터를 조회하고 기술적 지표를 계산한다."""
+    if not HAS_KRX_CREDENTIALS:
+        raise RuntimeError(
+            "KRX 인증 정보가 필요합니다. KOSPI 지수 데이터를 조회할 수 없습니다.\n"
+            "다음 단계를 따르세요:\n"
+            "1. .env.sample을 참고하여 .env 파일을 생성하세요\n"
+            "2. KRX_ID와 KRX_PW를 설정하세요\n"
+            "3. 다시 실행하세요"
+        )
+    
+    try:
+        idx = stock.get_index_ohlcv_by_date(START, END, KOSPI_INDEX_CODE)
+    except Exception as e:
+        raise RuntimeError(
+            f"KOSPI 지수 데이터 조회 중 오류 발생: {str(e)}\n"
+            "KRX 인증 정보를 확인하고 다시 시도하세요."
+        ) from e
+    
     if idx is None or idx.empty:
         raise RuntimeError("No KOSPI index data returned.")
 
-    idx = idx.reset_index().rename(columns={"날짜": "date", "종가": "close"})
+    try:
+        idx = idx.reset_index().rename(columns={"날짜": "date", "종가": "close"})
+    except Exception as e:
+        raise RuntimeError(
+            f"KOSPI 지수 데이터 포맷 오류: {str(e)}\n"
+            "조회한 데이터 구조: {list(idx.columns)}"
+        ) from e
+    
     idx["date"] = pd.to_datetime(idx["date"])
     idx["market_ma"] = idx["close"].rolling(MARKET_MA_DAYS).mean()
     idx["market_ma_slope"] = idx["market_ma"] - idx["market_ma"].shift(MARKET_SLOPE_DAYS)
@@ -665,7 +700,17 @@ def summarize(df: pd.DataFrame, trades_dict: dict):
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    result, trades_dict = run()
+    try:
+        result, trades_dict = run()
+    except RuntimeError as e:
+        print(f"\n❌ 실행 중 오류 발생:\n{str(e)}")
+        exit(1)
+    except Exception as e:
+        print(f"\n❌ 예기치 않은 오류 발생: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+    
     if result.empty:
         raise RuntimeError("ETF-only backtest produced no result rows.")
 
