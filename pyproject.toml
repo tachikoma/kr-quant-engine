@@ -1,0 +1,24 @@
+[project]
+name = "kr-quant-engine"
+version = "0.1.0"
+description = "Korean ETF stock quant engine with pykrx and uv"
+requires-python = ">=3.10"
+dependencies = [
+    "pykrx>=1.2.7",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+    "pyarrow>=15.0",
+]
+
+[project.scripts]
+kr-quant-backtest = "run_etf_backtest:main"
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
