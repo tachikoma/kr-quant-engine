@@ -45,8 +45,8 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
 # .env를 가장 먼저 로드 — KRX_ID / KRX_PW 등이 이후 임포트에서 참조됨
 _load_dotenv()
 
-# 백테스트 전략 로직 재사용
-from run_etf_backtest import (
+# ETF 전략 공통 로직 재사용
+from etf_shared import (
     get_strategy_config,
     select_target_etfs,
     build_rebalance_orders,

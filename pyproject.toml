@@ -13,8 +13,8 @@ dependencies = [
     "pyarrow>=15.0",
 ]
 
-[project.scripts]
-kr-quant-backtest = "run_etf_backtest:main"
+# [project.scripts]
+# kr-quant-backtest = "run_etf_backtest:main"
 
 [tool.uv]
 package = false

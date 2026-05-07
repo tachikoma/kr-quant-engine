@@ -3,7 +3,6 @@ import os
 
 import numpy as np
 import pandas as pd
-from pykrx import stock
 
 START = "20160101"
 END = "20260430"
@@ -34,6 +33,9 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 
 load_dotenv()
+
+from pykrx import stock
+
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
 MARKET = "KOSPI"
 

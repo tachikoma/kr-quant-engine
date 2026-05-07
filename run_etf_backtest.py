@@ -1,9 +1,26 @@
 from pathlib import Path
+import json
 import os
 
 import numpy as np
 import pandas as pd
-from pykrx import stock
+
+from etf_shared import (
+    ETF_LIST,
+    ETF_MAX_POSITIONS,
+    ETF_SELL_RANK_BUFFER,
+    KOSPI_INDEX_CODE,
+    MARKET_MA_DAYS,
+    MARKET_SLOPE_DAYS,
+    REBALANCE_STEP_DAYS,
+    SLIPPAGE_PCT,
+    BUY_FEE_PCT,
+    SELL_FEE_PCT,
+    ETF_SELL_TAX_PCT,
+    rank_etfs,
+    apply_buy_cost,
+    apply_sell_value,
+)
 
 START = "20160101"
 END = "20260430"
@@ -34,6 +51,9 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 
 load_dotenv()
+
+from pykrx import stock
+
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
 ENABLE_TICKER_NAME_LOOKUP = os.environ.get("ENABLE_TICKER_NAME_LOOKUP", "0") == "1"
 
@@ -47,34 +67,22 @@ if not HAS_KRX_CREDENTIALS:
 INITIAL_CASH = 1_000_000
 OUTPUT_DIR = Path("outputs_etf_only")
 
-BUY_FEE_PCT = 0.00015
-SELL_FEE_PCT = 0.00015
-ETF_SELL_TAX_PCT = 0.0
-SLIPPAGE_PCT = 0.0005
+# 실행 모드: single(일반 백테스트) | experiment(슬리피지 민감도 비교)
+RUN_MODE = os.environ.get("ETF_BACKTEST_MODE", "single").strip().lower()
+
+# 일반 백테스트 기본 슬리피지(퍼센트 단위, 예: 0.001 = 10bp)
+BASE_SLIPPAGE = float(os.environ.get("ETF_BASE_SLIPPAGE", str(SLIPPAGE_PCT)))
+
 # 슬리피지 민감도 테스트 옵션(퍼센트 단위, 예: 0.0005 = 5bp)
 SLIPPAGE_OPTIONS = [0.0005, 0.001, 0.002, 0.003]
 
-REBALANCE_STEP_DAYS = 20
-KOSPI_INDEX_CODE = "1001"
-MARKET_MA_DAYS = 120
-MARKET_SLOPE_DAYS = 20
+# 단일 실행 시 벤치마크 비교 결과 포함 여부
+ENABLE_BENCHMARK = os.environ.get("ETF_ENABLE_BENCHMARK", "1") == "1"
 
 # 비교 실험을 위한 시장 필터(risk-on/off) 사용 여부
 USE_MARKET_FILTER = True
 
-# ETF 후보군: 장기 생존, 유동성, 국내/해외/섹터 분산을 고려한 기본 리스트.
-ETF_LIST = [
-    "069500",  # KODEX 200
-    "229200",  # KODEX 코스닥150
-    "091160",  # KODEX 반도체
-    "102110",  # TIGER 200
-    "143850",  # TIGER 미국S&P500선물(H)
-    "133690",  # TIGER 미국나스닥100
-]
-ETF_MAX_POSITIONS = 2
-REBALANCE_POSITION_OPTIONS = [1, 2, 3]
-ETF_SELL_RANK_BUFFER = 3
-
+# ETF 후보군 선택 관련 상수는 etf_shared 모듈에서 관리합니다.
 
 BENCHMARK_TICKER = "069500"  # KODEX 200
 
@@ -85,23 +93,6 @@ PERIODS = [
     ("2022_2023", "2022-01-01", "2023-12-31"),
     ("2024_2026", "2024-01-01", "2026-04-30"),
 ]
-
-
-def get_strategy_config() -> dict:
-    """백테스트와 라이브 드라이런 모듈에서 공통으로 쓰는 ETF 전략 설정을 반환한다."""
-    return {
-        "etf_list": ETF_LIST,
-        "max_positions": ETF_MAX_POSITIONS,
-        "sell_rank_buffer": ETF_SELL_RANK_BUFFER,
-        "rebalance_step_days": REBALANCE_STEP_DAYS,
-        "market_index_code": KOSPI_INDEX_CODE,
-        "market_ma_days": MARKET_MA_DAYS,
-        "market_slope_days": MARKET_SLOPE_DAYS,
-        "buy_fee_pct": BUY_FEE_PCT,
-        "sell_fee_pct": SELL_FEE_PCT,
-        "sell_tax_pct": ETF_SELL_TAX_PCT,
-        "default_slippage_pct": SLIPPAGE_PCT,
-    }
 
 
 def get_ticker_name(ticker: str) -> str:
@@ -215,26 +206,6 @@ def safe_get(series: pd.Series, key: str):
     return float(value)
 
 
-def zscore(series: pd.Series) -> pd.Series:
-    series = series.replace([np.inf, -np.inf], np.nan)
-    if series.notna().sum() < 2:
-        return pd.Series(0.0, index=series.index)
-    filled = series.fillna(series.median())
-    std = filled.std(ddof=0)
-    if std == 0 or np.isnan(std):
-        return pd.Series(0.0, index=series.index)
-    return (filled - filled.mean()) / std
-
-
-def apply_buy_cost(price: float, slippage: float) -> float:
-    return price * (1 + slippage) * (1 + BUY_FEE_PCT)
-
-
-def apply_sell_value(price: float, qty: int, sell_tax_pct: float, slippage: float) -> float:
-    sell_price = price * (1 - slippage)
-    return qty * sell_price * (1 - SELL_FEE_PCT - sell_tax_pct)
-
-
 def load_etf_price() -> pd.DataFrame:
     frames = []
     failed = []
@@ -268,111 +239,6 @@ def load_etf_price() -> pd.DataFrame:
     price["trend_ok"] = (price["close"] > price["ma20"]) & (price["ma20"] > price["ma60"])
     return price
 
-
-
-def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
-    df = snapshot.copy()
-    df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
-    if df.empty:
-        return df
-
-    df["score"] = 0.55 * zscore(df["ret_60"]) + 0.45 * zscore(df["ret_120"])
-    return df.sort_values("score", ascending=False).reset_index(drop=True)
-
-
-def select_target_etfs(snapshot: pd.DataFrame, max_positions: int = ETF_MAX_POSITIONS) -> list[str]:
-    """검증된 랭킹 로직으로 최신 스냅샷에서 목표 ETF 티커를 반환한다."""
-    ranked = rank_etfs(snapshot)
-    if ranked.empty:
-        return []
-    return ranked.head(max_positions)["ticker"].tolist()
-
-
-def build_rebalance_orders(
-    current_holdings: dict[str, int],
-    target_tickers: list[str],
-    latest_prices: dict[str, float],
-    available_cash: float,
-    max_positions: int = ETF_MAX_POSITIONS,
-    sell_rank_buffer: int = ETF_SELL_RANK_BUFFER,
-    slippage: float = SLIPPAGE_PCT,
-) -> list[dict]:
-    """
-    드라이런 리밸런싱 주문 목록을 생성한다.
-
-    current_holdings: ticker -> 수량
-    target_tickers: 선호 순위가 반영된 목표 티커 목록(상위 -> 하위)
-    latest_prices: ticker -> 체결 기준 가격
-    available_cash: 리밸런싱 전 사용 가능 현금
-
-    이 함수는 실제 주문을 실행하지 않고, 의도된 SELL/BUY 주문만 반환한다.
-    """
-    orders = []
-    holdings = dict(current_holdings)
-    cash = float(available_cash)
-    target_set = set(target_tickers[:max_positions])
-    target_rank = {ticker: idx + 1 for idx, ticker in enumerate(target_tickers)}
-
-    for ticker, qty in list(holdings.items()):
-        rank = target_rank.get(ticker)
-        keep_by_rank = rank is not None and rank <= sell_rank_buffer
-        if keep_by_rank:
-            continue
-
-        price = latest_prices.get(ticker)
-        if price is None or pd.isna(price) or price <= 0:
-            continue
-
-        estimated_value = apply_sell_value(price, qty, ETF_SELL_TAX_PCT, slippage)
-        cash += estimated_value
-        orders.append(
-            {
-                "side": "SELL",
-                "ticker": ticker,
-                "qty": qty,
-                "reference_price": price,
-                "estimated_value": estimated_value,
-                "reason": "ETF_REBALANCE",
-            }
-        )
-        holdings.pop(ticker, None)
-
-    slots = max(max_positions - len(holdings), 0)
-    buy_list = [ticker for ticker in target_tickers if ticker in target_set and ticker not in holdings][:slots]
-    if not buy_list or cash <= 0:
-        return orders
-
-    budget = cash / len(buy_list)
-    for ticker in buy_list:
-        price = latest_prices.get(ticker)
-        if price is None or pd.isna(price) or price <= 0:
-            continue
-
-        unit_cost = apply_buy_cost(price, slippage)
-        qty = int(budget // unit_cost)
-        if qty <= 0:
-            continue
-
-        cost = qty * unit_cost
-        if cost > cash:
-            qty = int(cash // unit_cost)
-            cost = qty * unit_cost
-        if qty <= 0:
-            continue
-
-        cash -= cost
-        orders.append(
-            {
-                "side": "BUY",
-                "ticker": ticker,
-                "qty": qty,
-                "reference_price": price,
-                "estimated_value": cost,
-                "reason": "ETF_REBALANCE",
-            }
-        )
-
-    return orders
 
 
 def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], index_df: pd.DataFrame, use_market_filter: bool = True, max_positions: int = ETF_MAX_POSITIONS, slippage: float = SLIPPAGE_PCT):
@@ -555,6 +421,25 @@ def calc_stats(df: pd.DataFrame, equity_col: str) -> dict:
     }
 
 
+def get_backtest_period(df: pd.DataFrame, equity_col: str) -> dict:
+    temp = df[["date", equity_col]].dropna().copy()
+    temp["date"] = pd.to_datetime(temp["date"])
+    temp = temp.sort_values("date")
+
+    start_dt = temp["date"].iloc[0]
+    end_dt = temp["date"].iloc[-1]
+    calendar_days = int((end_dt - start_dt).days)
+    years = max(calendar_days / 365.25, 1 / 365.25)
+
+    return {
+        "start": str(start_dt.date()),
+        "end": str(end_dt.date()),
+        "trading_days": int(len(temp)),
+        "calendar_days": calendar_days,
+        "years": years,
+    }
+
+
 def calc_period_stats(df: pd.DataFrame, equity_col: str, period_name: str, start: str, end: str) -> dict | None:
     temp = df[["date", equity_col]].dropna().copy()
     temp["date"] = pd.to_datetime(temp["date"])
@@ -629,7 +514,36 @@ def build_period_comparison(df: pd.DataFrame) -> pd.DataFrame:
     return comparison
 
 
-def run():
+def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
+    index_df = get_index_data()
+    common_dates = list(index_df["date"])
+
+    result, trades = run_etf_strategy(
+        INITIAL_CASH,
+        common_dates,
+        index_df,
+        use_market_filter=USE_MARKET_FILTER,
+        max_positions=ETF_MAX_POSITIONS,
+        slippage=BASE_SLIPPAGE,
+    )
+
+    if ENABLE_BENCHMARK:
+        benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
+        benchmark_curve = benchmark_curve[["date", "equity_kodex200_bh"]]
+        result = pd.merge(result, benchmark_curve, on="date", how="outer")
+
+    result = result.sort_values("date")
+    result["equity"] = result["equity"].ffill().fillna(INITIAL_CASH)
+    result["cash"] = result["cash"].ffill().fillna(INITIAL_CASH)
+    result["market_value"] = result["market_value"].ffill().fillna(0)
+
+    if ENABLE_BENCHMARK and "equity_kodex200_bh" in result.columns:
+        result["equity_kodex200_bh"] = result["equity_kodex200_bh"].ffill().fillna(INITIAL_CASH)
+
+    return result, trades
+
+
+def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     index_df = get_index_data()
     common_dates = list(index_df["date"])
 
@@ -669,9 +583,52 @@ def run():
 
 
 
-def summarize(df: pd.DataFrame, trades_dict: dict):
+def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict | None, dict]:
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
+
+    strategy_stats = calc_stats(df, "equity")
+    period = get_backtest_period(df, "equity")
+    invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).mean()
+
+    print("\n=== 일반 백테스트 결과 ===")
+    print(f"모드: single")
+    print(f"슬리피지: {BASE_SLIPPAGE * 10000:.0f}bp")
+    print(f"백테스트 기간: {period['start']} ~ {period['end']} ({period['trading_days']} 거래일, {period['years']:.2f}년)")
+    print(f"초기 자산: {strategy_stats['initial']:,.0f}")
+    print(f"최종 자산: {strategy_stats['final']:,.0f}")
+    print(f"누적 수익률: {strategy_stats['total_return']:.2%}")
+    print(f"CAGR: {strategy_stats['cagr']:.2%}")
+    print(f"MDD: {strategy_stats['mdd']:.2%}")
+    print(f"변동성(연환산): {strategy_stats['volatility']:.2%}")
+    print(f"샤프: {strategy_stats['sharpe']:.4f}")
+    print(f"거래 수: {len(trades)}")
+    print(f"평균 투자 비중: {invested_ratio:.4f}")
+
+    benchmark_stats = None
+    if ENABLE_BENCHMARK and "equity_kodex200_bh" in df.columns:
+        benchmark_stats = calc_stats(df, "equity_kodex200_bh")
+        print("\n=== 벤치마크(KODEX200 Buy&Hold) ===")
+        print(f"최종 자산: {benchmark_stats['final']:,.0f}")
+        print(f"누적 수익률: {benchmark_stats['total_return']:.2%}")
+        print(f"CAGR: {benchmark_stats['cagr']:.2%}")
+        print(f"MDD: {benchmark_stats['mdd']:.2%}")
+        print(f"샤프: {benchmark_stats['sharpe']:.4f}")
+        print("\n=== 벤치마크 대비 ===")
+        print(
+            "요약: "
+            f"누적수익률 {strategy_stats['total_return'] - benchmark_stats['total_return']:+.2%}, "
+            f"CAGR {strategy_stats['cagr'] - benchmark_stats['cagr']:+.2%}, "
+            f"MDD {strategy_stats['mdd'] - benchmark_stats['mdd']:+.2%}"
+        )
+
+    return strategy_stats, benchmark_stats, period
+
+
+def summarize_experiment(df: pd.DataFrame, trades_dict: dict):
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    period = get_backtest_period(df, "equity_kodex200_bh")
 
     rows = []
     benchmark_stats = calc_stats(df, "equity_kodex200_bh")
@@ -684,7 +641,7 @@ def summarize(df: pd.DataFrame, trades_dict: dict):
 
     comparison = pd.DataFrame(rows)
 
-    print(df.tail())
+    print(f"\n백테스트 기간: {period['start']} ~ {period['end']} ({period['trading_days']} 거래일, {period['years']:.2f}년)")
     print("\n=== 슬리피지 민감도 테스트 ===")
     display_cols = ["strategy", "final", "total_return", "cagr", "mdd", "volatility", "sharpe"]
     print(comparison[display_cols].to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
@@ -697,11 +654,33 @@ def summarize(df: pd.DataFrame, trades_dict: dict):
         print(f"\n=== ETF {label} 상세 ===")
         print(f"거래 수: {len(trades)}")
         print(f"평균 투자 비중: {invested_ratio:.4f}")
+
+
+def _to_json_serializable(stats: dict) -> dict:
+    serializable = {}
+    for key, value in stats.items():
+        if isinstance(value, (np.integer, np.floating)):
+            serializable[key] = float(value)
+        elif pd.isna(value):
+            serializable[key] = None
+        else:
+            serializable[key] = value
+    return serializable
+
+
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
+    if RUN_MODE not in {"single", "experiment"}:
+        print(f"\n❌ 잘못된 ETF_BACKTEST_MODE 값: {RUN_MODE}")
+        print("   허용값: single | experiment")
+        exit(1)
+
     try:
-        result, trades_dict = run()
+        if RUN_MODE == "single":
+            result, trades = run_single_mode()
+        else:
+            result, trades_dict = run_experiment_mode()
     except RuntimeError as e:
         print(f"\n❌ 실행 중 오류 발생:\n{str(e)}")
         exit(1)
@@ -714,20 +693,44 @@ def main():
     if result.empty:
         raise RuntimeError("ETF-only backtest produced no result rows.")
 
-    result.to_csv(OUTPUT_DIR / "etf_equity_curve.csv", index=False, encoding="utf-8-sig")
-    # 필요 시 슬리피지별 체결 내역 저장
-    for slip in SLIPPAGE_OPTIONS:
-        label = f"slip_{int(slip*10000)}bp"
-        trades_dict[label].to_csv(OUTPUT_DIR / f"etf_trades_{label}.csv", index=False, encoding="utf-8-sig")
-    cols = ["date", "equity_kodex200_bh"] + [f"equity_slip_{int(s*10000)}bp" for s in SLIPPAGE_OPTIONS]
-    result[cols].to_csv(OUTPUT_DIR / "slippage_comparison.csv", index=False, encoding="utf-8-sig")
+    if RUN_MODE == "single":
+        curve_to_save = result.copy()
+        curve_to_save = curve_to_save.rename(columns={"equity": "equity_strategy", "equity_kodex200_bh": "equity_benchmark"})
+        save_cols = ["date", "equity_strategy", "cash", "market_value", "holdings"]
+        if "equity_benchmark" in curve_to_save.columns:
+            save_cols.append("equity_benchmark")
+        curve_to_save[save_cols].to_csv(OUTPUT_DIR / "etf_equity_curve.csv", index=False, encoding="utf-8-sig")
+        trades.to_csv(OUTPUT_DIR / "etf_trades.csv", index=False, encoding="utf-8-sig")
 
-    summarize(result, trades_dict)
-    print(f"저장 완료: {OUTPUT_DIR / 'etf_equity_curve.csv'}")
-    for slip in SLIPPAGE_OPTIONS:
-        label = f"slip_{int(slip*10000)}bp"
-        print(f"저장 완료: {OUTPUT_DIR / f'etf_trades_{label}.csv'}")
-    print(f"저장 완료: {OUTPUT_DIR / 'slippage_comparison.csv'}")
+        strategy_stats, benchmark_stats, period = summarize_single(result, trades)
+        payload = {
+            "mode": "single",
+            "slippage": BASE_SLIPPAGE,
+            "period": _to_json_serializable(period),
+            "strategy": _to_json_serializable(strategy_stats),
+            "benchmark": _to_json_serializable(benchmark_stats) if benchmark_stats is not None else None,
+        }
+        with (OUTPUT_DIR / "performance.json").open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        print(f"저장 완료: {OUTPUT_DIR / 'etf_equity_curve.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'etf_trades.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'performance.json'}")
+    else:
+        result.to_csv(OUTPUT_DIR / "etf_equity_curve.csv", index=False, encoding="utf-8-sig")
+        # 필요 시 슬리피지별 체결 내역 저장
+        for slip in SLIPPAGE_OPTIONS:
+            label = f"slip_{int(slip*10000)}bp"
+            trades_dict[label].to_csv(OUTPUT_DIR / f"etf_trades_{label}.csv", index=False, encoding="utf-8-sig")
+        cols = ["date", "equity_kodex200_bh"] + [f"equity_slip_{int(s*10000)}bp" for s in SLIPPAGE_OPTIONS]
+        result[cols].to_csv(OUTPUT_DIR / "slippage_comparison.csv", index=False, encoding="utf-8-sig")
+
+        summarize_experiment(result, trades_dict)
+        print(f"저장 완료: {OUTPUT_DIR / 'etf_equity_curve.csv'}")
+        for slip in SLIPPAGE_OPTIONS:
+            label = f"slip_{int(slip*10000)}bp"
+            print(f"저장 완료: {OUTPUT_DIR / f'etf_trades_{label}.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'slippage_comparison.csv'}")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ risk:
 costs:
   buy_fee_pct: 0.00015
   sell_fee_pct: 0.00015
-  sell_tax_pct: 0.0018
+  sell_tax_pct: 0.0020
   slippage_pct: 0.0005
 
 data:
