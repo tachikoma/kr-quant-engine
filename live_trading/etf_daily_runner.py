@@ -618,11 +618,25 @@ def run_daily() -> None:
         _wait_until(cfg.plan_time)
 
     api = None
+    adapter_init_error: Exception | None = None
     if KiwoomAdapter is not None:
         try:
             api = KiwoomAdapter()
         except Exception as exc:
-            print(f"[경고] 키움 어댑터 초기화 실패, 안전 모드로 계속 진행합니다: {exc}")
+            adapter_init_error = exc
+            print(f"[경고] 키움 어댑터 초기화 실패: {exc}")
+
+    if cfg.enable_live_order and api is None:
+        if KiwoomAdapter is None:
+            raise RuntimeError(
+                "LIVE_ORDER_ENABLED=1 이지만 키움 어댑터를 로드하지 못했습니다. "
+                "실전 모드에서는 API 없이 진행할 수 없습니다."
+            )
+        raise RuntimeError(
+            "LIVE_ORDER_ENABLED=1 이지만 키움 어댑터 초기화에 실패했습니다. "
+            "실전 모드에서는 API 없이 진행할 수 없습니다. "
+            f"원인: {adapter_init_error}"
+        )
 
     run_id = str(uuid.uuid4())
     plan = _build_plan(cfg, api)
