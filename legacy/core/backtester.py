@@ -1,5 +1,5 @@
 import pandas as pd
-from strategy import add_price_features, score_universe, get_rebalance_dates
+from legacy.core.strategy import add_price_features, score_universe, get_rebalance_dates
 
 
 def _apply_buy_cost(value, cfg):

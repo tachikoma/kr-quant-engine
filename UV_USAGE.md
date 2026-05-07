@@ -15,10 +15,10 @@ uv run python run_etf_backtest.py
 uv run python run_etf_backtest.py
 ```
 
-- ETF 드라이런(실주문 없음)
+- ETF 하루 1회 실행 러너(기본 안전모드)
 
 ```bash
-uv run python live_trading/etf_dry_run.py
+uv run python live_trading/etf_daily_runner.py
 ```
 
 ## 3. 가상환경 동작

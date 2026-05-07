@@ -1,13 +1,18 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import yaml
 import pandas as pd
 
-from data_loader import get_tickers, load_or_fetch_ohlcv, load_or_fetch_fundamentals, fetch_index_ohlcv
-from backtester import run_backtest
-from performance import save_outputs
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from legacy.core.data_loader import get_tickers, load_or_fetch_ohlcv, load_or_fetch_fundamentals, fetch_index_ohlcv
+from legacy.core.backtester import run_backtest
+from legacy.core.performance import save_outputs
 
 
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
@@ -36,12 +41,13 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 def main():
     load_dotenv()
+    default_config = PROJECT_ROOT / "legacy" / "config" / "config.yaml"
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True, help="YYYYMMDD")
     parser.add_argument("--end", required=True, help="YYYYMMDD")
     parser.add_argument("--market", default="KOSPI", choices=["KOSPI", "KOSDAQ"])
     parser.add_argument("--max-tickers", type=int, default=200)
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default=str(default_config))
     parser.add_argument("--out", default="outputs")
     args = parser.parse_args()
 

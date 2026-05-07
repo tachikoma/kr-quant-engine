@@ -1,13 +1,13 @@
 # kr_quant_engine
 
-국내 ETF 로테이션 백테스트/드라이런 프로젝트입니다.
+국내 ETF 로테이션 백테스트/하루 1회 실행 프로젝트입니다.
 
 현재 운영 기준은 ETF 전용 시나리오이며, 실행 기준 스크립트는 run_etf_backtest.py 입니다.
 
 ## 현재 운영 방향
 
 - 주 실행 경로: run_etf_backtest.py
-- 실전 연결 전 검증 경로: live_trading/etf_dry_run.py
+- 실전 연결 전 검증 경로: live_trading/etf_daily_runner.py (기본 안전모드)
 - 데이터 소스: pykrx (ETF/지수 OHLCV)
 - 기본 리밸런싱: 20거래일 주기
 - 기본 비교 기준: KODEX 200 Buy&Hold
@@ -35,12 +35,6 @@ uv sync
 uv run python run_etf_backtest.py
 ```
 
-1. ETF 드라이런 실행(실주문 없음)
-
-```bash
-uv run python live_trading/etf_dry_run.py
-```
-
 1. ETF 하루 1회 실행 러너(기본 안전모드)
 
 ```bash
@@ -53,6 +47,12 @@ uv run python live_trading/etf_daily_runner.py
 
 - KRX_ID, KRX_PW: pykrx 인증이 필요한 환경에서 사용
 - ENABLE_TICKER_NAME_LOOKUP=1: 종목명 조회를 강제로 켜고 싶을 때만 사용
+
+ETF 백테스트(run_etf_backtest.py) 관련:
+
+- ETF_BACKTEST_MODE=single|experiment: 실행 모드(기본 single)
+- ETF_BASE_SLIPPAGE=0.0005: single 모드 기본 슬리피지(기본 5bp)
+- ETF_ENABLE_BENCHMARK=1: single 모드에서 KODEX200 비교 포함 여부(기본 1)
 
 하루 1회 실행 러너 관련:
 
@@ -105,7 +105,7 @@ uv run python live_trading/etf_daily_runner.py
 
 선택 매핑 키(계좌별 응답 차이 대응):
 
-- KIWOOM_ORDER_SIDE_KEY, KIWOOM_ORDER_TICKER_KEY, KIWOOM_ORDER_QTY_KEY
+- KIWOOM_ORDER_TICKER_KEY, KIWOOM_ORDER_QTY_KEY
 - KIWOOM_ORDER_PRICE_KEY, KIWOOM_ORDER_TYPE_KEY, KIWOOM_ORDER_ACCOUNT_KEY
 - KIWOOM_ORDER_ID_PATH
 - KIWOOM_ORDER_STATUS_ACCOUNT_KEY
@@ -116,6 +116,14 @@ uv run python live_trading/etf_daily_runner.py
 ## 주요 결과물
 
 run_etf_backtest.py 실행 후 outputs_etf_only 경로에 생성됩니다.
+
+single 모드(기본):
+
+- etf_equity_curve.csv
+- etf_trades.csv
+- performance.json
+
+experiment 모드(ETF_BACKTEST_MODE=experiment):
 
 - etf_equity_curve.csv
 - etf_trades_slip_5bp.csv
@@ -129,13 +137,14 @@ run_etf_backtest.py 실행 후 outputs_etf_only 경로에 생성됩니다.
 ## 디렉터리 가이드
 
 - run_etf_backtest.py: ETF 백테스트 메인
-- live_trading/etf_dry_run.py: 실전 전 주문 시뮬레이션
+- live_trading/etf_daily_runner.py: 실전 전 주문 계획/실행 러너(기본 안전모드)
 - live_trading/kiwoom_adapter.py: 키움 연동 어댑터(선택)
 - outputs_etf_only/: ETF 기준 결과물
 - data_cache/: 데이터 캐시
+- runtime_state/: 실전 러너 상태 파일(etf_daily_state.json)
 
 ## 주의사항
 
 - pykrx 데이터는 제공처 정책/호출 제한을 준수해야 합니다.
 - 백테스트는 미래 성과를 보장하지 않습니다.
-- 실전 적용 전 드라이런과 소액 검증을 권장합니다.
+- 실전 적용 전 etf_daily_runner 안전모드(LIVE_ORDER_ENABLED=0)와 소액 검증을 권장합니다.

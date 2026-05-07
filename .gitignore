@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 data_cache/
+runtime_state/
 outputs/
 outputs_*/
 .DS_Store

@@ -20,23 +20,24 @@ ETF 드라이런/라이브 실행용 키움 REST 어댑터.
 - KIWOOM_ACCOUNT_NO
 - KIWOOM_ACCESS_TOKEN
 - KIWOOM_TOKEN_URL
-- KIWOOM_CASH_ENDPOINT
-- KIWOOM_HOLDINGS_ENDPOINT
-- KIWOOM_PRICE_ENDPOINT
-- KIWOOM_ORDER_ENDPOINT
-- KIWOOM_ORDER_STATUS_ENDPOINT
-- KIWOOM_ORDER_CANCEL_ENDPOINT
+- KIWOOM_CASH_ENDPOINT, 기본값: /api/dostk/acnt
+- KIWOOM_CASH_API_ID, 기본값: kt00001
+- KIWOOM_HOLDINGS_ENDPOINT, 기본값: /api/dostk/acnt
+- KIWOOM_HOLDINGS_API_ID, 기본값: kt00018
+- KIWOOM_PRICE_ENDPOINT, 기본값: /api/dostk/mrkcond
+- KIWOOM_PRICE_API_ID, 기본값: ka10004
+- KIWOOM_ORDER_ENDPOINT, 기본값: /api/dostk/ordr
+- KIWOOM_ORDER_STATUS_ENDPOINT, 기본값: /api/dostk/acnt
+- KIWOOM_ORDER_CANCEL_ENDPOINT, 기본값: /api/dostk/ordr
 
 키움 REST 엔드포인트 경로와 JSON 응답 구조는 계좌/API 버전에 따라 다를 수 있으므로,
 이 어댑터는 설정 가능한 JSON 경로를 지원한다.
-- KIWOOM_CASH_PATH, 기본값: output.deposit
-- KIWOOM_HOLDINGS_PATH, 기본값: output
-- KIWOOM_HOLDINGS_TICKER_KEY, 기본값: ticker
-- KIWOOM_HOLDINGS_QTY_KEY, 기본값: quantity
-- KIWOOM_PRICE_PATH, 기본값: output.price
-- KIWOOM_ORDER_ID_PATH, 기본값: output.order_id
-- KIWOOM_ORDER_FILLED_QTY_PATH, 기본값: output.filled_qty
-- KIWOOM_ORDER_QTY_PATH, 기본값: output.order_qty
+- KIWOOM_CASH_PATH, 기본값: ord_alow_amt
+- KIWOOM_HOLDINGS_PATH, 기본값: acnt_evlt_remn_indv_tot
+- KIWOOM_HOLDINGS_TICKER_KEY, 기본값: stk_cd
+- KIWOOM_HOLDINGS_QTY_KEY, 기본값: rmnd_qty
+- KIWOOM_PRICE_PATH, 기본값: sel_fpr_bid  (ka10004 매도최우선호가)
+- KIWOOM_ORDER_ID_PATH, 기본값: ord_no
 
 주문/취소 기본 스펙(키움 REST 문서):
 - 매수 api-id: kt10000
@@ -51,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import requests
@@ -95,6 +97,10 @@ class KiwoomAdapter:
         self.account_no = os.environ.get("KIWOOM_ACCOUNT_NO", "")
         self.access_token = os.environ.get("KIWOOM_ACCESS_TOKEN", "")
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
+        self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
+        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", "1.0"))
+        self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", "0.2"))
+        self._last_request_ts = 0.0
 
         if not self.base_url:
             raise RuntimeError("KIWOOM_BASE_URL is required")
@@ -134,18 +140,49 @@ class KiwoomAdapter:
             headers["api-id"] = api_id
         return headers
 
+    def _throttle_request(self) -> None:
+        if self.http_min_interval <= 0:
+            return
+        elapsed = time.monotonic() - self._last_request_ts
+        wait_sec = self.http_min_interval - elapsed
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+
+    def _retry_delay(self, response: requests.Response | None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After", "").strip()
+            if retry_after:
+                try:
+                    return max(0.0, float(retry_after))
+                except ValueError:
+                    pass
+        return max(0.0, self.http_retry_delay)
+
     def _post(self, endpoint: str, payload: dict[str, Any], api_id: str | None = None) -> dict[str, Any]:
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
             url = endpoint
         else:
             url = f"{self.base_url}/{endpoint.lstrip('/')}"
 
-        response = requests.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
-        response.raise_for_status()
-        try:
-            return response.json()
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Invalid JSON response from {url}: {response.text[:500]}") from exc
+        response: requests.Response | None = None
+        for attempt in range(self.http_max_retries + 1):
+            self._throttle_request()
+            response = requests.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
+            self._last_request_ts = time.monotonic()
+
+            if response.status_code == 429 and attempt < self.http_max_retries:
+                time.sleep(self._retry_delay(response))
+                continue
+
+            response.raise_for_status()
+            try:
+                return response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON response from {url}: {response.text[:500]}") from exc
+
+        if response is not None:
+            response.raise_for_status()
+        raise RuntimeError(f"HTTP request failed without response: {url}")
 
     def _get_by_path(self, data: Any, path: str, default: Any = None) -> Any:
         current = data
@@ -196,48 +233,104 @@ class KiwoomAdapter:
         }
         return mapping.get(text, "3")
 
+    def _normalize_ticker(self, ticker: str) -> str:
+        text = str(ticker).strip()
+        if os.environ.get("KIWOOM_NORMALIZE_TICKER", "1").strip().lower() in {"1", "true", "yes", "y", "on"}:
+            if text.startswith("A") and len(text) == 7 and text[1:].isdigit():
+                return text[1:]
+        return text
+
+    def _raise_on_api_error(self, data: dict[str, Any], context: str) -> None:
+        """키움 공통 응답(return_code/return_msg) 에러를 명시적으로 처리한다."""
+        code = data.get("return_code")
+        if code is None:
+            return
+
+        code_text = str(code).strip()
+        if code_text in {"0", "0000", "OK", "ok"}:
+            return
+
+        message = str(data.get("return_msg", "")).strip()
+        raise RuntimeError(f"Kiwoom API error ({context}): return_code={code_text}, return_msg={message}")
+
+    def _build_account_payload(self, prefix: str) -> dict[str, Any]:
+        """계좌 조회 공통 파라미터를 환경변수 기반으로 구성한다."""
+        payload: dict[str, Any] = {}
+
+        account_key = os.environ.get(f"{prefix}_ACCOUNT_KEY", "account_no")
+        if self.account_no:
+            payload[account_key] = self.account_no
+
+        qry_tp = (
+            os.environ.get(f"{prefix}_QRY_TP")
+            or os.environ.get("KIWOOM_ACCOUNT_QRY_TP")
+            or os.environ.get("KIWOOM_ORDER_STATUS_QRY_TP")
+            or "1"
+        )
+        if qry_tp:
+            payload["qry_tp"] = str(qry_tp)
+
+        stk_bond_tp = os.environ.get(f"{prefix}_STK_BOND_TP") or os.environ.get("KIWOOM_ACCOUNT_STK_BOND_TP")
+        if stk_bond_tp:
+            payload["stk_bond_tp"] = str(stk_bond_tp)
+
+        sell_tp = os.environ.get(f"{prefix}_SELL_TP") or os.environ.get("KIWOOM_ACCOUNT_SELL_TP")
+        if sell_tp:
+            payload["sell_tp"] = str(sell_tp)
+
+        # prefix별 환경변수가 명시된 경우에만 포함(TR마다 필수 여부가 다름)
+        dmst_stex_tp = os.environ.get(f"{prefix}_DMST_STEX_TP") or os.environ.get("KIWOOM_DMST_STEX_TP")
+        if dmst_stex_tp:
+            payload["dmst_stex_tp"] = str(dmst_stex_tp)
+
+        raw_extra = os.environ.get(f"{prefix}_PAYLOAD_JSON", "").strip()
+        if raw_extra:
+            try:
+                extra = json.loads(raw_extra)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON in {prefix}_PAYLOAD_JSON: {raw_extra}") from exc
+            if not isinstance(extra, dict):
+                raise RuntimeError(f"{prefix}_PAYLOAD_JSON must be a JSON object")
+            payload.update(extra)
+
+        return payload
+
     def get_cash(self) -> float:
         """ETF 매수에 사용할 수 있는 예수금을 반환한다."""
-        endpoint = os.environ.get("KIWOOM_CASH_ENDPOINT")
-        if not endpoint:
-            raise RuntimeError("KIWOOM_CASH_ENDPOINT is required")
-
-        api_id = os.environ.get("KIWOOM_CASH_API_ID")
-        payload: dict[str, Any] = {}
-        if self.account_no:
-            payload["account_no"] = self.account_no
+        endpoint = os.environ.get("KIWOOM_CASH_ENDPOINT", "/api/dostk/acnt")
+        api_id = os.environ.get("KIWOOM_CASH_API_ID", "kt00001")
+        payload = self._build_account_payload("KIWOOM_CASH")
         data = self._post(endpoint, payload, api_id)
-        path = os.environ.get("KIWOOM_CASH_PATH", "output.deposit")
+        self._raise_on_api_error(data, context="get_cash")
+        path = os.environ.get("KIWOOM_CASH_PATH", "ord_alow_amt")
         value = self._get_by_path(data, path)
+        if value is None:
+            raise RuntimeError(f"Cash response path not found: path={path}, top_keys={list(data.keys())}")
         return self._to_number(value)
 
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""
-        endpoint = os.environ.get("KIWOOM_HOLDINGS_ENDPOINT")
-        if not endpoint:
-            raise RuntimeError("KIWOOM_HOLDINGS_ENDPOINT is required")
-
-        api_id = os.environ.get("KIWOOM_HOLDINGS_API_ID")
-        payload: dict[str, Any] = {}
-        if self.account_no:
-            payload["account_no"] = self.account_no
+        endpoint = os.environ.get("KIWOOM_HOLDINGS_ENDPOINT", "/api/dostk/acnt")
+        api_id = os.environ.get("KIWOOM_HOLDINGS_API_ID", "kt00018")
+        payload = self._build_account_payload("KIWOOM_HOLDINGS")
         data = self._post(endpoint, payload, api_id)
+        self._raise_on_api_error(data, context="get_holdings")
 
-        path = os.environ.get("KIWOOM_HOLDINGS_PATH", "output")
+        path = os.environ.get("KIWOOM_HOLDINGS_PATH", "acnt_evlt_remn_indv_tot")
         rows = self._get_by_path(data, path, [])
         if isinstance(rows, dict):
             rows = rows.get("list") or rows.get("items") or rows.get("rows") or []
         if not isinstance(rows, list):
             raise RuntimeError(f"Holdings response path did not resolve to list: path={path}, value={rows}")
 
-        ticker_key = os.environ.get("KIWOOM_HOLDINGS_TICKER_KEY", "ticker")
-        qty_key = os.environ.get("KIWOOM_HOLDINGS_QTY_KEY", "quantity")
+        ticker_key = os.environ.get("KIWOOM_HOLDINGS_TICKER_KEY", "stk_cd")
+        qty_key = os.environ.get("KIWOOM_HOLDINGS_QTY_KEY", "rmnd_qty")
 
         holdings: dict[str, int] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            ticker = str(row.get(ticker_key, "")).strip()
+            ticker = self._normalize_ticker(str(row.get(ticker_key, "")).strip())
             if not ticker:
                 continue
             qty = int(self._to_number(row.get(qty_key)))
@@ -247,13 +340,10 @@ class KiwoomAdapter:
 
     def get_prices(self, tickers: list[str]) -> dict[str, float]:
         """최근 체결/참조 가격을 ticker -> 가격 형태로 반환한다."""
-        endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT")
-        if not endpoint:
-            raise RuntimeError("KIWOOM_PRICE_ENDPOINT is required")
-
-        api_id = os.environ.get("KIWOOM_PRICE_API_ID")
-        price_path = os.environ.get("KIWOOM_PRICE_PATH", "output.price")
-        ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "ticker")
+        endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT", "/api/dostk/mrkcond")
+        api_id = os.environ.get("KIWOOM_PRICE_API_ID", "ka10004")
+        price_path = os.environ.get("KIWOOM_PRICE_PATH", "sel_fpr_bid")
+        ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "stk_cd")
 
         prices: dict[str, float] = {}
         for ticker in tickers:
@@ -314,17 +404,6 @@ class KiwoomAdapter:
         data = self._post(endpoint, payload, api_id)
         order_id_path = os.environ.get("KIWOOM_ORDER_ID_PATH", "ord_no")
         order_id = self._get_by_path(data, order_id_path)
-        if not order_id:
-            order_id = (
-                data.get("ord_no")
-                or data.get("orderId")
-                or data.get("order_id")
-                or data.get("odno")
-                or data.get("id")
-                or self._get_by_path(data, "output.ord_no")
-                or self._get_by_path(data, "output.odno")
-            )
-
         return {
             "order_id": "" if order_id is None else str(order_id),
             "response": data,

@@ -63,7 +63,7 @@ import pandas as pd
 from pykrx import stock
 
 
-STATE_DIR = PROJECT_ROOT / "data_cache" / "live_state"
+STATE_DIR = PROJECT_ROOT / "runtime_state"
 STATE_PATH = STATE_DIR / "etf_daily_state.json"
 
 # 기본 실행 시각: 한국 시장 개장 직전
@@ -133,10 +133,11 @@ def _date_to_iso(day: dt.date) -> str:
 
 
 def _load_state() -> dict[str, Any]:
-    if not STATE_PATH.exists():
-        return {}
-    with STATE_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    if STATE_PATH.exists():
+        with STATE_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    return {}
 
 
 def _save_state(state: dict[str, Any]) -> None:
