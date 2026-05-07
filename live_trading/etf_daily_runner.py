@@ -298,12 +298,14 @@ def _should_rebalance(today: str, state: dict[str, Any], step_days: int, referen
         return True
 
     trading_dates = _load_recent_trading_dates(reference_ticker=reference_ticker, lookback_days=220)
-    if today not in trading_dates or last not in trading_dates:
-        # 거래일 캘린더가 불완전한 경우 보수적으로 리밸런스하지 않음
+    if not trading_dates or last not in trading_dates:
+        # last_rebalance_date가 캘린더에 없으면 판단 불가
         return False
 
     last_idx = trading_dates.index(last)
-    today_idx = trading_dates.index(today)
+    # 장 전/중 실행 시 오늘 데이터가 아직 없을 수 있으므로
+    # today가 목록에 없으면 마지막 거래일 다음 거래일로 간주한다.
+    today_idx = trading_dates.index(today) if today in trading_dates else len(trading_dates)
     return (today_idx - last_idx) >= step_days
 
 

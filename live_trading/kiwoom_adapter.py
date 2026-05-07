@@ -18,8 +18,8 @@ ETF 드라이런/라이브 실행용 키움 REST 어댑터.
 
 선택 환경 변수:
 - KIWOOM_ACCOUNT_NO
-- KIWOOM_ACCESS_TOKEN
-- KIWOOM_TOKEN_URL
+- KIWOOM_TOKEN_ENDPOINT, 기본값: /oauth2/token
+- KIWOOM_TOKEN_API_ID, 기본값: au10001
 - KIWOOM_CASH_ENDPOINT, 기본값: /api/dostk/acnt
 - KIWOOM_CASH_API_ID, 기본값: kt00001
 - KIWOOM_HOLDINGS_ENDPOINT, 기본값: /api/dostk/acnt
@@ -95,7 +95,7 @@ class KiwoomAdapter:
         self.app_key = os.environ.get("KIWOOM_APPKEY", "")
         self.secret_key = os.environ.get("KIWOOM_SECRETKEY", "")
         self.account_no = os.environ.get("KIWOOM_ACCOUNT_NO", "")
-        self.access_token = os.environ.get("KIWOOM_ACCESS_TOKEN", "")
+        self.access_token = ""
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
         self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
         self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", "1.0"))
@@ -105,22 +105,32 @@ class KiwoomAdapter:
         if not self.base_url:
             raise RuntimeError("KIWOOM_BASE_URL is required")
 
-        if not self.access_token:
-            self.access_token = self._issue_token()
+        self.access_token = self._issue_token()
+
+    def _resolve_url(self, endpoint: str) -> str:
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            return endpoint
+        return f"{self.base_url}/{endpoint.lstrip('/')}"
 
     def _issue_token(self) -> str:
-        token_url = os.environ.get("KIWOOM_TOKEN_URL")
-        if not token_url:
-            raise RuntimeError("KIWOOM_ACCESS_TOKEN or KIWOOM_TOKEN_URL is required")
+        token_endpoint = os.environ.get("KIWOOM_TOKEN_ENDPOINT", "/oauth2/token")
+        token_api_id = os.environ.get("KIWOOM_TOKEN_API_ID", "au10001")
         if not self.app_key or not self.secret_key:
             raise RuntimeError("KIWOOM_APPKEY and KIWOOM_SECRETKEY are required to issue token")
 
+        token_url = self._resolve_url(token_endpoint)
         payload = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
             "secretkey": self.secret_key,
         }
-        response = requests.post(token_url, json=payload, timeout=self.timeout)
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        if token_api_id:
+            headers["api-id"] = token_api_id
+
+        response = requests.post(token_url, headers=headers, json=payload, timeout=self.timeout)
         response.raise_for_status()
         data = response.json()
 
@@ -159,10 +169,7 @@ class KiwoomAdapter:
         return max(0.0, self.http_retry_delay)
 
     def _post(self, endpoint: str, payload: dict[str, Any], api_id: str | None = None) -> dict[str, Any]:
-        if endpoint.startswith("http://") or endpoint.startswith("https://"):
-            url = endpoint
-        else:
-            url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        url = self._resolve_url(endpoint)
 
         response: requests.Response | None = None
         for attempt in range(self.http_max_retries + 1):
@@ -253,6 +260,14 @@ class KiwoomAdapter:
         message = str(data.get("return_msg", "")).strip()
         raise RuntimeError(f"Kiwoom API error ({context}): return_code={code_text}, return_msg={message}")
 
+    # prefix별 qry_tp / dmst_stex_tp 기본값 (.env.sample 기준)
+    _DEFAULT_QRY_TP: dict[str, str] = {
+        "KIWOOM_CASH": "2",
+    }
+    _DEFAULT_DMST_STEX_TP: dict[str, str] = {
+        "KIWOOM_HOLDINGS": "KRX",
+    }
+
     def _build_account_payload(self, prefix: str) -> dict[str, Any]:
         """계좌 조회 공통 파라미터를 환경변수 기반으로 구성한다."""
         payload: dict[str, Any] = {}
@@ -261,11 +276,12 @@ class KiwoomAdapter:
         if self.account_no:
             payload[account_key] = self.account_no
 
+        default_qry_tp = self._DEFAULT_QRY_TP.get(prefix, "1")
         qry_tp = (
             os.environ.get(f"{prefix}_QRY_TP")
             or os.environ.get("KIWOOM_ACCOUNT_QRY_TP")
             or os.environ.get("KIWOOM_ORDER_STATUS_QRY_TP")
-            or "1"
+            or default_qry_tp
         )
         if qry_tp:
             payload["qry_tp"] = str(qry_tp)
@@ -278,8 +294,13 @@ class KiwoomAdapter:
         if sell_tp:
             payload["sell_tp"] = str(sell_tp)
 
-        # prefix별 환경변수가 명시된 경우에만 포함(TR마다 필수 여부가 다름)
-        dmst_stex_tp = os.environ.get(f"{prefix}_DMST_STEX_TP") or os.environ.get("KIWOOM_DMST_STEX_TP")
+        # 환경변수 미설정 시 prefix별 기본값 사용(TR마다 필수 여부가 다름)
+        default_dmst = self._DEFAULT_DMST_STEX_TP.get(prefix, "")
+        dmst_stex_tp = (
+            os.environ.get(f"{prefix}_DMST_STEX_TP")
+            or os.environ.get("KIWOOM_DMST_STEX_TP")
+            or default_dmst
+        )
         if dmst_stex_tp:
             payload["dmst_stex_tp"] = str(dmst_stex_tp)
 
