@@ -76,6 +76,7 @@ class RunnerConfig:
     wait_until_open: bool
     enable_live_order: bool
     force: bool
+    force_rebalance: bool
     market_filter: bool
     rebalance_step_days: int
     market_ma_days: int
@@ -152,6 +153,7 @@ def _read_env_config() -> RunnerConfig:
         wait_until_open=_parse_bool("WAIT_UNTIL_MARKET_OPEN", True),
         enable_live_order=_parse_bool("LIVE_ORDER_ENABLED", False),
         force=_parse_bool("DAILY_RUN_FORCE", False),
+        force_rebalance=_parse_bool("FORCE_REBALANCE", False),
         market_filter=_parse_bool("USE_MARKET_FILTER", True),
         rebalance_step_days=int(strategy_cfg["rebalance_step_days"]),
         market_ma_days=int(strategy_cfg["market_ma_days"]),
@@ -336,12 +338,14 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
 
     state = _load_state()
     today = _date_to_iso(_today_kst())
-    rebalance_due = _should_rebalance(
+    rebalance_due = config.force_rebalance or _should_rebalance(
         today=today,
         state=state,
         step_days=config.rebalance_step_days,
         reference_ticker=etf_list[0],
     )
+    if config.force_rebalance:
+        print("[강제] FORCE_REBALANCE=1 — 리밸런싱 주기를 무시하고 강제 실행합니다.")
 
     if (not risk_on) or (not rebalance_due):
         target = []
