@@ -53,6 +53,7 @@ import json
 import os
 from pathlib import Path
 import time
+import threading
 from typing import Any
 
 import requests
@@ -98,8 +99,28 @@ class KiwoomAdapter:
         self.access_token = ""
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
         self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
-        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", "1.0"))
+        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", "0.2"))
         self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", "0.2"))
+        self.http_debug_response = os.environ.get("KIWOOM_HTTP_DEBUG_RESPONSE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        self.http_debug_body = os.environ.get("KIWOOM_HTTP_DEBUG_BODY", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        self.http_debug_body_limit = int(os.environ.get("KIWOOM_HTTP_DEBUG_BODY_LIMIT", "800"))
+        # 재시도 지연값 통합: 이제 재시도 대기값은 KIWOOM_HTTP_RETRY_DELAY 하나로 관리합니다.
+        # (기존 KIWOOM_API_RATE_LIMIT_RETRY_DELAY 환경변수는 더 이상 사용하지 않습니다.)
+        self.api_rate_limit_retry_delay = self.http_retry_delay
+        # 스레드 간 호출 간격 예약/동기화를 위한 락과 마지막 예약 타임스탬프
+        self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
 
         if not self.base_url:
@@ -130,7 +151,11 @@ class KiwoomAdapter:
         if token_api_id:
             headers["api-id"] = token_api_id
 
+        # 토큰 발급도 전체 호출 간 딜레이 규칙을 따르도록 한다.
+        self._throttle_request()
         response = requests.post(token_url, headers=headers, json=payload, timeout=self.timeout)
+        with self._throttle_lock:
+            self._last_request_ts = time.monotonic()
         response.raise_for_status()
         data = response.json()
 
@@ -151,10 +176,19 @@ class KiwoomAdapter:
         return headers
 
     def _throttle_request(self) -> None:
+        """스레드 안전하게 요청 시작 시점 간격을 보장한다.
+
+        예약(예약 타임스탬프)을 사용하여 동시에 여러 스레드가 진입해도
+        요청 시작 간격이 최소 `http_min_interval` 이상이 되도록 한다.
+        """
         if self.http_min_interval <= 0:
             return
-        elapsed = time.monotonic() - self._last_request_ts
-        wait_sec = self.http_min_interval - elapsed
+        now = time.monotonic()
+        with self._throttle_lock:
+            # 다음 요청 시작 시각을 예약한다.
+            expected = max(self._last_request_ts + self.http_min_interval, now)
+            self._last_request_ts = expected
+        wait_sec = expected - now
         if wait_sec > 0:
             time.sleep(wait_sec)
 
@@ -175,7 +209,18 @@ class KiwoomAdapter:
         for attempt in range(self.http_max_retries + 1):
             self._throttle_request()
             response = requests.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
-            self._last_request_ts = time.monotonic()
+            # 실제 요청 시작 시각을 최신 값으로 갱신(락으로 동기화)
+            with self._throttle_lock:
+                self._last_request_ts = time.monotonic()
+
+            if self.http_debug_response:
+                print(
+                    f"[HTTP] POST {endpoint} api-id={api_id or ''} status={response.status_code} "
+                    f"request={payload}"
+                )
+                if self.http_debug_body:
+                    body_text = response.text[: max(self.http_debug_body_limit, 0)]
+                    print(f"[HTTP] response(body): {body_text}")
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
@@ -183,13 +228,39 @@ class KiwoomAdapter:
 
             response.raise_for_status()
             try:
-                return response.json()
+                data = response.json()
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"Invalid JSON response from {url}: {response.text[:500]}") from exc
+
+            # 키움은 HTTP 200이어도 return_code로 API 제한(예: 5)을 내려줄 수 있다.
+            if self._is_api_rate_limited(data) and attempt < self.http_max_retries:
+                wait_sec = max(0.0, self.api_rate_limit_retry_delay)
+                if self.http_debug_response:
+                    code = data.get("return_code")
+                    msg = str(data.get("return_msg", "")).strip()
+                    print(
+                        f"[HTTP][재시도] API 제한 감지(return_code={code}, return_msg={msg}) "
+                        f"-> {wait_sec:.1f}초 대기 후 재시도"
+                    )
+                time.sleep(wait_sec)
+                continue
+
+            return data
 
         if response is not None:
             response.raise_for_status()
         raise RuntimeError(f"HTTP request failed without response: {url}")
+
+    def _is_api_rate_limited(self, data: dict[str, Any]) -> bool:
+        """키움 API 본문 기준 요청 제한 응답 여부를 판별한다."""
+        code = str(data.get("return_code", "")).strip()
+        msg = str(data.get("return_msg", "")).strip()
+
+        if code == "5":
+            return True
+        if "허용된 요청 개수를 초과" in msg:
+            return True
+        return False
 
     def _get_by_path(self, data: Any, path: str, default: Any = None) -> Any:
         current = data
@@ -213,7 +284,10 @@ class KiwoomAdapter:
         if isinstance(value, (int, float)):
             return float(value)
         text = str(value).strip().replace(",", "")
+        # +/- 부호 제거 (양수로 정규화)
         if text.startswith("+"):
+            text = text[1:]
+        if text.startswith("-"):
             text = text[1:]
         if text == "":
             return 0.0
@@ -246,6 +320,89 @@ class KiwoomAdapter:
             if text.startswith("A") and len(text) == 7 and text[1:].isdigit():
                 return text[1:]
         return text
+
+    def _candidate_price_paths(self) -> list[str]:
+        """가격 조회 응답에서 사용할 후보 경로 목록을 반환한다."""
+        raw = os.environ.get("KIWOOM_PRICE_PATH_CANDIDATES", "").strip()
+        if raw:
+            return [p.strip() for p in raw.split(",") if p.strip()]
+
+        primary = os.environ.get("KIWOOM_PRICE_PATH", "sel_fpr_bid").strip() or "sel_fpr_bid"
+        # 계좌/환경별 응답 래핑(output/data) 차이를 흡수하기 위한 기본 후보들
+        paths = [
+            primary,
+            f"output.{primary}",
+            f"data.{primary}",
+            "sel_fpr_bid",
+            "buy_fpr_bid",
+            "output.sel_fpr_bid",
+            "output.buy_fpr_bid",
+            "data.sel_fpr_bid",
+            "data.buy_fpr_bid",
+        ]
+
+        uniq: list[str] = []
+        for p in paths:
+            if p and p not in uniq:
+                uniq.append(p)
+        return uniq
+
+    def _candidate_price_tickers(self, ticker: str) -> list[str]:
+        """가격 조회 요청 시도용 티커 후보를 반환한다."""
+        text = str(ticker).strip()
+        if not text:
+            return []
+
+        candidates = [text]
+        try_a_prefix = os.environ.get("KIWOOM_PRICE_TRY_A_PREFIX", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if try_a_prefix and len(text) == 6 and text.isdigit():
+            candidates.append(f"A{text}")
+        return candidates
+
+    def _candidate_price_paths_for_side(self, side: str) -> list[str]:
+        """매수/매도 기준가 조회용 후보 경로를 반환한다."""
+        side_upper = side.upper()
+        if side_upper == "BUY":
+            raw = os.environ.get("KIWOOM_PRICE_PATH_BUY_CANDIDATES", "").strip()
+            if raw:
+                return [p.strip() for p in raw.split(",") if p.strip()]
+            primary = os.environ.get("KIWOOM_PRICE_PATH_BUY", "buy_fpr_bid").strip() or "buy_fpr_bid"
+            defaults = ["buy_fpr_bid", "sel_fpr_bid"]
+        else:
+            raw = os.environ.get("KIWOOM_PRICE_PATH_SELL_CANDIDATES", "").strip()
+            if raw:
+                return [p.strip() for p in raw.split(",") if p.strip()]
+            primary = os.environ.get("KIWOOM_PRICE_PATH_SELL", "sel_fpr_bid").strip() or "sel_fpr_bid"
+            defaults = ["sel_fpr_bid", "buy_fpr_bid"]
+
+        paths = [
+            primary,
+            f"output.{primary}",
+            f"data.{primary}",
+        ]
+        for key in defaults:
+            paths.extend([key, f"output.{key}", f"data.{key}"])
+
+        uniq: list[str] = []
+        for p in paths:
+            if p and p not in uniq:
+                uniq.append(p)
+        return uniq
+
+    def _extract_price_from_response(self, data: dict[str, Any], path_candidates: list[str]) -> tuple[float, str | None]:
+        """응답에서 가격을 추출하고 사용된 경로를 함께 반환한다."""
+        for path in path_candidates:
+            value = self._get_by_path(data, path)
+            price = self._to_number(value)
+            if price > 0:
+                return price, path
+        return 0.0, None
 
     def _raise_on_api_error(self, data: dict[str, Any], context: str) -> None:
         """키움 공통 응답(return_code/return_msg) 에러를 명시적으로 처리한다."""
@@ -363,20 +520,99 @@ class KiwoomAdapter:
         """최근 체결/참조 가격을 ticker -> 가격 형태로 반환한다."""
         endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT", "/api/dostk/mrkcond")
         api_id = os.environ.get("KIWOOM_PRICE_API_ID", "ka10004")
-        price_path = os.environ.get("KIWOOM_PRICE_PATH", "sel_fpr_bid")
         ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "stk_cd")
+        path_candidates = self._candidate_price_paths()
 
         prices: dict[str, float] = {}
         for ticker in tickers:
-            payload = {
-                ticker_payload_key: ticker,
-            }
-            data = self._post(endpoint, payload, api_id)
-            value = self._get_by_path(data, price_path)
-            price = self._to_number(value)
-            if price > 0:
-                prices[ticker] = price
+            if not str(ticker).strip():
+                continue
+
+            last_error: str | None = None
+            last_data: dict[str, Any] | None = None
+            resolved_price = 0.0
+            resolved_path: str | None = None
+            used_request_ticker = str(ticker)
+
+            for request_ticker in self._candidate_price_tickers(str(ticker)):
+                payload = {
+                    ticker_payload_key: request_ticker,
+                }
+                try:
+                    data = self._post(endpoint, payload, api_id)
+                    self._raise_on_api_error(data, context=f"get_prices:{request_ticker}")
+                    last_data = data
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+
+                price, used_path = self._extract_price_from_response(data, path_candidates)
+                if price > 0:
+                    resolved_price = price
+                    resolved_path = used_path
+                    used_request_ticker = request_ticker
+                    break
+
+            if resolved_price > 0:
+                prices[str(ticker)] = resolved_price
         return prices
+
+    def get_bid_ask_prices(self, tickers: list[str]) -> dict[str, dict[str, float]]:
+        """종목별 매수/매도 기준가를 함께 반환한다.
+
+        반환 형태:
+        {
+          "091160": {"buy_price": 12345.0, "sell_price": 12350.0},
+          ...
+        }
+        """
+        endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT", "/api/dostk/mrkcond")
+        api_id = os.environ.get("KIWOOM_PRICE_API_ID", "ka10004")
+        ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "stk_cd")
+        buy_path_candidates = self._candidate_price_paths_for_side("BUY")
+        sell_path_candidates = self._candidate_price_paths_for_side("SELL")
+
+        out: dict[str, dict[str, float]] = {}
+        for ticker in tickers:
+            ticker_text = str(ticker).strip()
+            if not ticker_text:
+                continue
+
+            last_error: str | None = None
+            last_data: dict[str, Any] | None = None
+            buy_price = 0.0
+            sell_price = 0.0
+            used_buy_path: str | None = None
+            used_sell_path: str | None = None
+            used_request_ticker = ticker_text
+
+            for request_ticker in self._candidate_price_tickers(ticker_text):
+                payload = {ticker_payload_key: request_ticker}
+                try:
+                    data = self._post(endpoint, payload, api_id)
+                    self._raise_on_api_error(data, context=f"get_bid_ask_prices:{request_ticker}")
+                    last_data = data
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+
+                sell_price, used_sell_path = self._extract_price_from_response(data, sell_path_candidates)
+                buy_price, used_buy_path = self._extract_price_from_response(data, buy_path_candidates)
+                used_request_ticker = request_ticker
+
+                if sell_price > 0 or buy_price > 0:
+                    break
+
+            quote: dict[str, float] = {}
+            if buy_price > 0:
+                quote["buy_price"] = buy_price
+            if sell_price > 0:
+                quote["sell_price"] = sell_price
+
+            if quote:
+                out[ticker_text] = quote
+
+        return out
 
     def place_order(
         self,
@@ -423,6 +659,7 @@ class KiwoomAdapter:
             payload[cond_price_key] = str(cond_price)
 
         data = self._post(endpoint, payload, api_id)
+        self._raise_on_api_error(data, context=f"place_order:{side_upper}")
         order_id_path = os.environ.get("KIWOOM_ORDER_ID_PATH", "ord_no")
         order_id = self._get_by_path(data, order_id_path)
         return {
@@ -460,27 +697,54 @@ class KiwoomAdapter:
             payload[account_key] = self.account_no
 
         data = self._post(endpoint, payload, api_id)
+        self._raise_on_api_error(data, context="get_order_status")
 
         list_key = os.environ.get("KIWOOM_ORDER_STATUS_LIST_KEY", "acnt_ord_cntr_prps_dtl")
-        rows = data.get(list_key) or []
+        rows = self._get_by_path(data, list_key, [])
+        if isinstance(rows, dict):
+            rows = rows.get("list") or rows.get("items") or rows.get("rows") or []
         if not isinstance(rows, list):
             rows = []
 
-        # fr_ord_no로 시작하는 첫 번째 레코드 중 ord_no가 일치하는 행을 찾는다.
-        # 일치하는 행이 없으면 첫 번째 행을 사용한다.
+        order_no_key = os.environ.get("KIWOOM_ORDER_STATUS_ORDER_NO_KEY", "ord_no")
+        filled_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_FILLED_QTY_KEY", "cntr_qty")
+        confirm_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_CONFIRM_QTY_KEY", "cnfm_qty")
+        order_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_ORDER_QTY_KEY", "ord_qty")
+        remaining_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_REMAINING_QTY_KEY", "ord_remnq")
+
+        # 반드시 주문번호가 일치하는 행만 사용한다.
+        # 일치 행이 없으면 다른 주문을 오인하지 않도록 미확인 상태로 반환한다.
         target_row: dict[str, Any] = {}
+        normalized_order_id = str(order_id).strip()
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if str(row.get("ord_no", "")).strip() == str(order_id).strip():
+            if str(row.get(order_no_key, "")).strip() == normalized_order_id:
                 target_row = row
                 break
-        if not target_row and rows:
-            target_row = rows[0] if isinstance(rows[0], dict) else {}
 
-        filled_qty = int(self._to_number(target_row.get("cntr_qty", 0)))
-        order_qty = int(self._to_number(target_row.get("ord_qty", 0)))
-        remaining_qty = int(self._to_number(target_row.get("ord_remnq", 0)))
+        if not target_row:
+            return {
+                "order_id": order_id,
+                "filled_qty": 0,
+                "order_qty": 0,
+                "remaining_qty": 0,
+                "is_filled": False,
+                "is_found": False,
+                "response": data,
+            }
+
+        filled_qty = int(self._to_number(target_row.get(filled_qty_key, 0)))
+        confirm_qty = int(self._to_number(target_row.get(confirm_qty_key, 0)))
+        if confirm_qty > filled_qty:
+            filled_qty = confirm_qty
+
+        order_qty = int(self._to_number(target_row.get(order_qty_key, 0)))
+        remaining_qty_raw = target_row.get(remaining_qty_key)
+        if remaining_qty_raw is None or str(remaining_qty_raw).strip() == "":
+            remaining_qty = max(order_qty - filled_qty, 0)
+        else:
+            remaining_qty = int(self._to_number(remaining_qty_raw))
 
         # ord_remnq == 0 이거나 cntr_qty >= ord_qty면 전량체결로 간주
         if order_qty > 0:
@@ -494,6 +758,7 @@ class KiwoomAdapter:
             "order_qty": order_qty,
             "remaining_qty": remaining_qty,
             "is_filled": is_filled,
+            "is_found": True,
             "response": data,
         }
 

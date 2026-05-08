@@ -94,6 +94,8 @@ class RunnerConfig:
     retry_unfilled_orders: bool
     retry_order_type: str
     retry_fill_timeout_sec: int
+    protect_external_holdings: bool
+    block_live_after_cutoff: bool
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -171,6 +173,8 @@ def _read_env_config() -> RunnerConfig:
         retry_unfilled_orders=_parse_bool("RETRY_UNFILLED_ORDERS", True),
         retry_order_type=os.environ.get("RETRY_ORDER_TYPE", "MARKET").upper(),
         retry_fill_timeout_sec=int(os.environ.get("RETRY_FILL_TIMEOUT_SEC", "90")),
+        protect_external_holdings=_parse_bool("PROTECT_EXTERNAL_HOLDINGS", True),
+        block_live_after_cutoff=_parse_bool("BLOCK_LIVE_AFTER_CUTOFF", True),
     )
 
 
@@ -180,6 +184,10 @@ def _cutoff_deadline(cutoff_time_hhmm: str, timeout_sec: int) -> dt.datetime:
     cutoff_time = _parse_hhmm(cutoff_time_hhmm)
     cutoff_dt = dt.datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
     return min(timeout_deadline, cutoff_dt)
+
+
+def _earlier_hhmm(left: str, right: str) -> str:
+    return left if _parse_hhmm(left) <= _parse_hhmm(right) else right
 
 
 def _wait_until(target_time_hhmm: str) -> None:
@@ -242,13 +250,24 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220) -> pd.DataFram
     start = _date_to_krx(start_day)
     end = _date_to_krx(end_day)
 
+    print(f"[데이터] ETF 가격 로드 시작: {len(etf_list)}개 티커, 기간={start}~{end}")
+    t0 = dt.datetime.now()
+
     frames: list[pd.DataFrame] = []
-    for ticker in etf_list:
+    for i, ticker in enumerate(etf_list, 1):
+        print(f"  ({i}/{len(etf_list)}) {ticker} 조회 중...", end=" ", flush=True)
+        t1 = dt.datetime.now()
         raw = stock.get_market_ohlcv_by_date(start, end, ticker)
+        elapsed = (dt.datetime.now() - t1).total_seconds()
         price = _normalize_ohlcv(raw, ticker)
         if price.empty:
+            print(f"데이터 없음 ({elapsed:.1f}초)")
             continue
+        print(f"완료 (행수={len(price)}, {elapsed:.1f}초)")
         frames.append(price)
+
+    total_elapsed = (dt.datetime.now() - t0).total_seconds()
+    print(f"[데이터] ETF 가격 로드 완료 ({total_elapsed:.1f}초 소요)")
 
     if not frames:
         raise RuntimeError("ETF 가격 데이터가 비어 있습니다.")
@@ -268,8 +287,12 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220) -> pd.DataFram
 def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) -> bool:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=260)
+    print(f"[시장필터] KOSPI 지수({market_index_code}) 조회 중... ", end="", flush=True)
+    t0 = dt.datetime.now()
     idx = stock.get_index_ohlcv_by_date(_date_to_krx(start_day), _date_to_krx(end_day), market_index_code)
+    elapsed = (dt.datetime.now() - t0).total_seconds()
     if idx is None or idx.empty:
+        print(f"데이터 없음 ({elapsed:.1f}초) → risk_on=True (기본값)")
         return True
 
     idx = idx.reset_index().rename(columns={"날짜": "date", "종가": "close"})
@@ -280,54 +303,122 @@ def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) 
     idx["market_ma_slope"] = idx["market_ma"] - idx["market_ma"].shift(slope_days)
     last = idx.iloc[-1]
     if pd.isna(last["market_ma"]) or pd.isna(last["market_ma_slope"]):
+        print(f"MA 계산 불가 ({elapsed:.1f}초) → risk_on=True (기본값)")
         return True
-    return bool((last["close"] >= last["market_ma"]) and (last["market_ma_slope"] >= 0))
+
+    risk_on = bool((last["close"] >= last["market_ma"]) and (last["market_ma_slope"] >= 0))
+    close_val = last["close"]
+    ma_val = last["market_ma"]
+    slope_val = last["market_ma_slope"]
+    print(
+        f"완료 ({elapsed:.1f}초) | "
+        f"종가={close_val:,.0f}, MA{ma_days}={ma_val:,.0f}, "
+        f"기울기({slope_days}일)={slope_val:+.1f} → risk_on={risk_on}"
+    )
+    return risk_on
 
 
 def _load_recent_trading_dates(reference_ticker: str, lookback_days: int = 120) -> list[str]:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=lookback_days)
+    print(f"[리밸런싱] 거래일 캘린더 조회 중({reference_ticker})... ", end="", flush=True)
+    t0 = dt.datetime.now()
     df = stock.get_market_ohlcv_by_date(_date_to_krx(start_day), _date_to_krx(end_day), reference_ticker)
+    elapsed = (dt.datetime.now() - t0).total_seconds()
     data = _normalize_ohlcv(df, reference_ticker)
     if data.empty:
+        print(f"데이터 없음 ({elapsed:.1f}초)")
         return []
-    return [d.date().isoformat() for d in sorted(data["date"].unique())]
+    dates = [d.date().isoformat() for d in sorted(data["date"].unique())]
+    print(f"완료 ({elapsed:.1f}초, 거래일 {len(dates)}개)")
+    return dates
 
 
 def _should_rebalance(today: str, state: dict[str, Any], step_days: int, reference_ticker: str) -> bool:
     last = state.get("last_rebalance_date")
     if not last:
+        print(f"[리밸런싱] 마지막 리밸런싱 기록 없음 → 즉시 실행")
         return True
 
     trading_dates = _load_recent_trading_dates(reference_ticker=reference_ticker, lookback_days=220)
     if not trading_dates or last not in trading_dates:
         # last_rebalance_date가 캘린더에 없으면 판단 불가
+        print(f"[리밸런싱] last={last}가 거래일 캘린더에 없음 → 스킵")
         return False
 
     last_idx = trading_dates.index(last)
     # 장 전/중 실행 시 오늘 데이터가 아직 없을 수 있으므로
     # today가 목록에 없으면 마지막 거래일 다음 거래일로 간주한다.
     today_idx = trading_dates.index(today) if today in trading_dates else len(trading_dates)
-    return (today_idx - last_idx) >= step_days
+    elapsed_days = today_idx - last_idx
+    due = elapsed_days >= step_days
+    print(
+        f"[리밸런싱] 마지막={last}, 경과={elapsed_days}거래일, 주기={step_days}일 → "
+        f"{'실행 예정' if due else '아직 아님'}"
+    )
+    return due
 
 
 def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
     strategy_cfg = get_strategy_config()
     etf_list = strategy_cfg["etf_list"]
+    external_holdings: dict[str, int] = {}
 
+    # 1단계: 잔고/예수금 조회
     if api is None:
-        # 어댑터가 없으면 최소한의 안전한 모의 데이터로 판단 단계만 수행
+        print("[계획수립] API 없음 — 모의 데이터로 판단만 수행")
         holdings = {"069500": 10}
         cash = 1_000_000.0
         latest_prices = {ticker: 100000.0 for ticker in etf_list}
+        latest_buy_prices = dict(latest_prices)
+        latest_sell_prices = dict(latest_prices)
+        holdings_for_rebalance = dict(holdings)
     else:
+        print("[계획수립] 잔고/예수금/현재가 조회 중...", end=" ", flush=True)
+        t0 = dt.datetime.now()
         holdings = api.get_holdings()
         cash = float(api.get_cash())
-        latest_prices = api.get_prices(etf_list)
 
+        if config.protect_external_holdings:
+            etf_set = set(etf_list)
+            external_holdings = {ticker: qty for ticker, qty in holdings.items() if ticker not in etf_set}
+            holdings_for_rebalance = {ticker: qty for ticker, qty in holdings.items() if ticker in etf_set}
+            if external_holdings:
+                print(f"\n[보호] 전략 유니버스 외 보유종목 {len(external_holdings)}개는 매도 대상에서 제외합니다.")
+        else:
+            holdings_for_rebalance = dict(holdings)
+
+        # 리밸런싱 대상 보유 종목만 포함해서 가격 조회
+        price_tickers = list(set(etf_list) | set(holdings_for_rebalance.keys()))
+        latest_prices = api.get_prices(price_tickers)
+        latest_buy_prices = dict(latest_prices)
+        latest_sell_prices = dict(latest_prices)
+        if hasattr(api, "get_bid_ask_prices"):
+            bid_ask_prices = api.get_bid_ask_prices(price_tickers)
+            for ticker in price_tickers:
+                row = bid_ask_prices.get(ticker, {})
+                buy_price = row.get("buy_price")
+                sell_price = row.get("sell_price")
+                if buy_price is not None:
+                    latest_buy_prices[ticker] = float(buy_price)
+                if sell_price is not None:
+                    latest_sell_prices[ticker] = float(sell_price)
+        elapsed = (dt.datetime.now() - t0).total_seconds()
+        print(f"완료 ({elapsed:.1f}초) | 보유종목={len(holdings)}개, 예수금={cash:,.0f}")
+
+    # 2단계: ETF 가격 스냅샷 로드
     snapshot = _load_snapshot(etf_list)
     ranked = rank_etfs(snapshot)
+    if not ranked.empty:
+        print("[랭킹] ETF 순위:")
+        for _, row in ranked.iterrows():
+            trend_mark = "✓" if row.get("trend_ok") else "✗"
+            print(
+                f"  {row['ticker']}  ret_60={row.get('ret_60', float('nan')):.2%}  "
+                f"ret_120={row.get('ret_120', float('nan')):.2%}  trend={trend_mark}"
+            )
 
+    # 3단계: 시장 필터
     risk_on = True
     if config.market_filter:
         risk_on = _load_market_risk_on(
@@ -335,7 +426,10 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
             ma_days=config.market_ma_days,
             slope_days=config.market_slope_days,
         )
+    else:
+        print("[시장필터] USE_MARKET_FILTER=0 — 시장 필터 비활성화")
 
+    # 4단계: 리밸런싱 주기 판단
     state = _load_state()
     today = _date_to_iso(_today_kst())
     rebalance_due = config.force_rebalance or _should_rebalance(
@@ -347,16 +441,41 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
     if config.force_rebalance:
         print("[강제] FORCE_REBALANCE=1 — 리밸런싱 주기를 무시하고 강제 실행합니다.")
 
-    if (not risk_on) or (not rebalance_due):
+    # 5단계: 목표 티커 결정
+    if not risk_on:
+        print("[계획수립] risk_on=False → 전량 매도 모드 (목표 티커 없음)")
+        target = []
+    elif not rebalance_due:
+        print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (주문 없음)")
         target = []
     else:
         target = ranked.head(config.max_positions)["ticker"].tolist() if not ranked.empty else []
+        print(f"[계획수립] 목표 티커 확정: {target}")
+
+    if target:
+        print("[계획수립] 목표 티커 가격 조회 결과:")
+        for ticker in target:
+            buy_price = latest_buy_prices.get(ticker)
+            sell_price = latest_sell_prices.get(ticker)
+            buy_bad = buy_price is None or pd.isna(buy_price) or buy_price <= 0
+            sell_bad = sell_price is None or pd.isna(sell_price) or sell_price <= 0
+            if buy_bad and sell_bad:
+                print(
+                    f"  {ticker}: 매수/매도 가격 미조회/비정상 "
+                    f"(buy={buy_price}, sell={sell_price})"
+                )
+            else:
+                buy_text = "N/A" if buy_bad else f"{float(buy_price):,.0f}"
+                sell_text = "N/A" if sell_bad else f"{float(sell_price):,.0f}"
+                print(f"  {ticker}: buy={buy_text}, sell={sell_text}")
 
     orders = build_rebalance_orders(
-        current_holdings=holdings,
+        current_holdings=holdings_for_rebalance,
         target_tickers=target,
         latest_prices=latest_prices,
         available_cash=cash,
+        latest_buy_prices=latest_buy_prices,
+        latest_sell_prices=latest_sell_prices,
         max_positions=config.max_positions,
         sell_rank_buffer=config.sell_rank_buffer,
     )
@@ -371,6 +490,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         "holdings": holdings,
         "cash": cash,
         "target": target,
+        "blocked_external_holdings": external_holdings,
         "ranked_top": ranked.head(10).to_dict(orient="records") if not ranked.empty else [],
         "sell_orders": sell_orders,
         "buy_orders": buy_orders,
@@ -589,15 +709,54 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
     print(f"실주문 모드: {'ON' if cfg.enable_live_order else 'OFF'}")
     print(f"매도 컷오프: {cfg.sell_cutoff_time}, 매수 컷오프: {cfg.buy_cutoff_time}")
     print(f"미체결 재주문: {'ON' if cfg.retry_unfilled_orders else 'OFF'} ({cfg.retry_order_type})")
+    print(f"유니버스 외 보유 매도 차단: {'ON' if cfg.protect_external_holdings else 'OFF'}")
+    print(f"컷오프 이후 실주문 차단: {'ON' if cfg.block_live_after_cutoff else 'OFF'}")
     print(f"보유종목수: {len(plan['holdings'])}, 예수금: {plan['cash']:,.0f}")
+    if plan['holdings']:
+        print("  현재 보유:")
+        for ticker, qty in plan['holdings'].items():
+            print(f"    {ticker}: {qty}주")
+    blocked_external = plan.get("blocked_external_holdings") or {}
+    if blocked_external:
+        print("  매도 제외(유니버스 외 보유):")
+        for ticker, qty in blocked_external.items():
+            print(f"    {ticker}: {qty}주")
     print(f"목표 티커: {plan['target']}")
     print(f"매도 주문 수: {len(plan['sell_orders'])}, 매수 주문 수: {len(plan['buy_orders'])}")
+    if plan['sell_orders']:
+        print("  매도 주문 상세:")
+        for o in plan['sell_orders']:
+            print(
+                f"    SELL {o['ticker']} {o['qty']}주 "
+                f"(참고가={o.get('reference_price', 0):,.0f}, "
+                f"예상금액={o.get('estimated_value', 0):,.0f})"
+            )
+    if plan['buy_orders']:
+        print("  매수 주문 상세:")
+        for o in plan['buy_orders']:
+            print(
+                f"    BUY  {o['ticker']} {o['qty']}주 "
+                f"(참고가={o.get('reference_price', 0):,.0f}, "
+                f"예상금액={o.get('estimated_value', 0):,.0f})"
+            )
+    if not plan['sell_orders'] and not plan['buy_orders']:
+        reason = []
+        if not plan['risk_on']:
+            reason.append("시장 필터 OFF (risk_on=False)")
+        if not plan['rebalance_due']:
+            reason.append("리밸런싱 주기 미도달")
+        if reason:
+            print(f"  주문 없음 사유: {', '.join(reason)}")
 
 
 def run_daily() -> None:
     cfg = _read_env_config()
     state = _load_state()
     today = _date_to_iso(_today_kst())
+
+    print(f"[시작] ETF 데일리 러너 — {today} {_now_kst().strftime('%H:%M:%S')} (KST)")
+    print(f"  LIVE_ORDER_ENABLED={cfg.enable_live_order}  FORCE={cfg.force}  FORCE_REBALANCE={cfg.force_rebalance}")
+    print(f"  max_positions={cfg.max_positions}  rebalance_step_days={cfg.rebalance_step_days}")
 
     if not _is_weekday(_today_kst()):
         print("[종료] 주말이므로 실행하지 않습니다.")
@@ -608,8 +767,24 @@ def run_daily() -> None:
         and state.get("trading_date") == today
         and state.get("status") in {"DONE", "NO_ACTION"}
     ):
-        print("[종료] 오늘은 이미 실행 완료 상태입니다. DAILY_RUN_FORCE=1로 강제 실행할 수 있습니다.")
+        print(
+            f"[종료] 오늘은 이미 실행 완료 상태입니다 (status={state.get('status')}). "
+            "DAILY_RUN_FORCE=1로 강제 실행할 수 있습니다."
+        )
         return
+
+    if cfg.enable_live_order and cfg.block_live_after_cutoff:
+        now_dt = _now_kst()
+        live_cutoff_hhmm = _earlier_hhmm(cfg.sell_cutoff_time, cfg.buy_cutoff_time)
+        live_cutoff_dt = dt.datetime.combine(now_dt.date(), _parse_hhmm(live_cutoff_hhmm), tzinfo=now_dt.tzinfo)
+        if now_dt >= live_cutoff_dt:
+            print(
+                f"[안전차단] 현재 시각({_now_kst().strftime('%H:%M:%S')})이 "
+                f"실주문 컷오프({live_cutoff_hhmm}) 이후입니다. "
+                "실주문 실행을 중단합니다."
+            )
+            print("[안내] 테스트가 목적이라면 LIVE_ORDER_ENABLED=0(드라이런)으로 실행하세요.")
+            return
 
     now = _now_kst().time()
     plan_time = _parse_hhmm(cfg.plan_time)
@@ -666,10 +841,16 @@ def run_daily() -> None:
         print("[안전모드] LIVE_ORDER_ENABLED=0 또는 어댑터 미사용 상태입니다. 실제 주문은 전송하지 않습니다.")
 
     # 1) 매도 우선
+    print(f"\n[주문] ─── 매도 단계 ───")
     sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1)
+    if sell_results:
+        for r in sell_results:
+            status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
+            print(f"  SELL {r['ticker']} {r['qty']}주 → {status_txt}")
     sell_retry_results: list[dict[str, Any]] = []
 
     if (not dry_run) and api is not None:
+        print(f"[주문] 매도 체결 대기 중 (타임아웃={cfg.sell_fill_timeout_sec}초, 컷오프={cfg.sell_cutoff_time})")
         sell_results = _poll_and_finalize_orders(
             api=api,
             submitted_results=sell_results,
@@ -678,6 +859,12 @@ def run_daily() -> None:
             cutoff_time_hhmm=cfg.sell_cutoff_time,
             cancel_unfilled_orders=cfg.cancel_unfilled_orders,
         )
+        for r in sell_results:
+            print(
+                f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+                f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
+                + (f" (타임아웃)" if r.get("timed_out") else "")
+            )
         if cfg.retry_unfilled_orders:
             retry_sell_orders = _build_retry_orders(sell_results)
             if retry_sell_orders:
@@ -711,9 +898,15 @@ def run_daily() -> None:
     can_buy = dry_run or _is_side_fully_filled(sell_results, sell_retry_results)
     buy_results: list[dict[str, Any]] = []
     buy_retry_results: list[dict[str, Any]] = []
+    print(f"\n[주문] ─── 매수 단계 ───")
     if can_buy:
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1)
+        if buy_results:
+            for r in buy_results:
+                status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
+                print(f"  BUY  {r['ticker']} {r['qty']}주 → {status_txt}")
         if (not dry_run) and api is not None:
+            print(f"[주문] 매수 체결 대기 중 (타임아웃={cfg.buy_fill_timeout_sec}초, 컷오프={cfg.buy_cutoff_time})")
             buy_results = _poll_and_finalize_orders(
                 api=api,
                 submitted_results=buy_results,
@@ -722,6 +915,12 @@ def run_daily() -> None:
                 cutoff_time_hhmm=cfg.buy_cutoff_time,
                 cancel_unfilled_orders=cfg.cancel_unfilled_orders,
             )
+            for r in buy_results:
+                print(
+                    f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+                    f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
+                    + (f" (타임아웃)" if r.get("timed_out") else "")
+                )
             if cfg.retry_unfilled_orders:
                 retry_buy_orders = _build_retry_orders(buy_results)
                 if retry_buy_orders:
@@ -771,10 +970,38 @@ def run_daily() -> None:
 
     print("=== 실행 결과 ===")
     print(f"실행 상태: {run_status}")
+    for r in sell_results + sell_retry_results:
+        print(
+            f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+            f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
+        )
+    for r in buy_results + buy_retry_results:
+        print(
+            f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+            f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
+        )
     print(f"매도 제출 건수: {len(sell_results)}")
     print(f"매수 제출 건수: {len(buy_results)}")
     print(f"상태 파일: {STATE_PATH}")
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ETF 하루 1회 실행 러너")
+    parser.add_argument(
+        "--force-live",
+        action="store_true",
+        help=(
+            "컷오프 이후에도 실주문 실행을 강제로 허용합니다. "
+            "매우 위험하니 프로덕션에서 신중히 사용하세요."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.force_live:
+        # 프로세스 환경변수로 안전차단 플래그를 덮어써서 컷오프 검사 우회
+        os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
+        print("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
+
     run_daily()

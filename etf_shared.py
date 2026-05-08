@@ -26,7 +26,7 @@ ETF_SELL_RANK_BUFFER = 3
 
 
 def get_strategy_config() -> dict:
-    """백테스트와 드라이런에서 공통으로 쓰는 ETF 전략 설정을 반환한다."""
+    """백테스트와 실전에서 공통으로 쓰는 ETF 전략 설정을 반환한다."""
     return {
         "etf_list": ETF_LIST,
         "max_positions": ETF_MAX_POSITIONS,
@@ -85,25 +85,36 @@ def build_rebalance_orders(
     target_tickers: list[str],
     latest_prices: dict[str, float],
     available_cash: float,
+    latest_buy_prices: dict[str, float] | None = None,
+    latest_sell_prices: dict[str, float] | None = None,
     max_positions: int = ETF_MAX_POSITIONS,
     sell_rank_buffer: int = ETF_SELL_RANK_BUFFER,
     slippage: float = SLIPPAGE_PCT,
 ) -> list[dict]:
-    """드라이런 리밸런싱 주문 목록을 생성한다."""
+    """리밸런싱 주문 목록을 생성한다."""
     orders = []
     holdings = dict(current_holdings)
     cash = float(available_cash)
+    buy_prices = latest_buy_prices or latest_prices
+    sell_prices = latest_sell_prices or latest_prices
     target_set = set(target_tickers[:max_positions])
     target_rank = {ticker: idx + 1 for idx, ticker in enumerate(target_tickers)}
+
+    print(
+        f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(target_tickers)}개, "
+        f"max_positions={max_positions}, 예수금={cash:,.0f}"
+    )
 
     for ticker, qty in list(holdings.items()):
         rank = target_rank.get(ticker)
         keep_by_rank = rank is not None and rank <= sell_rank_buffer
         if keep_by_rank:
+            print(f"[주문계산][매도스킵] {ticker} 보유유지 (랭크={rank}, 버퍼={sell_rank_buffer})")
             continue
 
-        price = latest_prices.get(ticker)
+        price = sell_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
+            print(f"[주문계산][매도스킵] {ticker} 매도가격 없음/비정상 (sell_price={price})")
             continue
 
         estimated_value = apply_sell_value(price, qty, ETF_SELL_TAX_PCT, slippage)
@@ -122,18 +133,29 @@ def build_rebalance_orders(
 
     slots = max(max_positions - len(holdings), 0)
     buy_list = [ticker for ticker in target_tickers if ticker in target_set and ticker not in holdings][:slots]
+    print(f"[주문계산] 매수 슬롯={slots}, 매수후보={buy_list}")
     if not buy_list or cash <= 0:
+        if not buy_list:
+            print("[주문계산] 매수 대상 없음 → 주문 생성 종료")
+        if cash <= 0:
+            print(f"[주문계산] 예수금 부족(cash={cash:,.0f}) → 주문 생성 종료")
         return orders
 
     budget = cash / len(buy_list)
+    print(f"[주문계산] 종목당 예산={budget:,.0f}")
     for ticker in buy_list:
-        price = latest_prices.get(ticker)
+        price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
+            print(f"[주문계산][매수스킵] {ticker} 매수가격 없음/비정상 (buy_price={price})")
             continue
 
         unit_cost = apply_buy_cost(price, slippage)
         qty = int(budget // unit_cost)
         if qty <= 0:
+            print(
+                f"[주문계산][매수스킵] {ticker} 수량 0 "
+                f"(budget={budget:,.0f}, unit_cost={unit_cost:,.0f})"
+            )
             continue
 
         cost = qty * unit_cost
@@ -141,6 +163,10 @@ def build_rebalance_orders(
             qty = int(cash // unit_cost)
             cost = qty * unit_cost
         if qty <= 0:
+            print(
+                f"[주문계산][매수스킵] {ticker} 잔여예수금 부족 "
+                f"(cash={cash:,.0f}, unit_cost={unit_cost:,.0f})"
+            )
             continue
 
         cash -= cost
@@ -154,5 +180,10 @@ def build_rebalance_orders(
                 "reason": "ETF_REBALANCE",
             }
         )
+
+    print(
+        f"[주문계산] 완료 | 매도={sum(1 for o in orders if o.get('side') == 'SELL')}건, "
+        f"매수={sum(1 for o in orders if o.get('side') == 'BUY')}건"
+    )
 
     return orders

@@ -43,6 +43,12 @@ uv run python live_trading/etf_daily_runner.py
 
 기본값은 안전모드(LIVE_ORDER_ENABLED=0)로 실제 주문을 전송하지 않고 계획만 생성/기록합니다.
 
+강제 우회(위험): 컷오프 안전장치를 우회하여 실주문을 허용하려면 아래처럼 실행하세요. 실제 주문이 발생하므로 신중히 사용하세요.
+
+```bash
+python live_trading/etf_daily_runner.py --force-live
+```
+
 ## 환경 변수(.env)
 
 - KRX_ID, KRX_PW: pykrx 인증이 필요한 환경에서 사용
