@@ -396,19 +396,31 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
 
 
 
-def calc_stats(df: pd.DataFrame, equity_col: str) -> dict:
+def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dict:
     temp = df[["date", equity_col]].dropna().copy()
     temp["date"] = pd.to_datetime(temp["date"])
-    temp = temp.sort_values("date")
-    temp["daily_ret"] = temp[equity_col].pct_change().fillna(0)
+    temp = temp.sort_values("date").reset_index(drop=True)
+
+    # 일간 수익률: 첫 관측치는 NaN이 되므로 분석에서 제외하기 위해 dropna() 사용
+    returns = temp[equity_col].pct_change().dropna()
 
     total_return = temp[equity_col].iloc[-1] / temp[equity_col].iloc[0] - 1
     years = max((temp["date"].iloc[-1] - temp["date"].iloc[0]).days / 365.25, 1 / 365.25)
     cagr = (temp[equity_col].iloc[-1] / temp[equity_col].iloc[0]) ** (1 / years) - 1
+
     drawdown = temp[equity_col] / temp[equity_col].cummax() - 1
     mdd = drawdown.min()
-    volatility = temp["daily_ret"].std() * np.sqrt(252)
-    sharpe = np.nan if volatility == 0 else temp["daily_ret"].mean() * 252 / volatility
+    # 주의: mdd는 음수로 반환됩니다 (예: -0.25 == -25% 최대 낙폭)
+
+    # 변동성은 모집단 기준(ddof=0) 표준편차로 계산
+    volatility = returns.std(ddof=0) * np.sqrt(252) if not returns.empty else 0.0
+
+    # 샤프: risk_free는 연간 비율(예: 0.01)을 입력, 기본 0
+    if volatility == 0:
+        sharpe = np.nan
+    else:
+        rf_daily = risk_free / 252
+        sharpe = (returns.mean() - rf_daily) * 252 / volatility
 
     return {
         "initial": temp[equity_col].iloc[0],
@@ -440,7 +452,14 @@ def get_backtest_period(df: pd.DataFrame, equity_col: str) -> dict:
     }
 
 
-def calc_period_stats(df: pd.DataFrame, equity_col: str, period_name: str, start: str, end: str) -> dict | None:
+def calc_period_stats(
+    df: pd.DataFrame,
+    equity_col: str,
+    period_name: str,
+    start: str,
+    end: str,
+    risk_free: float = 0.0,
+) -> dict | None:
     temp = df[["date", equity_col]].dropna().copy()
     temp["date"] = pd.to_datetime(temp["date"])
     start_dt = pd.Timestamp(start)
@@ -450,14 +469,21 @@ def calc_period_stats(df: pd.DataFrame, equity_col: str, period_name: str, start
     if len(temp) < 2:
         return None
 
-    temp["daily_ret"] = temp[equity_col].pct_change().fillna(0)
+    returns = temp[equity_col].pct_change().dropna()
     total_return = temp[equity_col].iloc[-1] / temp[equity_col].iloc[0] - 1
     years = max((temp["date"].iloc[-1] - temp["date"].iloc[0]).days / 365.25, 1 / 365.25)
     cagr = (temp[equity_col].iloc[-1] / temp[equity_col].iloc[0]) ** (1 / years) - 1
+
     drawdown = temp[equity_col] / temp[equity_col].cummax() - 1
     mdd = drawdown.min()
-    volatility = temp["daily_ret"].std() * np.sqrt(252)
-    sharpe = np.nan if volatility == 0 else temp["daily_ret"].mean() * 252 / volatility
+    # 주의: mdd는 음수로 반환됩니다 (예: -0.25 == -25% 최대 낙폭)
+
+    volatility = returns.std(ddof=0) * np.sqrt(252) if not returns.empty else 0.0
+    if volatility == 0:
+        sharpe = np.nan
+    else:
+        rf_daily = risk_free / 252
+        sharpe = (returns.mean() - rf_daily) * 252 / volatility
 
     return {
         "period": period_name,
