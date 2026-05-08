@@ -446,8 +446,10 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         print("[계획수립] risk_on=False → 전량 매도 모드 (목표 티커 없음)")
         target = []
     elif not rebalance_due:
-        print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (주문 없음)")
-        target = []
+        # 리밸런싱 미도달일에는 실제 주문을 생성하지 않지만, 플랜 상에는
+        # 현재 보유를 목표로 표시하여 '유지' 의도를 명확히 합니다.
+        print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)")
+        target = list(holdings_for_rebalance.keys())
     else:
         target = ranked.head(config.max_positions)["ticker"].tolist() if not ranked.empty else []
         print(f"[계획수립] 목표 티커 확정: {target}")
@@ -455,21 +457,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
     # rebalance_due=False 이고 시장이 위험상태(risk_on=True)인 경우
     # 리밸런싱이 필요 없으므로 주문 생성을 건너뛰고 즉시 빈 주문 계획을 반환한다.
     # (risk_on=False 인 경우는 전량 매도 모드이므로 기존 동작을 유지)
-    if not rebalance_due and risk_on:
-        print("[계획수립] rebalance_due=False 및 risk_on=True → 리밸런싱 미실행, 주문 생성 생략")
-        return {
-            "today": today,
-            "risk_on": risk_on,
-            "rebalance_due": rebalance_due,
-            "holdings": holdings,
-            "cash": cash,
-            "target": [],
-            "blocked_external_holdings": external_holdings,
-            "ranked_top": ranked.head(10).to_dict(orient="records") if not ranked.empty else [],
-            "sell_orders": [],
-            "buy_orders": [],
-            "all_orders": [],
-        }
+    # (방어) 빌드 함수에서 빈 target인 경우 매도를 허용할지 여부를 제어합니다.
 
     if target:
         print("[계획수립] 목표 티커 가격 조회 결과:")
@@ -497,6 +485,8 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         latest_sell_prices=latest_sell_prices,
         max_positions=config.max_positions,
         sell_rank_buffer=config.sell_rank_buffer,
+        allow_empty_target_sell=not risk_on,
+        generate_orders=rebalance_due,
     )
 
     sell_orders = [o for o in orders if o.get("side") == "SELL"]

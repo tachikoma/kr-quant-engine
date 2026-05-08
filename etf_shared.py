@@ -90,6 +90,8 @@ def build_rebalance_orders(
     max_positions: int = ETF_MAX_POSITIONS,
     sell_rank_buffer: int = ETF_SELL_RANK_BUFFER,
     slippage: float = SLIPPAGE_PCT,
+    allow_empty_target_sell: bool = False,
+    generate_orders: bool = True,
 ) -> list[dict]:
     """리밸런싱 주문 목록을 생성한다."""
     orders = []
@@ -99,6 +101,16 @@ def build_rebalance_orders(
     sell_prices = latest_sell_prices or latest_prices
     target_set = set(target_tickers[:max_positions])
     target_rank = {ticker: idx + 1 for idx, ticker in enumerate(target_tickers)}
+
+    # generate_orders=False이면 리밸런싱이 비활성화된 상태이므로 주문 생성을 건너뜁니다.
+    if not generate_orders:
+        print("[주문계산] generate_orders=False — 리밸런싱 미실행으로 주문 생성 생략")
+        return []
+
+    # 빈 target에 대해 '빈 target이면 전량매도'로 해석되는 것을 방지하기 위한 방어 로직
+    if not target_tickers and not allow_empty_target_sell:
+        print("[주문계산] target이 비어있고 빈 target에서 매도 허용이 아니므로 주문 생성 생략")
+        return []
 
     print(
         f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(target_tickers)}개, "
