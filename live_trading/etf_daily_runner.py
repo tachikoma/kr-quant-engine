@@ -896,6 +896,7 @@ def run_daily() -> None:
                 )
 
     # 2) 매도 후 예수금 재확인(실주문 모드에서만)
+    refreshed_cash = None
     if (not dry_run) and api is not None:
         try:
             refreshed_cash = _safe_float(api.get_cash())
@@ -907,6 +908,59 @@ def run_daily() -> None:
     can_buy = dry_run or _is_side_fully_filled(sell_results, sell_retry_results)
     buy_results: list[dict[str, Any]] = []
     buy_retry_results: list[dict[str, Any]] = []
+
+    # 매도 체결이 완료되어 실제 매수가 가능한 경우(실거래)에는
+    # 매도 완료 후의 실제 예수금/보유를 기준으로 매수 주문을 재계산합니다.
+    if can_buy and (not dry_run) and api is not None:
+        try:
+            refreshed_holdings = api.get_holdings()
+            print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
+        except Exception as exc:
+            print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
+            refreshed_holdings = plan.get("holdings", {})
+
+        price_tickers = list(set(plan.get("target", [])) | set(refreshed_holdings.keys()))
+        try:
+            latest_prices_after = api.get_prices(price_tickers)
+            latest_buy_prices_after = dict(latest_prices_after)
+            latest_sell_prices_after = dict(latest_prices_after)
+            if hasattr(api, "get_bid_ask_prices"):
+                bid_ask = api.get_bid_ask_prices(price_tickers)
+                for ticker in price_tickers:
+                    row = bid_ask.get(ticker, {})
+                    buy_price = row.get("buy_price")
+                    sell_price = row.get("sell_price")
+                    if buy_price is not None:
+                        latest_buy_prices_after[ticker] = float(buy_price)
+                    if sell_price is not None:
+                        latest_sell_prices_after[ticker] = float(sell_price)
+        except Exception as exc:
+            print(f"[경고] 매도 후 가격 재조회 실패: {exc}")
+            latest_prices_after = {}
+            latest_buy_prices_after = {}
+            latest_sell_prices_after = {}
+
+        try:
+            new_orders = build_rebalance_orders(
+                current_holdings=refreshed_holdings,
+                target_tickers=plan.get("target", []),
+                latest_prices=latest_prices_after,
+                available_cash=refreshed_cash if refreshed_cash is not None else 0.0,
+                latest_buy_prices=latest_buy_prices_after,
+                latest_sell_prices=latest_sell_prices_after,
+                max_positions=cfg.max_positions,
+                sell_rank_buffer=cfg.sell_rank_buffer,
+                allow_empty_target_sell=not plan.get("risk_on", True),
+                generate_orders=True,
+            )
+            new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
+            plan["buy_orders"] = new_buy_orders
+            print(
+                f"[정보] 매도 후 실제 상태로 매수 주문 재계산: 매수 후보={len(new_buy_orders)}건, "
+                f"예수금={refreshed_cash:,.0f}"
+            )
+        except Exception as exc:
+            print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
     print(f"\n[주문] ─── 매수 단계 ───")
     if can_buy:
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1)
