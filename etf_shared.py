@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import numpy as np
 import pandas as pd
 
@@ -7,6 +8,9 @@ BUY_FEE_PCT = 0.00015
 SELL_FEE_PCT = 0.00015
 ETF_SELL_TAX_PCT = 0.0
 SLIPPAGE_PCT = 0.0005
+# 시장 스프레드(전 종목 공통 기본값). 실제 매매 시 매수는 price*(1+spread/2),
+# 매도는 price*(1-spread/2) 로 가정합니다. 기본값 0으로 두어 기존 동작을 보존합니다.
+SPREAD_PCT = float(os.environ.get("ETF_SPREAD_PCT", "0.0"))
 
 REBALANCE_STEP_DAYS = 20
 KOSPI_INDEX_CODE = "1001"
@@ -39,6 +43,7 @@ def get_strategy_config() -> dict:
         "sell_fee_pct": SELL_FEE_PCT,
         "sell_tax_pct": ETF_SELL_TAX_PCT,
         "default_slippage_pct": SLIPPAGE_PCT,
+        "spread_pct": SPREAD_PCT,
     }
 
 

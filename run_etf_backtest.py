@@ -17,6 +17,7 @@ from etf_shared import (
     BUY_FEE_PCT,
     SELL_FEE_PCT,
     ETF_SELL_TAX_PCT,
+    SPREAD_PCT,
     rank_etfs,
     apply_buy_cost,
     apply_sell_value,
@@ -280,9 +281,10 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 open_price = safe_get(next_open, ticker)
                 if open_price is None:
                     continue
-
+                # 매도는 실전처럼 호가 스프레드를 고려: 매도 체결가는 reference_open * (1 - spread/2)
+                exec_sell_price = open_price * (1 - SPREAD_PCT / 2)
                 qty = holdings.pop(ticker)
-                cash += apply_sell_value(open_price, qty, ETF_SELL_TAX_PCT, slippage)
+                cash += apply_sell_value(exec_sell_price, qty, ETF_SELL_TAX_PCT, slippage)
                 trades.append(
                     {
                         "date": next_dt,
@@ -291,7 +293,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                         "side": "SELL",
                         "reason": "ETF_REBALANCE",
                         "qty": qty,
-                        "price": open_price,
+                        "price": exec_sell_price,
                         "cash_after": cash,
                     }
                 )
@@ -304,8 +306,9 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     open_price = safe_get(next_open, ticker)
                     if open_price is None:
                         continue
-
-                    unit_cost = apply_buy_cost(open_price, slippage)
+                    # 매수는 매수호가(ask)를 가정: reference_open * (1 + spread/2)
+                    exec_buy_price = open_price * (1 + SPREAD_PCT / 2)
+                    unit_cost = apply_buy_cost(exec_buy_price, slippage)
                     qty = int(budget // unit_cost)
                     if qty <= 0:
                         continue
@@ -327,7 +330,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                             "side": "BUY",
                             "reason": "ETF_REBALANCE",
                             "qty": qty,
-                            "price": open_price,
+                            "price": exec_buy_price,
                             "cash_after": cash,
                         }
                     )
@@ -375,7 +378,9 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
             open_price = safe_get(next_open, BENCHMARK_TICKER)
             if open_price is None:
                 continue
-            unit_cost = apply_buy_cost(open_price, SLIPPAGE_PCT)
+            # 벤치마크 매수도 스프레드 반영
+            exec_buy_price = open_price * (1 + SPREAD_PCT / 2)
+            unit_cost = apply_buy_cost(exec_buy_price, SLIPPAGE_PCT)
             qty = int(cash // unit_cost)
             if qty > 0:
                 cash -= qty * unit_cost
