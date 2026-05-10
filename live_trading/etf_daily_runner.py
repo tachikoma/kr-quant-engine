@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import csv
 import sys
 import time
 import uuid
@@ -29,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs
+from config_utils import parse_pct_env
 
 try:
     from live_trading.kiwoom_adapter import KiwoomAdapter
@@ -65,6 +67,7 @@ from pykrx import stock
 
 STATE_DIR = PROJECT_ROOT / "runtime_state"
 STATE_PATH = STATE_DIR / "etf_daily_state.json"
+OUTPUT_DIR = PROJECT_ROOT / "outputs_etf_only"
 
 # 기본 실행 시각: 한국 시장 개장 직전
 DEFAULT_PLAN_TIME = "08:50"
@@ -96,6 +99,11 @@ class RunnerConfig:
     retry_fill_timeout_sec: int
     protect_external_holdings: bool
     block_live_after_cutoff: bool
+    # 실전에서 인위적 슬리피지 적용 여부 및 값
+    apply_slippage_in_live: bool
+    live_slippage_pct: float
+    # 실전에서 API가 없을 때의 호가 스프레드 fallback
+    spread_pct: float
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -149,6 +157,125 @@ def _save_state(state: dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def _extract_exec_price(row: dict) -> float | None:
+    """주문 상태/응답에서 체결가를 찾아 반환합니다. API 스펙이 다양하므로 여러 키를 시도합니다."""
+    candidates = [
+        "executed_price",
+        "avg_filled_price",
+        "avg_fill_price",
+        "avg_price",
+        "filled_price",
+        "fill_price",
+        "exec_price",
+        "price",
+    ]
+
+    for container_key in ("last_status", "response"):
+        cont = row.get(container_key)
+        if isinstance(cont, dict):
+            for key in candidates:
+                if key in cont:
+                    try:
+                        return float(cont.get(key))
+                    except Exception:
+                        return None
+            # trades 리스트 내부 탐색
+            trades = cont.get("trades") or cont.get("filled_trades") or cont.get("exec_trades")
+            if isinstance(trades, list) and trades:
+                for t in trades:
+                    if isinstance(t, dict):
+                        for k in ("price", "trade_price", "exec_price"):
+                            if k in t:
+                                try:
+                                    return float(t.get(k))
+                                except Exception:
+                                    return None
+
+    # 직접 row 레벨에 가격이 있을 수 있음
+    for key in candidates:
+        if key in row:
+            try:
+                return float(row.get(key))
+            except Exception:
+                return None
+
+    return None
+
+
+def _append_execution_log(executed_orders: list[dict], run_id: str, trading_date: str) -> None:
+    """`outputs_etf_only/execution_log.csv`에 실행 결과를 append합니다."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / "execution_log.csv"
+    header = [
+        "run_id",
+        "trading_date",
+        "timestamp",
+        "order_id",
+        "ticker",
+        "side",
+        "mode",
+        "requested_qty",
+        "filled_qty",
+        "remaining_qty",
+        "is_filled",
+        "executed_price",
+        "error",
+        "status",
+    ]
+
+    rows = []
+    ts = _now_kst().isoformat()
+    for r in executed_orders:
+        order_id = r.get("order_id", "") or ""
+        ticker = r.get("ticker", "")
+        side = r.get("side", "")
+        mode = r.get("mode", "")
+        requested = int(r.get("requested_qty", r.get("qty", 0) or 0))
+        filled = int(r.get("filled_qty", 0) or 0)
+        remaining = int(r.get("remaining_qty", max(requested - filled, 0)) or 0)
+        is_filled = bool(r.get("is_filled", False))
+        exec_price = _extract_exec_price(r)
+        error = r.get("error", "") or ""
+        status_summary = ""
+        try:
+            status_summary = json.dumps(r.get("last_status") or r.get("response") or {}, ensure_ascii=False)
+        except Exception:
+            status_summary = str(r.get("last_status") or r.get("response") or "")
+
+        rows.append(
+            [
+                run_id,
+                trading_date,
+                ts,
+                order_id,
+                ticker,
+                side,
+                mode,
+                requested,
+                filled,
+                remaining,
+                is_filled,
+                (exec_price if exec_price is not None else ""),
+                error,
+                status_summary,
+            ]
+        )
+
+    write_header = not path.exists()
+    try:
+        import csv as _csv
+
+        with path.open("a", encoding="utf-8", newline="") as f:
+            writer = _csv.writer(f)
+            if write_header:
+                writer.writerow(header)
+            for row in rows:
+                writer.writerow(row)
+    except Exception as e:
+        print(f"⚠️ 실행로그 저장 실패: {e}")
+
+
+
 def _read_env_config() -> RunnerConfig:
     strategy_cfg = get_strategy_config()
     return RunnerConfig(
@@ -175,6 +302,9 @@ def _read_env_config() -> RunnerConfig:
         retry_fill_timeout_sec=int(os.environ.get("RETRY_FILL_TIMEOUT_SEC", "90")),
         protect_external_holdings=_parse_bool("PROTECT_EXTERNAL_HOLDINGS", True),
         block_live_after_cutoff=_parse_bool("BLOCK_LIVE_AFTER_CUTOFF", True),
+        apply_slippage_in_live=_parse_bool("APPLY_SLIPPAGE_IN_LIVE", False),
+        live_slippage_pct=parse_pct_env("LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)),
+        spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
     )
 
 
@@ -486,6 +616,9 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         max_positions=config.max_positions,
         sell_rank_buffer=config.sell_rank_buffer,
         allow_empty_target_sell=not risk_on,
+        # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
+        # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
+        slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
         generate_orders=rebalance_due,
     )
 
@@ -1030,6 +1163,10 @@ def run_daily() -> None:
         "last_rebalance_date": today if plan["rebalance_due"] else state.get("last_rebalance_date"),
     }
     _save_state(new_state)
+    try:
+        _append_execution_log(executed_orders, run_id, today)
+    except Exception as exc:
+        print(f"⚠️ 실행로그 기록 중 오류: {exc}")
 
     print("=== 실행 결과 ===")
     print(f"실행 상태: {run_status}")

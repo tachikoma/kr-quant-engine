@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import os
 import numpy as np
 import pandas as pd
 
 BUY_FEE_PCT = 0.00015
 SELL_FEE_PCT = 0.00015
 ETF_SELL_TAX_PCT = 0.0
-SLIPPAGE_PCT = 0.0005
-# 시장 스프레드(전 종목 공통 기본값). 실제 매매 시 매수는 price*(1+spread/2),
-# 매도는 price*(1-spread/2) 로 가정합니다. 기본값 0으로 두어 기존 동작을 보존합니다.
-SPREAD_PCT = float(os.environ.get("ETF_SPREAD_PCT", "0.0"))
 
 REBALANCE_STEP_DAYS = 20
 KOSPI_INDEX_CODE = "1001"
@@ -29,6 +24,10 @@ ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
 
+# (기존 .env 로드 로직 제거) 백테스트 전용 환경 변수는
+# 백테스트 모듈에서 관리하도록 이동했습니다.
+
+
 def get_strategy_config() -> dict:
     """백테스트와 실전에서 공통으로 쓰는 ETF 전략 설정을 반환한다."""
     return {
@@ -42,8 +41,10 @@ def get_strategy_config() -> dict:
         "buy_fee_pct": BUY_FEE_PCT,
         "sell_fee_pct": SELL_FEE_PCT,
         "sell_tax_pct": ETF_SELL_TAX_PCT,
-        "default_slippage_pct": SLIPPAGE_PCT,
-        "spread_pct": SPREAD_PCT,
+        # 기본 슬리피지/스프레드는 백테스트와 실전에서 공통으로 참고할 수 있게 노출합니다.
+        # 단위: 비율 (예: 0.0005 == 5bp)
+        "default_slippage_pct": 0.0005,
+        "spread_pct": 0.0005,
     }
 
 
@@ -94,7 +95,7 @@ def build_rebalance_orders(
     latest_sell_prices: dict[str, float] | None = None,
     max_positions: int = ETF_MAX_POSITIONS,
     sell_rank_buffer: int = ETF_SELL_RANK_BUFFER,
-    slippage: float = SLIPPAGE_PCT,
+    slippage: float = 0.0005,
     allow_empty_target_sell: bool = False,
     generate_orders: bool = True,
 ) -> list[dict]:

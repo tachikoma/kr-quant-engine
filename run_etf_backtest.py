@@ -13,14 +13,14 @@ from etf_shared import (
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     REBALANCE_STEP_DAYS,
-    SLIPPAGE_PCT,
     BUY_FEE_PCT,
     SELL_FEE_PCT,
     ETF_SELL_TAX_PCT,
-    SPREAD_PCT,
     rank_etfs,
     apply_buy_cost,
     apply_sell_value,
+    build_rebalance_orders,
+    get_strategy_config,
 )
 
 START = "20160101"
@@ -53,6 +53,16 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 load_dotenv()
 
+# 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
+# ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
+# ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
+from config_utils import parse_pct_env
+
+strategy_cfg = get_strategy_config()
+SLIPPAGE_PCT = parse_pct_env("ETF_BASE_SLIPPAGE", strategy_cfg.get("default_slippage_pct", 0.0005))
+SPREAD_PCT = parse_pct_env("ETF_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005))
+BASE_SLIPPAGE = SLIPPAGE_PCT
+
 from pykrx import stock
 
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
@@ -72,7 +82,6 @@ OUTPUT_DIR = Path("outputs_etf_only")
 RUN_MODE = os.environ.get("ETF_BACKTEST_MODE", "single").strip().lower()
 
 # 일반 백테스트 기본 슬리피지(퍼센트 단위, 예: 0.001 = 10bp)
-BASE_SLIPPAGE = float(os.environ.get("ETF_BASE_SLIPPAGE", str(SLIPPAGE_PCT)))
 
 # 슬리피지 민감도 테스트 옵션(퍼센트 단위, 예: 0.0005 = 5bp)
 SLIPPAGE_OPTIONS = [0.0005, 0.001, 0.002, 0.003]
@@ -267,59 +276,66 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
         should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
 
         if should_rebalance:
+            # 시장 필터 + 랭킹으로 목표 종목 결정
             risk_on = is_risk_on(index_df, dt) if use_market_filter else True
             ranked = rank_etfs(today.reset_index())
-            target_rank = dict(zip(ranked["ticker"], ranked.index + 1)) if not ranked.empty else {}
             targets = ranked.head(max_positions)["ticker"].tolist() if risk_on else []
 
-            for ticker in list(holdings.keys()):
-                rank = target_rank.get(ticker)
-                keep_by_rank = rank is not None and rank <= ETF_SELL_RANK_BUFFER and risk_on
-                if keep_by_rank:
-                    continue
+            # 최신 참조가격(다음 시가)을 기반으로 호가 스프레드를 적용한 매수/매도 참조가격 사전 생성
+            latest_prices = next_open.to_dict()
+            all_tickers = set(holdings.keys()) | set(targets)
+            latest_buy_prices = {}
+            latest_sell_prices = {}
+            for t in all_tickers:
+                op = safe_get(next_open, t)
+                if op is None:
+                    latest_buy_prices[t] = None
+                    latest_sell_prices[t] = None
+                else:
+                    latest_buy_prices[t] = op * (1 + SPREAD_PCT / 2)
+                    latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
-                open_price = safe_get(next_open, ticker)
-                if open_price is None:
-                    continue
-                # 매도는 실전처럼 호가 스프레드를 고려: 매도 체결가는 reference_open * (1 - spread/2)
-                exec_sell_price = open_price * (1 - SPREAD_PCT / 2)
-                qty = holdings.pop(ticker)
-                cash += apply_sell_value(exec_sell_price, qty, ETF_SELL_TAX_PCT, slippage)
-                trades.append(
-                    {
-                        "date": next_dt,
-                        "ticker": ticker,
-                        "name": get_ticker_name(ticker),
-                        "side": "SELL",
-                        "reason": "ETF_REBALANCE",
-                        "qty": qty,
-                        "price": exec_sell_price,
-                        "cash_after": cash,
-                    }
-                )
+            # 실전 주문 생성 로직 재사용
+            orders = build_rebalance_orders(
+                current_holdings=holdings,
+                target_tickers=targets,
+                latest_prices=latest_prices,
+                available_cash=cash,
+                latest_buy_prices=latest_buy_prices,
+                latest_sell_prices=latest_sell_prices,
+                max_positions=max_positions,
+                sell_rank_buffer=ETF_SELL_RANK_BUFFER,
+                slippage=slippage,
+                allow_empty_target_sell=False,
+                generate_orders=True,
+            )
 
-            slots = max(max_positions - len(holdings), 0)
-            buy_list = [ticker for ticker in targets if ticker not in holdings][:slots]
-            if buy_list and cash > 0:
-                budget = cash / len(buy_list)
-                for ticker in buy_list:
-                    open_price = safe_get(next_open, ticker)
-                    if open_price is None:
-                        continue
-                    # 매수는 매수호가(ask)를 가정: reference_open * (1 + spread/2)
-                    exec_buy_price = open_price * (1 + SPREAD_PCT / 2)
-                    unit_cost = apply_buy_cost(exec_buy_price, slippage)
-                    qty = int(budget // unit_cost)
+            # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)
+            for o in orders:
+                ticker = o.get("ticker")
+                qty = int(o.get("qty", 0))
+                ref_price = o.get("reference_price")
+                side = o.get("side")
+
+                if side == "SELL":
+                    holdings.pop(ticker, None)
+                    cash += float(o.get("estimated_value", 0.0))
+                    trades.append(
+                        {
+                            "date": next_dt,
+                            "ticker": ticker,
+                            "name": get_ticker_name(ticker),
+                            "side": "SELL",
+                            "reason": o.get("reason", "ETF_REBALANCE"),
+                            "qty": qty,
+                            "price": ref_price,
+                            "cash_after": cash,
+                        }
+                    )
+                else:  # BUY
+                    cost = float(o.get("estimated_value", 0.0))
                     if qty <= 0:
                         continue
-
-                    cost = qty * unit_cost
-                    if cost > cash:
-                        qty = int(cash // unit_cost)
-                        cost = qty * unit_cost
-                    if qty <= 0:
-                        continue
-
                     holdings[ticker] = holdings.get(ticker, 0) + qty
                     cash -= cost
                     trades.append(
@@ -328,9 +344,9 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                             "ticker": ticker,
                             "name": get_ticker_name(ticker),
                             "side": "BUY",
-                            "reason": "ETF_REBALANCE",
+                            "reason": o.get("reason", "ETF_REBALANCE"),
                             "qty": qty,
-                            "price": exec_buy_price,
+                            "price": ref_price,
                             "cash_after": cash,
                         }
                     )
@@ -625,6 +641,7 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     print("\n=== 일반 백테스트 결과 ===")
     print(f"모드: single")
     print(f"슬리피지: {BASE_SLIPPAGE * 10000:.0f}bp")
+    print(f"스프레드: {SPREAD_PCT * 10000:.0f}bp")
     print(f"백테스트 기간: {period['start']} ~ {period['end']} ({period['trading_days']} 거래일, {period['years']:.2f}년)")
     print(f"초기 자산: {strategy_stats['initial']:,.0f}")
     print(f"최종 자산: {strategy_stats['final']:,.0f}")
