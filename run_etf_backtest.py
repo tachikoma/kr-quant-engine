@@ -296,6 +296,14 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
             # 실전 주문 생성 로직 재사용
+            max_asset_pct_env = os.environ.get("MAX_ASSET_PCT")
+            max_asset_pct = None
+            if max_asset_pct_env is not None and max_asset_pct_env.strip() != "" and float(max_asset_pct_env) > 0:
+                try:
+                    max_asset_pct = float(max_asset_pct_env)
+                except Exception:
+                    max_asset_pct = None
+
             orders = build_rebalance_orders(
                 current_holdings=holdings,
                 target_tickers=targets,
@@ -308,6 +316,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 slippage=slippage,
                 allow_empty_target_sell=False,
                 generate_orders=True,
+                max_asset_pct=max_asset_pct,
             )
 
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)

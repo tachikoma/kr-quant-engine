@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import numpy as np
 import pandas as pd
 
@@ -20,6 +21,14 @@ ETF_LIST = [
     "143850",  # TIGER 미국S&P500선물(H)
     "133690",  # TIGER 미국나스닥100
 ]
+
+# 환경변수 `ETF_LIST`가 쉼표로 전달되면 모듈 로드 시점에 기본 후보풀을 재정의합니다.
+env_list = os.environ.get("ETF_LIST")
+if env_list:
+    parsed = [t.strip() for t in env_list.split(",") if t.strip()]
+    if parsed:
+        ETF_LIST = parsed
+        print(f"[etf_shared] ETF_LIST overridden from env: {len(ETF_LIST)} tickers")
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
@@ -98,6 +107,7 @@ def build_rebalance_orders(
     slippage: float = 0.0005,
     allow_empty_target_sell: bool = False,
     generate_orders: bool = True,
+    max_asset_pct: float | None = None,
 ) -> list[dict]:
     """리밸런싱 주문 목록을 생성한다."""
     orders = []
@@ -149,6 +159,23 @@ def build_rebalance_orders(
         )
         holdings.pop(ticker, None)
 
+    # 현재 매도 후 보유 비중 기준으로 자산별 최대 노출 제한(max_asset_pct)을 계산할 수 있습니다.
+    # max_asset_pct가 None 또는 0이면 제한을 적용하지 않습니다.
+    current_market_value = 0.0
+    for t, q in holdings.items():
+        p = sell_prices.get(t)
+        if p is None or pd.isna(p):
+            continue
+        current_market_value += q * float(p)
+
+    current_equity = cash + current_market_value
+    max_allowed_per_asset = None
+    try:
+        if max_asset_pct is not None and float(max_asset_pct) > 0:
+            max_allowed_per_asset = float(max_asset_pct) * float(current_equity)
+    except Exception:
+        max_allowed_per_asset = None
+
     slots = max(max_positions - len(holdings), 0)
     buy_list = [ticker for ticker in target_tickers if ticker in target_set and ticker not in holdings][:slots]
     print(f"[주문계산] 매수 슬롯={slots}, 매수후보={buy_list}")
@@ -175,6 +202,16 @@ def build_rebalance_orders(
                 f"(budget={budget:,.0f}, unit_cost={unit_cost:,.0f})"
             )
             continue
+
+        # 자산별 최대 노출 제한 적용
+        if max_allowed_per_asset is not None:
+            allowed_qty = int(max_allowed_per_asset // unit_cost)
+            if allowed_qty <= 0:
+                print(f"[주문계산][cap] {ticker} cap으로 인해 매수 불가 (allowed_qty=0)")
+                continue
+            if qty > allowed_qty:
+                print(f"[주문계산][cap] {ticker} cap enforced: qty {qty} -> {allowed_qty}")
+                qty = allowed_qty
 
         cost = qty * unit_cost
         if cost > cash:
