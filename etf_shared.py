@@ -15,11 +15,12 @@ MARKET_SLOPE_DAYS = 20
 
 ETF_LIST = [
     "069500",  # KODEX 200
-    "229200",  # KODEX 코스닥150
+    # "229200",  # KODEX 코스닥150
     "091160",  # KODEX 반도체
     "102110",  # TIGER 200
     "143850",  # TIGER 미국S&P500선물(H)
     "133690",  # TIGER 미국나스닥100
+    "243880",  # TIGER 200IT레버리지
 ]
 
 # 환경변수 `ETF_LIST`가 쉼표로 전달되면 모듈 로드 시점에 기본 후보풀을 재정의합니다.
@@ -110,30 +111,74 @@ def build_rebalance_orders(
     max_asset_pct: float | None = None,
 ) -> list[dict]:
     """리밸런싱 주문 목록을 생성한다."""
-    orders = []
-    holdings = dict(current_holdings)
-    cash = float(available_cash)
-    buy_prices = latest_buy_prices or latest_prices
-    sell_prices = latest_sell_prices or latest_prices
-    target_set = set(target_tickers[:max_positions])
-    target_rank = {ticker: idx + 1 for idx, ticker in enumerate(target_tickers)}
+    orders: list[dict] = []
 
-    # generate_orders=False이면 리밸런싱이 비활성화된 상태이므로 주문 생성을 건너뜁니다.
+    # --- 입력 정규화 및 방어 로직 ---
+    # current_holdings: 키를 문자열로, 값은 정수로 변환
+    holdings: dict[str, int] = {}
+    if current_holdings:
+        try:
+            for k, v in current_holdings.items():
+                if v is None:
+                    continue
+                try:
+                    holdings[str(k)] = int(v)
+                except Exception:
+                    # 변환 불가 시 스킵
+                    continue
+        except Exception:
+            holdings = {str(k): int(v) for k, v in dict(current_holdings).items() if v is not None}
+
+    # 현금
+    try:
+        cash = float(available_cash or 0.0)
+    except Exception:
+        cash = 0.0
+
+    # 가격 소스는 dict 또는 pandas.Series를 허용하도록 변환
+    def _to_price_dict(src) -> dict:
+        if src is None:
+            return {}
+        if isinstance(src, pd.Series):
+            return {str(k): (float(v) if (v is not None and not pd.isna(v)) else None) for k, v in src.to_dict().items()}
+        try:
+            return {str(k): (float(v) if (v is not None and not pd.isna(v)) else None) for k, v in dict(src).items()}
+        except Exception:
+            return {}
+
+    base_prices = _to_price_dict(latest_prices)
+    buy_prices = _to_price_dict(latest_buy_prices) if latest_buy_prices is not None else base_prices
+    sell_prices = _to_price_dict(latest_sell_prices) if latest_sell_prices is not None else base_prices
+
+    # 대상 티커 목록을 문자열 리스트로 정리
+    targets: list[str] = [str(t) for t in target_tickers] if target_tickers else []
+    target_set = set(targets[:max_positions])
+    target_rank = {ticker: idx + 1 for idx, ticker in enumerate(targets)}
+
+    # generate_orders=False이면 주문 생성 건너뜀
     if not generate_orders:
         print("[주문계산] generate_orders=False — 리밸런싱 미실행으로 주문 생성 생략")
         return []
 
-    # 빈 target에 대해 '빈 target이면 전량매도'로 해석되는 것을 방지하기 위한 방어 로직
-    if not target_tickers and not allow_empty_target_sell:
+    # 빈 타겟 보호 로직
+    if not targets and not allow_empty_target_sell:
         print("[주문계산] target이 비어있고 빈 target에서 매도 허용이 아니므로 주문 생성 생략")
         return []
 
-    print(
-        f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(target_tickers)}개, "
-        f"max_positions={max_positions}, 예수금={cash:,.0f}"
-    )
+    print(f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(targets)}개, max_positions={max_positions}, 예수금={cash:,.0f}")
 
+    # --- 매도 로직 ---
     for ticker, qty in list(holdings.items()):
+        # 수량 정수 보장
+        try:
+            qty_i = int(qty or 0)
+        except Exception:
+            qty_i = 0
+
+        if qty_i <= 0:
+            # 비정상 수량은 무시
+            continue
+
         rank = target_rank.get(ticker)
         keep_by_rank = rank is not None and rank <= sell_rank_buffer
         if keep_by_rank:
@@ -145,28 +190,35 @@ def build_rebalance_orders(
             print(f"[주문계산][매도스킵] {ticker} 매도가격 없음/비정상 (sell_price={price})")
             continue
 
-        estimated_value = apply_sell_value(price, qty, ETF_SELL_TAX_PCT, slippage)
-        cash += estimated_value
+        try:
+            estimated_value = apply_sell_value(float(price), qty_i, ETF_SELL_TAX_PCT, slippage)
+        except Exception as e:
+            print(f"[주문계산][매도오류] {ticker} estimated_value 계산 실패: {e}")
+            continue
+
+        cash += float(estimated_value)
         orders.append(
             {
                 "side": "SELL",
                 "ticker": ticker,
-                "qty": qty,
-                "reference_price": price,
-                "estimated_value": estimated_value,
+                "qty": qty_i,
+                "reference_price": float(price),
+                "estimated_value": float(estimated_value),
                 "reason": "ETF_REBALANCE",
             }
         )
         holdings.pop(ticker, None)
 
-    # 현재 매도 후 보유 비중 기준으로 자산별 최대 노출 제한(max_asset_pct)을 계산할 수 있습니다.
-    # max_asset_pct가 None 또는 0이면 제한을 적용하지 않습니다.
+    # --- 보유 가치 계산 (매도 후 기준) ---
     current_market_value = 0.0
     for t, q in holdings.items():
         p = sell_prices.get(t)
         if p is None or pd.isna(p):
             continue
-        current_market_value += q * float(p)
+        try:
+            current_market_value += int(q) * float(p)
+        except Exception:
+            continue
 
     current_equity = cash + current_market_value
     max_allowed_per_asset = None
@@ -176,8 +228,9 @@ def build_rebalance_orders(
     except Exception:
         max_allowed_per_asset = None
 
+    # --- 매수 후보 선정 ---
     slots = max(max_positions - len(holdings), 0)
-    buy_list = [ticker for ticker in target_tickers if ticker in target_set and ticker not in holdings][:slots]
+    buy_list = [ticker for ticker in targets if ticker not in holdings][:slots]
     print(f"[주문계산] 매수 슬롯={slots}, 매수후보={buy_list}")
     if not buy_list or cash <= 0:
         if not buy_list:
@@ -188,13 +241,23 @@ def build_rebalance_orders(
 
     budget = cash / len(buy_list)
     print(f"[주문계산] 종목당 예산={budget:,.0f}")
+
     for ticker in buy_list:
         price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
             print(f"[주문계산][매수스킵] {ticker} 매수가격 없음/비정상 (buy_price={price})")
             continue
 
-        unit_cost = apply_buy_cost(price, slippage)
+        try:
+            unit_cost = apply_buy_cost(float(price), slippage)
+        except Exception as e:
+            print(f"[주문계산][매수오류] {ticker} unit_cost 계산 실패: {e}")
+            continue
+
+        if unit_cost <= 0:
+            print(f"[주문계산][매수스킵] {ticker} 단가 비정상 (unit_cost={unit_cost})")
+            continue
+
         qty = int(budget // unit_cost)
         if qty <= 0:
             print(
@@ -230,8 +293,8 @@ def build_rebalance_orders(
                 "side": "BUY",
                 "ticker": ticker,
                 "qty": qty,
-                "reference_price": price,
-                "estimated_value": cost,
+                "reference_price": float(price),
+                "estimated_value": float(cost),
                 "reason": "ETF_REBALANCE",
             }
         )

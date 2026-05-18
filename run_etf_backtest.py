@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
 import os
+import argparse
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -23,8 +25,35 @@ from etf_shared import (
     get_strategy_config,
 )
 
-START = "20160101"
-END = "20260430"
+# 백테스트 기본 기간: 시작일 기본은 20160101, 종료일 기본은 오늘(또는 마지막 영업일)
+START_DEFAULT = "20160101"
+END_DEFAULT = date.today().strftime("%Y%m%d")
+START = START_DEFAULT
+END = END_DEFAULT
+
+
+# 날짜 인자 정규화: 여러 포맷(YYYYMMDD, YYYY-MM-DD 등)을 허용하여 'YYYYMMDD' 반환
+def _normalize_date_arg(date_str: str | None) -> str | None:
+    if date_str is None:
+        return None
+    s = str(date_str).strip()
+    if not s:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y%m%d")
+        except ValueError:
+            continue
+    raise ValueError(f"잘못된 날짜 형식: {date_str}. YYYYMMDD 또는 YYYY-MM-DD 를 사용하세요.")
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ETF 전용 백테스트 실행기")
+    parser.add_argument("--start", "-s", help="시작일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 20160101", default=None)
+    parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
+    parser.add_argument("--mode", "-m", choices=["single", "experiment"], help="실행 모드: single 또는 experiment (옵션)", default=None)
+    return parser.parse_args()
 
 
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
@@ -155,15 +184,208 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 
 def get_price(ticker: str) -> pd.DataFrame:
+    cache_dir = Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    use_cache = os.environ.get("ETF_USE_CACHE", "1") != "0"
+    force_refresh = os.environ.get("ETF_REFRESH_CACHE", "0") == "1"
+    cache_parquet = cache_dir / f"{ticker}.parquet"
+    cache_csv_pattern = list(cache_dir.glob(f"{ticker}_*.csv"))
+
+    # 기존 CSV 캐시(구형 포맷)가 있으면 병합하여 Parquet 마스터로 마이그레이션 시도
+    if use_cache and not force_refresh and not cache_parquet.exists() and cache_csv_pattern:
+        try:
+            parts = []
+            for f in sorted(cache_csv_pattern):
+                try:
+                    p = pd.read_csv(f, parse_dates=["date"])
+                    parts.append(p)
+                except Exception:
+                    continue
+            if parts:
+                df_mig = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date")
+                if "ticker" not in df_mig.columns:
+                    df_mig["ticker"] = str(ticker)
+                df_mig["ticker"] = df_mig["ticker"].astype(str)
+                try:
+                    tmp = cache_parquet.with_suffix(".parquet.tmp")
+                    df_mig.to_parquet(tmp)
+                    os.replace(tmp, cache_parquet)
+                    print(f"[캐시] {ticker} CSV->Parquet 마이그레이션: {cache_parquet}")
+                except Exception as e:
+                    print(f"[캐시] {ticker} 마이그레이션(Parquet) 실패: {e} — CSV 보존")
+        except Exception as e:
+            print(f"[캐시] {ticker} 마이그레이션 실패: {e}")
+
+    # 캐시 사용 가능하면 Parquet에서 증분 로드/갱신
+    if use_cache and cache_parquet.exists() and not force_refresh:
+        try:
+            df_cached = pd.read_parquet(cache_parquet)
+            if "date" in df_cached.columns:
+                df_cached["date"] = pd.to_datetime(df_cached["date"])
+
+            start_req = pd.to_datetime(START)
+            end_req = pd.to_datetime(END)
+
+            cached_min = df_cached["date"].min()
+            cached_max = df_cached["date"].max()
+
+            # 완전 커버되면 서브셋 반환
+            if cached_min <= start_req and cached_max >= end_req:
+                subset = df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)].copy()
+                print(f"[캐시] {ticker} 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
+                return subset
+
+            to_concat = [df_cached]
+            fetched = False
+
+            # 왼쪽(이전) 구간이 필요하면 조회
+            if start_req < cached_min:
+                fetch_start = start_req.strftime("%Y%m%d")
+                fetch_end = (cached_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
+                try:
+                    raw_left = stock.get_market_ohlcv_by_date(fetch_start, fetch_end, ticker)
+                    df_left = normalize_ohlcv(raw_left, ticker)
+                    to_concat.insert(0, df_left)
+                    fetched = True
+                    print(f"[캐시] {ticker} left 증분 수집: {fetch_start}~{fetch_end}")
+                except Exception as e:
+                    print(f"[캐시] {ticker} left 증분 수집 실패: {e}")
+
+            # 오른쪽(최신) 구간이 필요하면 조회
+            if end_req > cached_max:
+                fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                fetch_end = end_req.strftime("%Y%m%d")
+                try:
+                    raw_right = stock.get_market_ohlcv_by_date(fetch_start, fetch_end, ticker)
+                    df_right = normalize_ohlcv(raw_right, ticker)
+                    to_concat.append(df_right)
+                    fetched = True
+                    print(f"[캐시] {ticker} right 증분 수집: {fetch_start}~{fetch_end}")
+                except Exception as e:
+                    print(f"[캐시] {ticker} right 증분 수집 실패: {e}")
+
+            if fetched:
+                df_new = pd.concat(to_concat, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+                try:
+                    tmp = cache_parquet.with_suffix(".parquet.tmp")
+                    df_new.to_parquet(tmp)
+                    os.replace(tmp, cache_parquet)
+                    print(f"[캐시] {ticker} 캐시 업데이트: {cache_parquet}")
+                except Exception as e:
+                    print(f"[캐시] {ticker} 캐시 저장 실패(Parquet): {e}")
+                subset = df_new[(df_new["date"] >= start_req) & (df_new["date"] <= end_req)].copy()
+                return subset
+            else:
+                # 일부만 캐시되어 있고 증분 불가한 경우 가능하면 서브셋 반환
+                subset = df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)].copy()
+                if not subset.empty:
+                    print(f"[캐시] {ticker} 부분 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
+                    return subset
+        except Exception as e:
+            print(f"[캐시] {ticker} 캐시 읽기 실패: {e} — 전체 재조회로 대체")
+
+    # 캐시가 없거나 강제 갱신인 경우 전체 조회 후 저장
     try:
-        return normalize_ohlcv(stock.get_market_ohlcv_by_date(START, END, ticker), ticker)
+        raw = stock.get_market_ohlcv_by_date(START, END, ticker)
+        df = normalize_ohlcv(raw, ticker)
+        if use_cache:
+            try:
+                tmp = cache_parquet.with_suffix(".parquet.tmp")
+                df.to_parquet(tmp)
+                os.replace(tmp, cache_parquet)
+                print(f"[캐시] 저장(Parquet): {cache_parquet}")
+            except Exception as e:
+                # Parquet 저장 실패시 CSV로 저장
+                try:
+                    csv_file = cache_dir / f"{ticker}.csv"
+                    tmp_csv = cache_dir / f"{ticker}.csv.tmp"
+                    df.to_csv(tmp_csv, index=False)
+                    os.replace(tmp_csv, csv_file)
+                    print(f"[캐시] Parquet 저장 실패({e}) — CSV 저장: {csv_file}")
+                except Exception as e2:
+                    print(f"[캐시] {ticker} 캐시 저장 실패: {e2}")
+        return df
     except Exception as e:
         print(f"❌ 오류: 종목 {ticker} 데이터 조회 실패: {str(e)}")
         raise RuntimeError(f"Cannot fetch price data for ticker {ticker}") from e
 
 
 def get_index_data() -> pd.DataFrame:
-    """KOSPI 지수 데이터를 조회하고 기술적 지표를 계산한다."""
+    """KOSPI 지수 데이터를 조회하고 기술적 지표를 계산한다.
+
+    인덱스 데이터는 단일 Parquet 캐시(data_cache/index.parquet)를 사용하여 증분 갱신합니다.
+    """
+    cache_dir = Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    use_cache = os.environ.get("ETF_USE_CACHE", "1") != "0"
+    force_refresh = os.environ.get("ETF_REFRESH_CACHE", "0") == "1"
+    cache_parquet = cache_dir / "index.parquet"
+
+    # 캐시가 있고 사용 허용이면 읽어서 요청 범위를 커버하는지 확인
+    if use_cache and cache_parquet.exists() and not force_refresh:
+        try:
+            idx_cached = pd.read_parquet(cache_parquet)
+            if "date" in idx_cached.columns:
+                idx_cached["date"] = pd.to_datetime(idx_cached["date"])
+
+            start_req = pd.to_datetime(START)
+            end_req = pd.to_datetime(END)
+            cached_min = idx_cached["date"].min()
+            cached_max = idx_cached["date"].max()
+
+            if cached_min <= start_req and cached_max >= end_req:
+                print(f"[캐시] KOSPI 인덱스 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
+                df = idx_cached.copy()
+                df = df[(df["date"] >= start_req) & (df["date"] <= end_req)]
+                return df[["date", "close", "market_ma", "market_ma_slope", "risk_on"]]
+
+            to_concat = [idx_cached]
+            fetched = False
+
+            if start_req < cached_min:
+                fetch_start = start_req.strftime("%Y%m%d")
+                fetch_end = (cached_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
+                try:
+                    raw_left = stock.get_index_ohlcv_by_date(fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                    left = raw_left.reset_index().rename(columns={"날짜": "date", "종가": "close"})
+                    left["date"] = pd.to_datetime(left["date"])
+                    to_concat.insert(0, left)
+                    fetched = True
+                    print(f"[캐시] KOSPI left 증분 수집: {fetch_start}~{fetch_end}")
+                except Exception as e:
+                    print(f"[캐시] KOSPI left 증분 수집 실패: {e}")
+
+            if end_req > cached_max:
+                fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                fetch_end = end_req.strftime("%Y%m%d")
+                try:
+                    raw_right = stock.get_index_ohlcv_by_date(fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                    right = raw_right.reset_index().rename(columns={"날짜": "date", "종가": "close"})
+                    right["date"] = pd.to_datetime(right["date"])
+                    to_concat.append(right)
+                    fetched = True
+                    print(f"[캐시] KOSPI right 증분 수집: {fetch_start}~{fetch_end}")
+                except Exception as e:
+                    print(f"[캐시] KOSPI right 증분 수집 실패: {e}")
+
+            if fetched:
+                idx_new = pd.concat(to_concat, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date")
+                idx_new["market_ma"] = idx_new["close"].rolling(MARKET_MA_DAYS).mean()
+                idx_new["market_ma_slope"] = idx_new["market_ma"] - idx_new["market_ma"].shift(MARKET_SLOPE_DAYS)
+                idx_new["risk_on"] = (idx_new["close"] >= idx_new["market_ma"]) & (idx_new["market_ma_slope"] >= 0)
+                try:
+                    tmp = cache_parquet.with_suffix(".parquet.tmp")
+                    idx_new.to_parquet(tmp)
+                    os.replace(tmp, cache_parquet)
+                    print(f"[캐시] KOSPI 인덱스 캐시 업데이트: {cache_parquet}")
+                except Exception as e:
+                    print(f"[캐시] KOSPI 캐시 저장 실패: {e}")
+                df = idx_new[(idx_new["date"] >= start_req) & (idx_new["date"] <= end_req)]
+                return df[["date", "close", "market_ma", "market_ma_slope", "risk_on"]]
+        except Exception as e:
+            print(f"[캐시] KOSPI 캐시 읽기 실패: {e}; 재조회")
+
+    # 캐시가 없거나 강제 갱신인 경우 전체 조회
     if not HAS_KRX_CREDENTIALS:
         raise RuntimeError(
             "KRX 인증 정보가 필요합니다. KOSPI 지수 데이터를 조회할 수 없습니다.\n"
@@ -172,7 +394,7 @@ def get_index_data() -> pd.DataFrame:
             "2. KRX_ID와 KRX_PW를 설정하세요\n"
             "3. 다시 실행하세요"
         )
-    
+
     try:
         idx = stock.get_index_ohlcv_by_date(START, END, KOSPI_INDEX_CODE)
     except Exception as e:
@@ -180,7 +402,7 @@ def get_index_data() -> pd.DataFrame:
             f"KOSPI 지수 데이터 조회 중 오류 발생: {str(e)}\n"
             "KRX 인증 정보를 확인하고 다시 시도하세요."
         ) from e
-    
+
     if idx is None or idx.empty:
         raise RuntimeError("No KOSPI index data returned.")
 
@@ -191,11 +413,28 @@ def get_index_data() -> pd.DataFrame:
             f"KOSPI 지수 데이터 포맷 오류: {str(e)}\n"
             "조회한 데이터 구조: {list(idx.columns)}"
         ) from e
-    
+
     idx["date"] = pd.to_datetime(idx["date"])
     idx["market_ma"] = idx["close"].rolling(MARKET_MA_DAYS).mean()
     idx["market_ma_slope"] = idx["market_ma"] - idx["market_ma"].shift(MARKET_SLOPE_DAYS)
     idx["risk_on"] = (idx["close"] >= idx["market_ma"]) & (idx["market_ma_slope"] >= 0)
+
+    if use_cache:
+        try:
+            tmp = cache_parquet.with_suffix(".parquet.tmp")
+            idx.to_parquet(tmp)
+            os.replace(tmp, cache_parquet)
+            print(f"[캐시] KOSPI 인덱스 저장: {cache_parquet}")
+        except Exception as e:
+            try:
+                csv_file = cache_dir / "index.csv"
+                tmp_csv = cache_dir / "index.csv.tmp"
+                idx.to_csv(tmp_csv, index=False)
+                os.replace(tmp_csv, csv_file)
+                print(f"[캐시] Parquet 저장 실패({e}) — CSV 저장: {csv_file}")
+            except Exception as e2:
+                print(f"[캐시] 인덱스 캐시 저장 실패: {e2}")
+
     return idx[["date", "close", "market_ma", "market_ma_slope", "risk_on"]]
 
 
@@ -221,15 +460,19 @@ def load_etf_price() -> pd.DataFrame:
     failed = []
     empty = []
 
-    for ticker in ETF_LIST:
+    total = len(ETF_LIST)
+    for idx, ticker in enumerate(ETF_LIST, start=1):
+        print(f"[데이터] {idx}/{total} 조회: {ticker}")
         try:
             df = get_price(ticker)
-            if df.empty:
+            if df is None or df.empty:
                 empty.append(ticker)
+                print(f"[데이터] {ticker} 비어있음")
                 continue
             frames.append(df)
         except Exception as exc:
             failed.append((ticker, str(exc)))
+            print(f"[데이터] {ticker} 수집 실패: {exc}")
 
     if not frames:
         raise RuntimeError(f"No ETF data collected. empty={empty}, failed={failed[:5]}")
@@ -241,6 +484,12 @@ def load_etf_price() -> pd.DataFrame:
 
     price = pd.concat(frames, ignore_index=True)
     price = price.sort_values(["ticker", "date"]).copy()
+    # 티커 컬럼이 숫자형으로 들어오는 경우 대비해 문자열로 일관성 유지
+    if "ticker" in price.columns:
+        try:
+            price["ticker"] = price["ticker"].astype(str)
+        except Exception:
+            price["ticker"] = price["ticker"].apply(lambda x: str(x))
     grouped = price.groupby("ticker")
     price["ret_60"] = grouped["close"].pct_change(60)
     price["ret_120"] = grouped["close"].pct_change(120)
@@ -279,11 +528,12 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
             # 시장 필터 + 랭킹으로 목표 종목 결정
             risk_on = is_risk_on(index_df, dt) if use_market_filter else True
             ranked = rank_etfs(today.reset_index())
-            targets = ranked.head(max_positions)["ticker"].tolist() if risk_on else []
+            # targets를 문자열 리스트로 통일
+            targets = [str(t) for t in ranked.head(max_positions)["ticker"].tolist()] if risk_on else []
 
             # 최신 참조가격(다음 시가)을 기반으로 호가 스프레드를 적용한 매수/매도 참조가격 사전 생성
             latest_prices = next_open.to_dict()
-            all_tickers = set(holdings.keys()) | set(targets)
+            all_tickers = set(map(str, holdings.keys())) | set(targets)
             latest_buy_prices = {}
             latest_sell_prices = {}
             for t in all_tickers:
@@ -321,8 +571,9 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)
             for o in orders:
-                ticker = o.get("ticker")
-                qty = int(o.get("qty", 0))
+                raw_ticker = o.get("ticker")
+                ticker = str(raw_ticker)
+                qty = int(o.get("qty", 0) or 0)
                 ref_price = o.get("reference_price")
                 side = o.get("side")
 
@@ -345,7 +596,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     cost = float(o.get("estimated_value", 0.0))
                     if qty <= 0:
                         continue
-                    holdings[ticker] = holdings.get(ticker, 0) + qty
+                    holdings[ticker] = int(holdings.get(ticker, 0)) + qty
                     cash -= cost
                     trades.append(
                         {
@@ -372,7 +623,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 "equity": cash + market_value,
                 "cash": cash,
                 "market_value": market_value,
-                "holdings": ",".join(sorted(holdings.keys())),
+                "holdings": ",".join(sorted(map(str, holdings.keys()))),
             }
         )
 
@@ -584,9 +835,23 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
     if ENABLE_BENCHMARK:
-        benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
-        benchmark_curve = benchmark_curve[["date", "equity_kodex200_bh"]]
-        result = pd.merge(result, benchmark_curve, on="date", how="outer")
+        try:
+            benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
+        except Exception as e:
+            print(f"[경고] 벤치마크 수집 실패: {e} — 벤치마크 병합을 생략합니다.")
+            benchmark_curve = pd.DataFrame()
+
+        if isinstance(benchmark_curve, pd.DataFrame) and "date" in benchmark_curve.columns:
+            try:
+                benchmark_curve["date"] = pd.to_datetime(benchmark_curve["date"])
+            except Exception:
+                pass
+
+        if not isinstance(benchmark_curve, pd.DataFrame) or benchmark_curve.empty or not {"date", "equity_kodex200_bh"}.issubset(set(benchmark_curve.columns)):
+            print("[경고] 벤치마크 데이터가 없거나 컬럼 누락 — 병합을 건너뜁니다.")
+        else:
+            benchmark_curve = benchmark_curve[["date", "equity_kodex200_bh"]]
+            result = pd.merge(result, benchmark_curve, on="date", how="outer")
 
     result = result.sort_values("date")
     result["equity"] = result["equity"].ffill().fillna(INITIAL_CASH)
@@ -619,9 +884,23 @@ def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
         results.append(curve)
         trades_dict[label] = trades
 
-    benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
-    benchmark_curve = benchmark_curve[["date", "equity_kodex200_bh"]]
+    try:
+        benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
+    except Exception as e:
+        print(f"[경고] 벤치마크 수집 실패: {e} — 기본 벤치마크로 대체합니다.")
+        benchmark_curve = pd.DataFrame({"date": common_dates, "equity_kodex200_bh": [INITIAL_CASH] * len(common_dates)})
 
+    if isinstance(benchmark_curve, pd.DataFrame) and "date" in benchmark_curve.columns:
+        try:
+            benchmark_curve["date"] = pd.to_datetime(benchmark_curve["date"])
+        except Exception:
+            pass
+
+    if not {"date", "equity_kodex200_bh"}.issubset(set(benchmark_curve.columns)) or benchmark_curve.empty:
+        print("[경고] 벤치마크 데이터 형식 불완전 — 기본 벤치마크로 대체합니다.")
+        benchmark_curve = pd.DataFrame({"date": common_dates, "equity_kodex200_bh": [INITIAL_CASH] * len(common_dates)})
+
+    benchmark_curve = benchmark_curve[["date", "equity_kodex200_bh"]]
     result = benchmark_curve
     for curve in results:
         result = pd.merge(result, curve, on="date", how="outer")
@@ -726,6 +1005,38 @@ def _to_json_serializable(stats: dict) -> dict:
 
 
 def main():
+    # CLI 인자 파싱: 시작/종료일과 모드(옵션)를 받아 전역 변수로 설정
+    args = _parse_cli_args()
+    global START, END, RUN_MODE
+
+    if args.start:
+        try:
+            START = _normalize_date_arg(args.start) or START
+        except Exception as e:
+            print(f"❌ 시작일 파싱 오류: {e}")
+            exit(1)
+    if args.end:
+        try:
+            END = _normalize_date_arg(args.end) or END
+        except Exception as e:
+            print(f"❌ 종료일 파싱 오류: {e}")
+            exit(1)
+    if args.mode:
+        RUN_MODE = args.mode
+
+    # 날짜 유효성 체크
+    try:
+        s_dt = datetime.strptime(START, "%Y%m%d")
+        e_dt = datetime.strptime(END, "%Y%m%d")
+        if s_dt > e_dt:
+            print("❌ 오류: 시작일이 종료일보다 큽니다.")
+            exit(1)
+    except Exception as e:
+        print(f"❌ 날짜 검증 실패: {e}")
+        exit(1)
+
+    print(f"백테스트 기간: {START} ~ {END} / 모드: {RUN_MODE}")
+
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     if RUN_MODE not in {"single", "experiment"}:
