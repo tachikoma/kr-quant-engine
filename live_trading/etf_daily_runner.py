@@ -63,6 +63,7 @@ _load_dotenv()
 
 import pandas as pd
 from pykrx import stock
+from pykrx_utils import _call_capture_stderr, _range_has_weekday
 
 
 STATE_DIR = PROJECT_ROOT / "runtime_state"
@@ -387,7 +388,11 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220) -> pd.DataFram
     for i, ticker in enumerate(etf_list, 1):
         print(f"  ({i}/{len(etf_list)}) {ticker} 조회 중...", end=" ", flush=True)
         t1 = dt.datetime.now()
-        raw = stock.get_market_ohlcv_by_date(start, end, ticker)
+        if not _range_has_weekday(start, end):
+            elapsed = (dt.datetime.now() - t1).total_seconds()
+            print(f"스킵(주말만 해당) — 데이터 없음 ({elapsed:.1f}초)")
+            continue
+        raw = _call_capture_stderr(stock.get_market_ohlcv_by_date, start, end, ticker)
         elapsed = (dt.datetime.now() - t1).total_seconds()
         price = _normalize_ohlcv(raw, ticker)
         if price.empty:
@@ -419,7 +424,13 @@ def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) 
     start_day = end_day - dt.timedelta(days=260)
     print(f"[시장필터] KOSPI 지수({market_index_code}) 조회 중... ", end="", flush=True)
     t0 = dt.datetime.now()
-    idx = stock.get_index_ohlcv_by_date(_date_to_krx(start_day), _date_to_krx(end_day), market_index_code)
+    start_s = _date_to_krx(start_day)
+    end_s = _date_to_krx(end_day)
+    if not _range_has_weekday(start_s, end_s):
+        elapsed = (dt.datetime.now() - t0).total_seconds()
+        print(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초) → risk_on=True (기본값)")
+        return True
+    idx = _call_capture_stderr(stock.get_index_ohlcv_by_date, start_s, end_s, market_index_code)
     elapsed = (dt.datetime.now() - t0).total_seconds()
     if idx is None or idx.empty:
         print(f"데이터 없음 ({elapsed:.1f}초) → risk_on=True (기본값)")
@@ -453,7 +464,13 @@ def _load_recent_trading_dates(reference_ticker: str, lookback_days: int = 120) 
     start_day = end_day - dt.timedelta(days=lookback_days)
     print(f"[리밸런싱] 거래일 캘린더 조회 중({reference_ticker})... ", end="", flush=True)
     t0 = dt.datetime.now()
-    df = stock.get_market_ohlcv_by_date(_date_to_krx(start_day), _date_to_krx(end_day), reference_ticker)
+    start_s = _date_to_krx(start_day)
+    end_s = _date_to_krx(end_day)
+    if not _range_has_weekday(start_s, end_s):
+        elapsed = (dt.datetime.now() - t0).total_seconds()
+        print(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초)")
+        return []
+    df = _call_capture_stderr(stock.get_market_ohlcv_by_date, start_s, end_s, reference_ticker)
     elapsed = (dt.datetime.now() - t0).total_seconds()
     data = _normalize_ohlcv(df, reference_ticker)
     if data.empty:

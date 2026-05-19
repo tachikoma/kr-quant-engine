@@ -7,6 +7,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
+from pykrx_utils import _call_capture_stderr, _range_has_weekday
 from etf_shared import (
     ETF_LIST,
     ETF_MAX_POSITIONS,
@@ -15,77 +16,42 @@ from etf_shared import (
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     REBALANCE_STEP_DAYS,
-    BUY_FEE_PCT,
-    SELL_FEE_PCT,
-    ETF_SELL_TAX_PCT,
     rank_etfs,
     apply_buy_cost,
-    apply_sell_value,
     build_rebalance_orders,
     get_strategy_config,
 )
-
-# 백테스트 기본 기간: 시작일 기본은 20160101, 종료일 기본은 오늘(또는 마지막 영업일)
-START_DEFAULT = "20160101"
-END_DEFAULT = date.today().strftime("%Y%m%d")
-START = START_DEFAULT
-END = END_DEFAULT
-
-
-# 날짜 인자 정규화: 여러 포맷(YYYYMMDD, YYYY-MM-DD 등)을 허용하여 'YYYYMMDD' 반환
-def _normalize_date_arg(date_str: str | None) -> str | None:
-    if date_str is None:
-        return None
-    s = str(date_str).strip()
-    if not s:
-        return None
-    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.strftime("%Y%m%d")
-        except ValueError:
-            continue
-    raise ValueError(f"잘못된 날짜 형식: {date_str}. YYYYMMDD 또는 YYYY-MM-DD 를 사용하세요.")
-
-
-def _parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ETF 전용 백테스트 실행기")
-    parser.add_argument("--start", "-s", help="시작일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 20160101", default=None)
-    parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
-    parser.add_argument("--mode", "-m", choices=["single", "experiment"], help="실행 모드: single 또는 experiment (옵션)", default=None)
-    return parser.parse_args()
-
-
-def load_dotenv(dotenv_path: str | Path | None = None) -> None:
-    if dotenv_path is None:
-        dotenv_path = Path(__file__).resolve().parent / ".env"
-    path = Path(dotenv_path)
-    if not path.exists():
-        return
-
-    with path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-
-load_dotenv()
 
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
 from config_utils import parse_pct_env
+def load_dotenv(dotenv_path: str | Path | None = None) -> None:
+    path = Path(dotenv_path) if dotenv_path is not None else Path(__file__).resolve().parent / ".env"
+    if not path.exists():
+        return
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        # 실패해도 무시하고 진행
+        pass
+
+
+load_dotenv()
 
 strategy_cfg = get_strategy_config()
 SLIPPAGE_PCT = parse_pct_env("ETF_BASE_SLIPPAGE", strategy_cfg.get("default_slippage_pct", 0.0005))
@@ -132,6 +98,36 @@ PERIODS = [
     ("2022_2023", "2022-01-01", "2023-12-31"),
     ("2024_2026", "2024-01-01", "2026-04-30"),
 ]
+
+# 백테스트 기본 기간: 시작일 기본은 20160101, 종료일 기본은 오늘(또는 마지막 영업일)
+START_DEFAULT = "20160101"
+END_DEFAULT = date.today().strftime("%Y%m%d")
+START = START_DEFAULT
+END = END_DEFAULT
+
+
+# 날짜 인자 정규화: 여러 포맷(YYYYMMDD, YYYY-MM-DD 등)을 허용하여 'YYYYMMDD' 반환
+def _normalize_date_arg(date_str: str | None) -> str | None:
+    if date_str is None:
+        return None
+    s = str(date_str).strip()
+    if not s:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y%m%d")
+        except ValueError:
+            continue
+    raise ValueError(f"잘못된 날짜 형식: {date_str}. YYYYMMDD 또는 YYYY-MM-DD 를 사용하세요.")
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ETF 전용 백테스트 실행기")
+    parser.add_argument("--start", "-s", help="시작일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 20160101", default=None)
+    parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
+    parser.add_argument("--mode", "-m", choices=["single", "experiment"], help="실행 모드: single 또는 experiment (옵션)", default=None)
+    return parser.parse_args()
 
 
 def get_ticker_name(ticker: str) -> str:
@@ -180,6 +176,64 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     out = df[["date", "ticker", "open", "close", "volume", "trading_value"]].copy()
     out["date"] = pd.to_datetime(out["date"])
+    return out
+
+
+def normalize_index_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """인덱스(지수)용 OHLCV 정규화: 다양한 pykrx 반환 포맷을 지원합니다.
+
+    반환 컬럼 최소 요구: `date`, `close`.
+    """
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return pd.DataFrame(columns=["date", "close"])
+
+    # 만약 인덱스가 날짜형이면 reset_index로 컬럼 추가
+    try:
+        if hasattr(df, "index") and (isinstance(df.index, pd.DatetimeIndex) or np.issubdtype(df.index.dtype, np.datetime64)):
+            tmp = df.reset_index()
+        else:
+            tmp = df.reset_index()
+    except Exception:
+        tmp = pd.DataFrame(df)
+
+    # 후보 컬럼명 탐색
+    date_col = None
+    close_col = None
+    for c in tmp.columns:
+        cn = str(c)
+        lc = cn.lower()
+        if date_col is None and ("날짜" in cn or lc == "date" or lc == "trd_dd" or lc.startswith("date") or lc == "index"):
+            date_col = c
+        if close_col is None and ("종가" in cn or "clsprc" in lc or "clsp" in lc or "close" in lc):
+            close_col = c
+
+    # 추가 탐색: date가 없으면 파서가 가능한 컬럼을 찾아본다
+    if date_col is None:
+        for c in tmp.columns:
+            try:
+                parsed = pd.to_datetime(tmp[c], errors="coerce")
+                if parsed.notna().sum() > 0:
+                    date_col = c
+                    tmp[c] = parsed
+                    break
+            except Exception:
+                continue
+
+    # close가 없으면 숫자형 컬럼 중 첫 번째를 사용
+    if close_col is None:
+        for c in tmp.columns:
+            if c == date_col:
+                continue
+            if pd.api.types.is_numeric_dtype(tmp[c]):
+                close_col = c
+                break
+
+    if date_col is None or close_col is None:
+        raise ValueError(f"인덱스 데이터에 date/close 컬럼이 없습니다. 컬럼 목록: {list(tmp.columns)}")
+
+    out = tmp.rename(columns={date_col: "date", close_col: "close"})
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
     return out
 
 
@@ -242,30 +296,78 @@ def get_price(ticker: str) -> pd.DataFrame:
             if start_req < cached_min:
                 fetch_start = start_req.strftime("%Y%m%d")
                 fetch_end = (cached_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
-                try:
-                    raw_left = stock.get_market_ohlcv_by_date(fetch_start, fetch_end, ticker)
-                    df_left = normalize_ohlcv(raw_left, ticker)
-                    to_concat.insert(0, df_left)
-                    fetched = True
-                    print(f"[캐시] {ticker} left 증분 수집: {fetch_start}~{fetch_end}")
-                except Exception as e:
-                    print(f"[캐시] {ticker} left 증분 수집 실패: {e}")
+                # 주말 전용 범위라면 조회를 건너뜁니다 (공휴일은 판별하지 않음)
+                if not _range_has_weekday(fetch_start, fetch_end):
+                    raw_left = pd.DataFrame()
+                    print(f"[캐시] {ticker} left 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
+                else:
+                    try:
+                        raw_left = _call_capture_stderr(stock.get_market_ohlcv_by_date, fetch_start, fetch_end, ticker)
+                    except Exception as e:
+                        print(f"[캐시] {ticker} left 호출 실패: {e}")
+                    else:
+                        try:
+                            if hasattr(raw_left, "columns"):
+                                print(f"[캐시][debug] {ticker} raw_left type={type(raw_left)}, columns={list(raw_left.columns)}")
+                                try:
+                                    print(raw_left.head().to_string())
+                                except Exception:
+                                    pass
+                            df_left = normalize_ohlcv(raw_left, ticker)
+                            if isinstance(df_left, pd.DataFrame) and not df_left.empty:
+                                to_concat.insert(0, df_left)
+                                fetched = True
+                                print(f"[캐시] {ticker} left 증분 수집: {fetch_start}~{fetch_end}")
+                            else:
+                                print(f"[캐시] {ticker} left 증분 비어있음: {fetch_start}~{fetch_end}")
+                        except Exception as e:
+                            print(f"[캐시] {ticker} left 정규화 실패: {e}")
 
             # 오른쪽(최신) 구간이 필요하면 조회
             if end_req > cached_max:
                 fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
                 fetch_end = end_req.strftime("%Y%m%d")
-                try:
-                    raw_right = stock.get_market_ohlcv_by_date(fetch_start, fetch_end, ticker)
-                    df_right = normalize_ohlcv(raw_right, ticker)
-                    to_concat.append(df_right)
-                    fetched = True
-                    print(f"[캐시] {ticker} right 증분 수집: {fetch_start}~{fetch_end}")
-                except Exception as e:
-                    print(f"[캐시] {ticker} right 증분 수집 실패: {e}")
+                # 주말 전용 범위면 조회 건너뜀
+                if not _range_has_weekday(fetch_start, fetch_end):
+                    raw_right = pd.DataFrame()
+                    print(f"[캐시] {ticker} right 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
+                else:
+                    try:
+                        raw_right = _call_capture_stderr(stock.get_market_ohlcv_by_date, fetch_start, fetch_end, ticker)
+                    except Exception as e:
+                        print(f"[캐시] {ticker} right 호출 실패: {e}")
+                    else:
+                        try:
+                            if hasattr(raw_right, "columns"):
+                                print(f"[캐시][debug] {ticker} raw_right type={type(raw_right)}, columns={list(raw_right.columns)}")
+                                try:
+                                    print(raw_right.head().to_string())
+                                except Exception:
+                                    pass
+                            df_right = normalize_ohlcv(raw_right, ticker)
+                            if isinstance(df_right, pd.DataFrame) and not df_right.empty:
+                                to_concat.append(df_right)
+                                fetched = True
+                                print(f"[캐시] {ticker} right 증분 수집: {fetch_start}~{fetch_end}")
+                            else:
+                                print(f"[캐시] {ticker} right 증분 비어있음: {fetch_start}~{fetch_end}")
+                        except Exception as e:
+                            print(f"[캐시] {ticker} right 정규화 실패: {e}")
 
             if fetched:
-                df_new = pd.concat(to_concat, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+                parts = [p for p in to_concat if isinstance(p, pd.DataFrame) and not p.empty]
+                if not parts:
+                    print(f"[캐시] {ticker} 증분 병합 대상이 없습니다; 기존 캐시 사용")
+                    df_new = df_cached.copy()
+                else:
+                    try:
+                        df_new = pd.concat(parts, ignore_index=True)
+                    except Exception as e:
+                        meta = [(type(p), list(p.columns) if hasattr(p, "columns") else None) for p in parts]
+                        print(f"[캐시] {ticker} 증분 병합 실패: {e}; parts={meta}")
+                        df_new = df_cached.copy()
+
+                df_new = df_new.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
                 try:
                     tmp = cache_parquet.with_suffix(".parquet.tmp")
                     df_new.to_parquet(tmp)
@@ -286,7 +388,7 @@ def get_price(ticker: str) -> pd.DataFrame:
 
     # 캐시가 없거나 강제 갱신인 경우 전체 조회 후 저장
     try:
-        raw = stock.get_market_ohlcv_by_date(START, END, ticker)
+        raw = _call_capture_stderr(stock.get_market_ohlcv_by_date, START, END, ticker)
         df = normalize_ohlcv(raw, ticker)
         if use_cache:
             try:
@@ -345,31 +447,83 @@ def get_index_data() -> pd.DataFrame:
             if start_req < cached_min:
                 fetch_start = start_req.strftime("%Y%m%d")
                 fetch_end = (cached_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
-                try:
-                    raw_left = stock.get_index_ohlcv_by_date(fetch_start, fetch_end, KOSPI_INDEX_CODE)
-                    left = raw_left.reset_index().rename(columns={"날짜": "date", "종가": "close"})
-                    left["date"] = pd.to_datetime(left["date"])
-                    to_concat.insert(0, left)
-                    fetched = True
-                    print(f"[캐시] KOSPI left 증분 수집: {fetch_start}~{fetch_end}")
-                except Exception as e:
-                    print(f"[캐시] KOSPI left 증분 수집 실패: {e}")
+                # 주말 전용 범위면 조회 생략
+                if not _range_has_weekday(fetch_start, fetch_end):
+                    raw_left = pd.DataFrame()
+                    print(f"[캐시] KOSPI left 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
+                else:
+                    try:
+                        raw_left = _call_capture_stderr(stock.get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                    except Exception as e:
+                        print(f"[캐시] KOSPI left 호출 실패: {e}")
+                    else:
+                        try:
+                            if hasattr(raw_left, "columns"):
+                                print(f"[캐시][debug] raw_left type={type(raw_left)}, columns={list(raw_left.columns)}")
+                                try:
+                                    print(raw_left.head().to_string())
+                                except Exception:
+                                    pass
+                            left = normalize_index_ohlcv(raw_left)
+                            if isinstance(left, pd.DataFrame) and not left.empty:
+                                to_concat.insert(0, left)
+                                fetched = True
+                                print(f"[캐시] KOSPI left 증분 수집: {fetch_start}~{fetch_end}")
+                            else:
+                                print(f"[캐시] KOSPI left 증분 비어있음: {fetch_start}~{fetch_end}")
+                        except Exception as e:
+                            print(f"[캐시] KOSPI left 정규화 실패: {e}; 원본 컬럼={list(raw_left.columns) if hasattr(raw_left, 'columns') else None}")
 
             if end_req > cached_max:
                 fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
                 fetch_end = end_req.strftime("%Y%m%d")
-                try:
-                    raw_right = stock.get_index_ohlcv_by_date(fetch_start, fetch_end, KOSPI_INDEX_CODE)
-                    right = raw_right.reset_index().rename(columns={"날짜": "date", "종가": "close"})
-                    right["date"] = pd.to_datetime(right["date"])
-                    to_concat.append(right)
-                    fetched = True
-                    print(f"[캐시] KOSPI right 증분 수집: {fetch_start}~{fetch_end}")
-                except Exception as e:
-                    print(f"[캐시] KOSPI right 증분 수집 실패: {e}")
+                # 주말 전용 범위면 조회 생략
+                if not _range_has_weekday(fetch_start, fetch_end):
+                    raw_right = pd.DataFrame()
+                    print(f"[캐시] KOSPI right 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
+                else:
+                    try:
+                        raw_right = _call_capture_stderr(stock.get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                    except Exception as e:
+                        print(f"[캐시] KOSPI right 호출 실패: {e}")
+                    else:
+                        try:
+                            if hasattr(raw_right, "columns"):
+                                print(f"[캐시][debug] raw_right type={type(raw_right)}, columns={list(raw_right.columns)}")
+                                try:
+                                    print(raw_right.head().to_string())
+                                except Exception:
+                                    pass
+                            right = normalize_index_ohlcv(raw_right)
+                            if isinstance(right, pd.DataFrame) and not right.empty:
+                                to_concat.append(right)
+                                fetched = True
+                                print(f"[캐시] KOSPI right 증분 수집: {fetch_start}~{fetch_end}")
+                            else:
+                                print(f"[캐시] KOSPI right 증분 비어있음: {fetch_start}~{fetch_end}")
+                        except Exception as e:
+                            print(f"[캐시] KOSPI right 정규화 실패: {e}; 원본 컬럼={list(raw_right.columns) if hasattr(raw_right, 'columns') else None}")
 
             if fetched:
-                idx_new = pd.concat(to_concat, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date")
+                # 빈 프레임을 제외하여 concat 관련 FutureWarning 제거
+                parts = [p for p in to_concat if isinstance(p, pd.DataFrame) and not p.empty]
+                if not parts:
+                    print("[캐시] KOSPI 증분 병합 대상이 없습니다; 기존 캐시 사용 시도")
+                    idx_new = idx_cached.copy()
+                else:
+                    try:
+                        idx_new = pd.concat(parts, ignore_index=True)
+                    except Exception as e:
+                        meta = [ (type(p), list(p.columns) if hasattr(p, 'columns') else None) for p in parts ]
+                        print(f"[캐시] KOSPI 증분 병합 실패: {e}; parts={meta}")
+                        idx_new = idx_cached.copy()
+
+                idx_new = idx_new.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+                if "close" not in idx_new.columns:
+                    print("[캐시] KOSPI 병합 결과에 'close' 컬럼이 없습니다; 캐시 재사용")
+                    idx_new = idx_cached.copy()
+
                 idx_new["market_ma"] = idx_new["close"].rolling(MARKET_MA_DAYS).mean()
                 idx_new["market_ma_slope"] = idx_new["market_ma"] - idx_new["market_ma"].shift(MARKET_SLOPE_DAYS)
                 idx_new["risk_on"] = (idx_new["close"] >= idx_new["market_ma"]) & (idx_new["market_ma_slope"] >= 0)
@@ -396,25 +550,22 @@ def get_index_data() -> pd.DataFrame:
         )
 
     try:
-        idx = stock.get_index_ohlcv_by_date(START, END, KOSPI_INDEX_CODE)
+        idx_raw = _call_capture_stderr(stock.get_index_ohlcv_by_date, START, END, KOSPI_INDEX_CODE)
     except Exception as e:
         raise RuntimeError(
             f"KOSPI 지수 데이터 조회 중 오류 발생: {str(e)}\n"
             "KRX 인증 정보를 확인하고 다시 시도하세요."
         ) from e
 
-    if idx is None or idx.empty:
+    if idx_raw is None or (isinstance(idx_raw, pd.DataFrame) and idx_raw.empty):
         raise RuntimeError("No KOSPI index data returned.")
-
     try:
-        idx = idx.reset_index().rename(columns={"날짜": "date", "종가": "close"})
+        idx = normalize_index_ohlcv(idx_raw)
     except Exception as e:
         raise RuntimeError(
-            f"KOSPI 지수 데이터 포맷 오류: {str(e)}\n"
-            "조회한 데이터 구조: {list(idx.columns)}"
+            f"KOSPI 지수 데이터 포맷 오류(정규화 실패): {e}\n"
+            f"조회한 데이터 구조: {list(idx_raw.columns) if hasattr(idx_raw, 'columns') else str(type(idx_raw))}"
         ) from e
-
-    idx["date"] = pd.to_datetime(idx["date"])
     idx["market_ma"] = idx["close"].rolling(MARKET_MA_DAYS).mean()
     idx["market_ma_slope"] = idx["market_ma"] - idx["market_ma"].shift(MARKET_SLOPE_DAYS)
     idx["risk_on"] = (idx["close"] >= idx["market_ma"]) & (idx["market_ma_slope"] >= 0)
@@ -924,7 +1075,7 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
 
     strategy_stats = calc_stats(df, "equity")
     period = get_backtest_period(df, "equity")
-    invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).mean()
+    invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).mean()
 
     print("\n=== 일반 백테스트 결과 ===")
     print(f"모드: single")
