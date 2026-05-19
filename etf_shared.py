@@ -59,7 +59,8 @@ def get_strategy_config() -> dict:
 
 
 def zscore(series: pd.Series) -> pd.Series:
-    series = series.replace([np.inf, -np.inf], np.nan)
+    # replace에서의 암묵적 다운캐스팅 경고를 피하기 위해 infer_objects를 적용합니다.
+    series = series.replace([np.inf, -np.inf], np.nan).infer_objects(copy=False)
     if series.notna().sum() < 2:
         return pd.Series(0.0, index=series.index)
     filled = series.fillna(series.median())
