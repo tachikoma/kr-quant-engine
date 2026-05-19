@@ -532,7 +532,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=15.0" },
-    { name = "pykrx", specifier = ">=1.2.7" },
+    { name = "pykrx", specifier = ">=1.2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
@@ -1004,7 +1004,7 @@ wheels = [
 
 [[package]]
 name = "pykrx"
-version = "1.2.7"
+version = "1.2.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "deprecated" },
@@ -1015,9 +1015,9 @@ dependencies = [
     { name = "pandas" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e9/be/1325cfbf43491c7c39ba49749c67da051d26ccaf0f77a601a113c3f21dc7/pykrx-1.2.7.tar.gz", hash = "sha256:739f377db37ad5591e4765965ec475ea07aa2904ec2f6e66180a57e428dab0c3", size = 5735161, upload-time = "2026-04-16T11:47:30.461Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/c0/e424304f0a6e6a95cca62a5da7fb463109a2cb1dc9af3f374fe9b75d1f81/pykrx-1.2.8.tar.gz", hash = "sha256:b2da03e62047db0ca7eefbcdf5bc2489857fa25a6faf1c2ddbb070b10fab0246", size = 5736268, upload-time = "2026-05-04T09:51:00.833Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/dd/6cf0878dfc833d7a3ae72f35f69126d547341593fcb51ec5019ebfce3880/pykrx-1.2.7-py3-none-any.whl", hash = "sha256:9382533ed27a575ca4af2ba03055b6f6f9168a5a96b51f6e4fcf398093f87c16", size = 2196528, upload-time = "2026-04-16T11:47:28.619Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/df/1c5766fe9a79ad43992d086d4b5e787b1efb9a950b47b0c8712c293c08bc/pykrx-1.2.8-py3-none-any.whl", hash = "sha256:e6d6e206d81575fedfa6a6bcea2d3843ea880f24bc79c1059121829975a9bd70", size = 2196865, upload-time = "2026-05-04T09:50:59.408Z" },
 ]
 
 [[package]]
