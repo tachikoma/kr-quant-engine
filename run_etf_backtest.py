@@ -12,10 +12,12 @@ from etf_shared import (
     ETF_LIST,
     ETF_MAX_POSITIONS,
     ETF_SELL_RANK_BUFFER,
+    ETF_TAXABLE_SELL_TAX_PCT,
     KOSPI_INDEX_CODE,
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     REBALANCE_STEP_DAYS,
+    TAXABLE_ETF_TICKERS,
     rank_etfs,
     apply_buy_cost,
     build_rebalance_orders,
@@ -657,6 +659,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
     cash = float(initial_cash)
     holdings = {}
+    holding_cost_basis = {}
     trades = []
     equity_rows = []
 
@@ -712,9 +715,12 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 available_cash=cash,
                 latest_buy_prices=latest_buy_prices,
                 latest_sell_prices=latest_sell_prices,
+                current_cost_basis=holding_cost_basis,
                 max_positions=max_positions,
                 sell_rank_buffer=ETF_SELL_RANK_BUFFER,
                 slippage=slippage,
+                sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+                taxable_tickers=TAXABLE_ETF_TICKERS,
                 allow_empty_target_sell=False,
                 generate_orders=True,
                 max_asset_pct=max_asset_pct,
@@ -730,6 +736,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
                 if side == "SELL":
                     holdings.pop(ticker, None)
+                    holding_cost_basis.pop(ticker, None)
                     cash += float(o.get("estimated_value", 0.0))
                     trades.append(
                         {
@@ -747,7 +754,14 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     cost = float(o.get("estimated_value", 0.0))
                     if qty <= 0:
                         continue
-                    holdings[ticker] = int(holdings.get(ticker, 0)) + qty
+                    prev_qty = int(holdings.get(ticker, 0) or 0)
+                    holdings[ticker] = prev_qty + qty
+                    fill_unit_cost = cost / qty if qty > 0 else 0.0
+                    if ticker in holding_cost_basis and prev_qty > 0:
+                        previous_total_cost = float(holding_cost_basis[ticker]) * prev_qty
+                        holding_cost_basis[ticker] = (previous_total_cost + cost) / holdings[ticker]
+                    else:
+                        holding_cost_basis[ticker] = fill_unit_cost
                     cash -= cost
                     trades.append(
                         {

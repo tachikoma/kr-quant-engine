@@ -7,6 +7,16 @@ import pandas as pd
 BUY_FEE_PCT = 0.00015
 SELL_FEE_PCT = 0.00015
 ETF_SELL_TAX_PCT = 0.0
+ETF_TAXABLE_SELL_TAX_PCT = 0.154
+
+# 현재 전략에서 매매차익 과세를 반영할 기타 ETF 후보입니다.
+TAXABLE_ETF_TICKERS = {
+    "143850",  # KODEX 미국S&P500선물(H)
+    "133690",  # TIGER 미국나스닥100
+    "472150",  # TIGER 배당커버드콜액티브
+    "486290",  # TIGER 미국나스닥100타겟데일리커버드콜
+    "411060",  # ACE KRX금현물
+}
 
 REBALANCE_STEP_DAYS = 10
 KOSPI_INDEX_CODE = "1001"
@@ -101,9 +111,25 @@ def apply_buy_cost(price: float, slippage: float) -> float:
     return price * (1 + slippage) * (1 + BUY_FEE_PCT)
 
 
-def apply_sell_value(price: float, qty: int, sell_tax_pct: float, slippage: float) -> float:
+def is_taxable_etf(ticker: str, taxable_tickers: set[str] | None = None) -> bool:
+    target_set = taxable_tickers if taxable_tickers is not None else TAXABLE_ETF_TICKERS
+    return str(ticker) in target_set
+
+
+def apply_sell_value(
+    price: float,
+    qty: int,
+    sell_tax_pct: float,
+    slippage: float,
+    cost_basis_per_share: float | None = None,
+) -> float:
     sell_price = price * (1 - slippage)
-    return qty * sell_price * (1 - SELL_FEE_PCT - sell_tax_pct)
+    gross_proceeds = qty * sell_price
+    taxable_gain = 0.0
+    if cost_basis_per_share is not None:
+        taxable_gain = max(0.0, gross_proceeds - qty * float(cost_basis_per_share))
+    estimated_tax = taxable_gain * max(float(sell_tax_pct or 0.0), 0.0)
+    return gross_proceeds * (1 - SELL_FEE_PCT) - estimated_tax
 
 
 def build_rebalance_orders(
@@ -113,9 +139,12 @@ def build_rebalance_orders(
     available_cash: float,
     latest_buy_prices: dict[str, float] | None = None,
     latest_sell_prices: dict[str, float] | None = None,
+    current_cost_basis: dict[str, float] | None = None,
     max_positions: int = ETF_MAX_POSITIONS,
     sell_rank_buffer: int = ETF_SELL_RANK_BUFFER,
     slippage: float = 0.0005,
+    sell_tax_pct: float = ETF_SELL_TAX_PCT,
+    taxable_tickers: set[str] | None = None,
     allow_empty_target_sell: bool = False,
     generate_orders: bool = True,
     max_asset_pct: float | None = None,
@@ -156,9 +185,24 @@ def build_rebalance_orders(
         except Exception:
             return {}
 
+    def _to_float_dict(src) -> dict[str, float]:
+        if src is None:
+            return {}
+        try:
+            items = src.items() if hasattr(src, "items") else dict(src).items()
+            result: dict[str, float] = {}
+            for k, v in items:
+                if v is None or pd.isna(v):
+                    continue
+                result[str(k)] = float(v)
+            return result
+        except Exception:
+            return {}
+
     base_prices = _to_price_dict(latest_prices)
     buy_prices = _to_price_dict(latest_buy_prices) if latest_buy_prices is not None else base_prices
     sell_prices = _to_price_dict(latest_sell_prices) if latest_sell_prices is not None else base_prices
+    cost_basis_map = _to_float_dict(current_cost_basis)
 
     # 대상 티커 목록을 문자열 리스트로 정리
     targets: list[str] = [str(t) for t in target_tickers] if target_tickers else []
@@ -201,7 +245,28 @@ def build_rebalance_orders(
             continue
 
         try:
-            estimated_value = apply_sell_value(float(price), qty_i, ETF_SELL_TAX_PCT, slippage)
+            cost_basis_per_share = cost_basis_map.get(ticker)
+            tax_rate = 0.0
+            if float(sell_tax_pct or 0.0) > 0:
+                if taxable_tickers is None:
+                    tax_rate = float(sell_tax_pct)
+                elif ticker in taxable_tickers:
+                    tax_rate = float(sell_tax_pct)
+
+            estimated_value = apply_sell_value(
+                float(price),
+                qty_i,
+                tax_rate,
+                slippage,
+                cost_basis_per_share=cost_basis_per_share,
+            )
+            # estimated_tax: 주문 기록용 참고값 (estimated_value에 이미 반영됨)
+            sell_price_adj = float(price) * (1 - slippage)
+            gross_proceeds_adj = qty_i * sell_price_adj
+            taxable_gain = 0.0
+            if cost_basis_per_share is not None:
+                taxable_gain = max(0.0, gross_proceeds_adj - qty_i * cost_basis_per_share)
+            estimated_tax = taxable_gain * max(tax_rate, 0.0)
         except Exception as e:
             print(f"[주문계산][매도오류] {ticker} estimated_value 계산 실패: {e}")
             continue
@@ -214,6 +279,7 @@ def build_rebalance_orders(
                 "qty": qty_i,
                 "reference_price": float(price),
                 "estimated_value": float(estimated_value),
+                "estimated_tax": float(estimated_tax),
                 "reason": "ETF_REBALANCE",
             }
         )
