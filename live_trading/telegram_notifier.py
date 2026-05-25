@@ -153,15 +153,15 @@ class TelegramNotifier:
                 filled = r.get("filled_qty", 0)
                 total = r.get("requested_qty", r.get("qty", 0))
                 ok = "✓" if r.get("is_filled") else "✗"
-                lines.append(f"  {ok} {r['ticker']} {filled:,}/{total:,}주")
+                lines.append(f"  {ok} {r.get('display_name', r['ticker'])} {filled:,}/{total:,}주")
 
         if buy_results:
             lines.append("\n<b>[매수]</b>")
             for r in buy_results:
                 filled = r.get("filled_qty", 0)
                 total = r.get("requested_qty", r.get("qty", 0))
-                ok = "✓" if r.get("is_filled") else "✗"
-                lines.append(f"  {ok} {r['ticker']} {filled:,}/{total:,}주")
+                ok = "\u2713" if r.get("is_filled") else "\u2717"
+                lines.append(f"  {ok} {r.get('display_name', r['ticker'])} {filled:,}/{total:,}주")
 
         if not sell_results and not buy_results:
             lines.append("주문 없음")

@@ -152,9 +152,12 @@ def build_rebalance_orders(
     allow_empty_target_sell: bool = False,
     generate_orders: bool = True,
     max_asset_pct: float | None = None,
+    ticker_names: dict[str, str] | None = None,
 ) -> list[dict]:
     """리밸런싱 주문 목록을 생성한다."""
     orders: list[dict] = []
+    # 로그/display_name용: ticker_names가 있으면 '종목명(코드)' 형태, 없으면 코드 그대로
+    _dn = lambda t: (ticker_names or {}).get(t, t)  # noqa: E731
 
     # --- 입력 정규화 및 방어 로직 ---
     # current_holdings: 키를 문자열로, 값은 정수로 변환
@@ -240,12 +243,12 @@ def build_rebalance_orders(
         rank = target_rank.get(ticker)
         keep_by_rank = rank is not None and rank <= sell_rank_buffer
         if keep_by_rank:
-            print(f"[주문계산][매도스킵] {ticker} 보유유지 (랭크={rank}, 버퍼={sell_rank_buffer})")
+            print(f"[주문계산][매도스킵] {_dn(ticker)} 보유유지 (랭크={rank}, 버퍼={sell_rank_buffer})")
             continue
 
         price = sell_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[주문계산][매도스킵] {ticker} 매도가격 없음/비정상 (sell_price={price})")
+            print(f"[주문계산][매도스킵] {_dn(ticker)} 매도가격 없음/비정상 (sell_price={price})")
             continue
 
         try:
@@ -272,7 +275,7 @@ def build_rebalance_orders(
                 taxable_gain = max(0.0, gross_proceeds_adj - qty_i * cost_basis_per_share)
             estimated_tax = taxable_gain * max(tax_rate, 0.0)
         except Exception as e:
-            print(f"[주문계산][매도오류] {ticker} estimated_value 계산 실패: {e}")
+            print(f"[주문계산][매도오류] {_dn(ticker)} estimated_value 계산 실패: {e}")
             continue
 
         cash += float(estimated_value)
@@ -280,6 +283,7 @@ def build_rebalance_orders(
             {
                 "side": "SELL",
                 "ticker": ticker,
+                "display_name": _dn(ticker),
                 "qty": qty_i,
                 "reference_price": float(price),
                 "estimated_value": float(estimated_value),
@@ -325,23 +329,23 @@ def build_rebalance_orders(
     for ticker in buy_list:
         price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[주문계산][매수스킵] {ticker} 매수가격 없음/비정상 (buy_price={price})")
+            print(f"[주문계산][매수스킵] {_dn(ticker)} 매수가격 없음/비정상 (buy_price={price})")
             continue
 
         try:
             unit_cost = apply_buy_cost(float(price), slippage)
         except Exception as e:
-            print(f"[주문계산][매수오류] {ticker} unit_cost 계산 실패: {e}")
+            print(f"[주문계산][매수오류] {_dn(ticker)} unit_cost 계산 실패: {e}")
             continue
 
         if unit_cost <= 0:
-            print(f"[주문계산][매수스킵] {ticker} 단가 비정상 (unit_cost={unit_cost})")
+            print(f"[주문계산][매수스킵] {_dn(ticker)} 단가 비정상 (unit_cost={unit_cost})")
             continue
 
         qty = int(budget // unit_cost)
         if qty <= 0:
             print(
-                f"[주문계산][매수스킵] {ticker} 수량 0 "
+                f"[주문계산][매수스킵] {_dn(ticker)} 수량 0 "
                 f"(budget={budget:,.0f}, unit_cost={unit_cost:,.0f})"
             )
             continue
@@ -350,10 +354,10 @@ def build_rebalance_orders(
         if max_allowed_per_asset is not None:
             allowed_qty = int(max_allowed_per_asset // unit_cost)
             if allowed_qty <= 0:
-                print(f"[주문계산][cap] {ticker} cap으로 인해 매수 불가 (allowed_qty=0)")
+                print(f"[주문계산][cap] {_dn(ticker)} cap으로 인해 매수 불가 (allowed_qty=0)")
                 continue
             if qty > allowed_qty:
-                print(f"[주문계산][cap] {ticker} cap enforced: qty {qty} -> {allowed_qty}")
+                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty}")
                 qty = allowed_qty
 
         cost = qty * unit_cost
@@ -362,7 +366,7 @@ def build_rebalance_orders(
             cost = qty * unit_cost
         if qty <= 0:
             print(
-                f"[주문계산][매수스킵] {ticker} 잔여예수금 부족 "
+                f"[주문계산][매수스킵] {_dn(ticker)} 잔여예수금 부족 "
                 f"(cash={cash:,.0f}, unit_cost={unit_cost:,.0f})"
             )
             continue
@@ -372,6 +376,7 @@ def build_rebalance_orders(
             {
                 "side": "BUY",
                 "ticker": ticker,
+                "display_name": _dn(ticker),
                 "qty": qty,
                 "reference_price": float(price),
                 "estimated_value": float(cost),

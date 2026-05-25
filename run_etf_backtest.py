@@ -7,7 +7,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from pykrx_utils import _call_capture_stderr, _range_has_weekday
+from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
 from etf_shared import (
     ETF_LIST,
     ETF_MAX_POSITIONS,
@@ -63,7 +63,6 @@ BASE_SLIPPAGE = SLIPPAGE_PCT
 from pykrx import stock
 
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
-ENABLE_TICKER_NAME_LOOKUP = os.environ.get("ENABLE_TICKER_NAME_LOOKUP", "0") == "1"
 
 # KRX 인증 정보 검증
 if not HAS_KRX_CREDENTIALS:
@@ -130,24 +129,6 @@ def _parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
     parser.add_argument("--mode", "-m", choices=["single", "experiment"], help="실행 모드: single 또는 experiment (옵션)", default=None)
     return parser.parse_args()
-
-
-def get_ticker_name(ticker: str) -> str:
-    # pykrx의 종목명 조회는 일부 환경에서 내부 에러 메시지를 직접 출력한다.
-    # 백테스트에는 종목명이 필수 정보가 아니므로 기본값은 ticker를 그대로 사용한다.
-    # 종목명 저장이 꼭 필요하면 .env에 ENABLE_TICKER_NAME_LOOKUP=1 을 추가한다.
-    if not (HAS_KRX_CREDENTIALS and ENABLE_TICKER_NAME_LOOKUP):
-        return ticker
-
-    try:
-        name = stock.get_market_ticker_name(ticker)
-        if name is None:
-            return ticker
-        if hasattr(name, "empty") and name.empty:
-            return ticker
-        return str(name)
-    except Exception:
-        return ticker
 
 
 def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:

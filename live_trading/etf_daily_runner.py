@@ -33,6 +33,12 @@ from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs
 from config_utils import parse_pct_env
 
 try:
+    from pykrx_utils import format_ticker as _format_ticker
+except Exception:
+    def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
+        return ticker
+
+try:
     from live_trading.kiwoom_adapter import KiwoomAdapter
 except Exception:
     KiwoomAdapter = None
@@ -380,7 +386,7 @@ def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return out
 
 
-def _load_snapshot(etf_list: list[str], lookback_days: int = 220) -> pd.DataFrame:
+def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: dict[str, str] | None = None) -> pd.DataFrame:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=lookback_days)
     start = _date_to_krx(start_day)
@@ -390,8 +396,10 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220) -> pd.DataFram
     t0 = dt.datetime.now()
 
     frames: list[pd.DataFrame] = []
+    _tn = ticker_names or {}
     for i, ticker in enumerate(etf_list, 1):
-        print(f"  ({i}/{len(etf_list)}) {ticker} 조회 중...", end=" ", flush=True)
+        dn = _tn.get(ticker, ticker)
+        print(f"  ({i}/{len(etf_list)}) {dn} 조회 중...", end=" ", flush=True)
         t1 = dt.datetime.now()
         if not _range_has_weekday(start, end):
             elapsed = (dt.datetime.now() - t1).total_seconds()
@@ -558,15 +566,20 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         elapsed = (dt.datetime.now() - t0).total_seconds()
         print(f"완료 ({elapsed:.1f}초) | 보유종목={len(holdings)}개, 예수금={cash:,.0f}")
 
+    # 로그/알림용 종목명 매핑 구성 (모든 후보 + 보유 종목 + 유니버스 외 보유)
+    _all_tickers = list(set(etf_list) | set(holdings_for_rebalance.keys()) | set(external_holdings.keys()))
+    ticker_names: dict[str, str] = {t: _format_ticker(t) for t in _all_tickers}
+
     # 2단계: ETF 가격 스냅샷 로드
-    snapshot = _load_snapshot(etf_list)
+    snapshot = _load_snapshot(etf_list, ticker_names=ticker_names)
     ranked = rank_etfs(snapshot)
+
     if not ranked.empty:
         print("[랭킹] ETF 순위:")
         for _, row in ranked.iterrows():
             trend_mark = "✓" if row.get("trend_ok") else "✗"
             print(
-                f"  {row['ticker']}  ret_60={row.get('ret_60', float('nan')):.2%}  "
+                f"  {ticker_names.get(row['ticker'], row['ticker'])}  ret_60={row.get('ret_60', float('nan')):.2%}  "
                 f"ret_120={row.get('ret_120', float('nan')):.2%}  trend={trend_mark}"
             )
 
@@ -618,15 +631,16 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
             sell_price = latest_sell_prices.get(ticker)
             buy_bad = buy_price is None or pd.isna(buy_price) or buy_price <= 0
             sell_bad = sell_price is None or pd.isna(sell_price) or sell_price <= 0
+            dn = ticker_names.get(ticker, ticker)
             if buy_bad and sell_bad:
                 print(
-                    f"  {ticker}: 매수/매도 가격 미조회/비정상 "
+                    f"  {dn}: 매수/매도 가격 미조회/비정상 "
                     f"(buy={buy_price}, sell={sell_price})"
                 )
             else:
                 buy_text = "N/A" if buy_bad else f"{float(buy_price):,.0f}"
                 sell_text = "N/A" if sell_bad else f"{float(sell_price):,.0f}"
-                print(f"  {ticker}: buy={buy_text}, sell={sell_text}")
+                print(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
     orders = build_rebalance_orders(
         current_holdings=holdings_for_rebalance,
@@ -642,6 +656,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
         slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
         generate_orders=rebalance_due,
+        ticker_names=ticker_names,
     )
 
     sell_orders = [o for o in orders if o.get("side") == "SELL"]
@@ -654,6 +669,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         "holdings": holdings,
         "cash": cash,
         "target": target,
+        "ticker_names": ticker_names,
         "blocked_external_holdings": external_holdings,
         "ranked_top": ranked.head(10).to_dict(orient="records") if not ranked.empty else [],
         "sell_orders": sell_orders,
@@ -675,6 +691,7 @@ def _submit_orders(
 
     for order in orders:
         ticker = str(order.get("ticker"))
+        display_name = str(order.get("display_name", ticker))
         qty = int(order.get("qty", 0))
         if qty <= 0:
             continue
@@ -683,6 +700,7 @@ def _submit_orders(
             results.append(
                 {
                     "ticker": ticker,
+                    "display_name": display_name,
                     "side": side,
                     "attempt": attempt,
                     "order_type": order_type,
@@ -704,6 +722,7 @@ def _submit_orders(
             results.append(
                 {
                     "ticker": ticker,
+                    "display_name": display_name,
                     "side": side,
                     "attempt": attempt,
                     "order_type": order_type,
@@ -719,11 +738,12 @@ def _submit_orders(
                 }
             )
             if notifier is not None:
-                notifier.notify_order_submitted(side, ticker, qty, order_id, attempt)
+                notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
         except Exception as exc:
             results.append(
                 {
                     "ticker": ticker,
+                    "display_name": display_name,
                     "side": side,
                     "attempt": attempt,
                     "order_type": order_type,
@@ -739,7 +759,7 @@ def _submit_orders(
                 }
             )
             if notifier is not None:
-                notifier.notify_order_error(side, ticker, qty, exc)
+                notifier.notify_order_error(side, display_name, qty, exc)
 
     return results
 
@@ -799,7 +819,7 @@ def _poll_and_finalize_orders(
                     price = _extract_exec_price(row)
                     notifier.notify_order_filled(
                         row.get("side", ""),
-                        row["ticker"],
+                        row.get("display_name", row["ticker"]),
                         row["filled_qty"],
                         row["requested_qty"],
                         price,
@@ -823,7 +843,7 @@ def _poll_and_finalize_orders(
                 row["cancel_submitted"] = True
                 row["cancel_response"] = cancel_resp
                 if notifier is not None:
-                    notifier.notify_order_cancelled(row.get("side", ""), ticker, remaining_qty)
+                    notifier.notify_order_cancelled(row.get("side", ""), row.get("display_name", ticker), remaining_qty)
             except Exception as exc:
                 row["cancel_submitted"] = False
                 row["cancel_error"] = str(exc)
@@ -833,7 +853,7 @@ def _poll_and_finalize_orders(
             if notifier is not None:
                 filled = row.get("filled_qty", 0)
                 total = row.get("requested_qty", row.get("qty", 0))
-                notifier.notify_order_timeout(row.get("side", ""), ticker, filled, total)
+                notifier.notify_order_timeout(row.get("side", ""), row.get("display_name", ticker), filled, total)
 
         row["is_filled"] = bool(row.get("remaining_qty", 0) == 0)
         row["timed_out"] = True
@@ -888,6 +908,7 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
 
 
 def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
+    tn = plan.get("ticker_names") or {}
     print("=== ETF 하루 1회 실행 계획 ===")
     print(f"기준일: {plan['today']}")
     print(f"risk_on: {plan['risk_on']}")
@@ -901,19 +922,19 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
     if plan['holdings']:
         print("  현재 보유:")
         for ticker, qty in plan['holdings'].items():
-            print(f"    {ticker}: {qty}주")
+            print(f"    {tn.get(ticker, ticker)}: {qty}주")
     blocked_external = plan.get("blocked_external_holdings") or {}
     if blocked_external:
         print("  매도 제외(유니버스 외 보유):")
         for ticker, qty in blocked_external.items():
-            print(f"    {ticker}: {qty}주")
-    print(f"목표 티커: {plan['target']}")
+            print(f"    {tn.get(ticker, ticker)}: {qty}주")
+    print(f"목표 티커: {[tn.get(t, t) for t in plan['target']]}")
     print(f"매도 주문 수: {len(plan['sell_orders'])}, 매수 주문 수: {len(plan['buy_orders'])}")
     if plan['sell_orders']:
         print("  매도 주문 상세:")
         for o in plan['sell_orders']:
             print(
-                f"    SELL {o['ticker']} {o['qty']}주 "
+                f"    SELL {o.get('display_name', o['ticker'])} {o['qty']}주 "
                 f"(참고가={o.get('reference_price', 0):,.0f}, "
                 f"예상금액={o.get('estimated_value', 0):,.0f})"
             )
@@ -921,7 +942,7 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
         print("  매수 주문 상세:")
         for o in plan['buy_orders']:
             print(
-                f"    BUY  {o['ticker']} {o['qty']}주 "
+                f"    BUY  {o.get('display_name', o['ticker'])} {o['qty']}주 "
                 f"(참고가={o.get('reference_price', 0):,.0f}, "
                 f"예상금액={o.get('estimated_value', 0):,.0f})"
             )

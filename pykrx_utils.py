@@ -138,3 +138,57 @@ def _range_has_weekday(start_ymd: str, end_ymd: str) -> bool:
         return any(d.weekday() < 5 for d in dr)
     except Exception:
         return True
+
+
+def get_ticker_name(ticker: str) -> str:
+    """종목 코드로 종목명을 조회합니다.
+
+    ENABLE_TICKER_NAME_LOOKUP=1 이고 KRX 인증 정보가 있을 때만 pykrx를 호출합니다.
+    비활성화 또는 실패 시 ticker 코드를 그대로 반환합니다.
+    """
+    # 함수 호출 시점에 읽어야 load_dotenv() 이후 값이 반영됨
+    if os.environ.get("ENABLE_TICKER_NAME_LOOKUP", "0") != "1":
+        return ticker
+    if not (os.environ.get("KRX_ID") and os.environ.get("KRX_PW")):
+        return ticker
+    try:
+        from pykrx import stock as _stock  # lazy import: load_dotenv() 이후에 실행됨
+
+        def _is_valid(val: object) -> bool:
+            """pykrx 반환값이 유효한 종목명인지 확인합니다."""
+            if val is None:
+                return False
+            if hasattr(val, "empty") and val.empty:
+                return False
+            s = str(val).strip()
+            return bool(s)
+
+        buf = io.StringIO()
+        # 1단계: ETF 전용 API 시도 (일반 주식 API보다 ETF에서 더 정확)
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            name = _stock.get_etf_ticker_name(ticker)
+        if _is_valid(name):
+            return str(name).strip()
+
+        # 2단계: 일반 주식 API 폴백 (ETF가 아닌 종목 커버)
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2), contextlib.redirect_stderr(buf2):
+            name = _stock.get_market_ticker_name(ticker)
+        if _is_valid(name):
+            return str(name).strip()
+
+        return ticker
+    except Exception:
+        return ticker
+
+
+def format_ticker(ticker: str) -> str:
+    """종목 코드를 '종목명(코드)' 형태로 포맷합니다.
+
+    ENABLE_TICKER_NAME_LOOKUP=1 이고 종목명 조회 성공 시: 'KODEX 200(069500)' 반환
+    비활성화 또는 실패 시: '069500' (ticker 코드) 그대로 반환
+    """
+    name = get_ticker_name(ticker)
+    if name == ticker:
+        return ticker
+    return f"{name}({ticker})"
