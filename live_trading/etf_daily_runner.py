@@ -37,6 +37,11 @@ try:
 except Exception:
     KiwoomAdapter = None
 
+try:
+    from live_trading.telegram_notifier import TelegramNotifier
+except Exception:
+    TelegramNotifier = None
+
 
 def _load_dotenv(dotenv_path: Path | None = None) -> None:
     path = dotenv_path or (PROJECT_ROOT / ".env")
@@ -664,6 +669,7 @@ def _submit_orders(
     dry_run: bool,
     order_type: str = "MARKET",
     attempt: int = 1,
+    notifier: Any = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
@@ -694,6 +700,7 @@ def _submit_orders(
 
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
+            order_id = response.get("order_id", "")
             results.append(
                 {
                     "ticker": ticker,
@@ -707,10 +714,12 @@ def _submit_orders(
                     "is_filled": False,
                     "submitted": True,
                     "mode": "LIVE",
-                    "order_id": response.get("order_id", ""),
+                    "order_id": order_id,
                     "response": response.get("response", {}),
                 }
             )
+            if notifier is not None:
+                notifier.notify_order_submitted(side, ticker, qty, order_id, attempt)
         except Exception as exc:
             results.append(
                 {
@@ -729,6 +738,8 @@ def _submit_orders(
                     "error": str(exc),
                 }
             )
+            if notifier is not None:
+                notifier.notify_order_error(side, ticker, qty, exc)
 
     return results
 
@@ -740,6 +751,7 @@ def _poll_and_finalize_orders(
     poll_interval_sec: int,
     cutoff_time_hhmm: str,
     cancel_unfilled_orders: bool,
+    notifier: Any = None,
 ) -> list[dict[str, Any]]:
     results = [dict(r) for r in submitted_results]
     pending_idx = {
@@ -783,6 +795,15 @@ def _poll_and_finalize_orders(
 
             if row["is_filled"]:
                 done_idx.append(i)
+                if notifier is not None:
+                    price = _extract_exec_price(row)
+                    notifier.notify_order_filled(
+                        row.get("side", ""),
+                        row["ticker"],
+                        row["filled_qty"],
+                        row["requested_qty"],
+                        price,
+                    )
 
         for i in done_idx:
             pending_idx.discard(i)
@@ -801,12 +822,18 @@ def _poll_and_finalize_orders(
                 cancel_resp = api.cancel_order(order_id=order_id, ticker=ticker, qty=remaining_qty)
                 row["cancel_submitted"] = True
                 row["cancel_response"] = cancel_resp
+                if notifier is not None:
+                    notifier.notify_order_cancelled(row.get("side", ""), ticker, remaining_qty)
             except Exception as exc:
                 row["cancel_submitted"] = False
                 row["cancel_error"] = str(exc)
         else:
             row["cancel_submitted"] = False
             row["cancel_skipped"] = True
+            if notifier is not None:
+                filled = row.get("filled_qty", 0)
+                total = row.get("requested_qty", row.get("qty", 0))
+                notifier.notify_order_timeout(row.get("side", ""), ticker, filled, total)
 
         row["is_filled"] = bool(row.get("remaining_qty", 0) == 0)
         row["timed_out"] = True
@@ -999,9 +1026,17 @@ def run_daily() -> None:
     if dry_run:
         print("[안전모드] LIVE_ORDER_ENABLED=0 또는 어댑터 미사용 상태입니다. 실제 주문은 전송하지 않습니다.")
 
+    # 실전 모드에서만 텔레그램 알림 활성화
+    notifier = None
+    if (not dry_run) and TelegramNotifier is not None:
+        try:
+            notifier = TelegramNotifier()
+        except Exception as _tg_exc:
+            print(f"[경고] 텔레그램 알림 초기화 실패: {_tg_exc}")
+
     # 1) 매도 우선
     print(f"\n[주문] ─── 매도 단계 ───")
-    sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1)
+    sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
     if sell_results:
         for r in sell_results:
             status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
@@ -1017,6 +1052,7 @@ def run_daily() -> None:
             poll_interval_sec=cfg.order_poll_interval_sec,
             cutoff_time_hhmm=cfg.sell_cutoff_time,
             cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+            notifier=notifier,
         )
         for r in sell_results:
             print(
@@ -1035,6 +1071,7 @@ def run_daily() -> None:
                     dry_run=False,
                     order_type=cfg.retry_order_type,
                     attempt=2,
+                    notifier=notifier,
                 )
                 sell_retry_results = _poll_and_finalize_orders(
                     api=api,
@@ -1043,6 +1080,7 @@ def run_daily() -> None:
                     poll_interval_sec=cfg.order_poll_interval_sec,
                     cutoff_time_hhmm=cfg.sell_cutoff_time,
                     cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+                    notifier=notifier,
                 )
 
     # 2) 매도 후 예수금 재확인(실주문 모드에서만)
@@ -1113,7 +1151,7 @@ def run_daily() -> None:
             print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
     print(f"\n[주문] ─── 매수 단계 ───")
     if can_buy:
-        buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1)
+        buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
         if buy_results:
             for r in buy_results:
                 status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
@@ -1127,6 +1165,7 @@ def run_daily() -> None:
                 poll_interval_sec=cfg.order_poll_interval_sec,
                 cutoff_time_hhmm=cfg.buy_cutoff_time,
                 cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+                notifier=notifier,
             )
             for r in buy_results:
                 print(
@@ -1145,6 +1184,7 @@ def run_daily() -> None:
                         dry_run=False,
                         order_type=cfg.retry_order_type,
                         attempt=2,
+                        notifier=notifier,
                     )
                     buy_retry_results = _poll_and_finalize_orders(
                         api=api,
@@ -1153,6 +1193,7 @@ def run_daily() -> None:
                         poll_interval_sec=cfg.order_poll_interval_sec,
                         cutoff_time_hhmm=cfg.buy_cutoff_time,
                         cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+                        notifier=notifier,
                     )
     else:
         print("[안전중단] 매도 주문이 전량 체결되지 않아 매수 주문을 제출하지 않습니다.")
@@ -1200,6 +1241,14 @@ def run_daily() -> None:
     print(f"매도 제출 건수: {len(sell_results)}")
     print(f"매수 제출 건수: {len(buy_results)}")
     print(f"상태 파일: {STATE_PATH}")
+
+    if notifier is not None:
+        notifier.notify_daily_summary(
+            trading_date=today,
+            run_status=run_status,
+            sell_results=sell_results + sell_retry_results,
+            buy_results=buy_results + buy_retry_results,
+        )
 
 
 if __name__ == "__main__":
