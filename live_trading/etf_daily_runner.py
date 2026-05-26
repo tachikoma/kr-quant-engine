@@ -325,6 +325,11 @@ def _cutoff_deadline(cutoff_time_hhmm: str, timeout_sec: int) -> dt.datetime:
     timeout_deadline = now + dt.timedelta(seconds=max(timeout_sec, 0))
     cutoff_time = _parse_hhmm(cutoff_time_hhmm)
     cutoff_dt = dt.datetime.combine(now.date(), cutoff_time, tzinfo=now.tzinfo)
+    # 컷오프가 이미 지난 경우: cutoff 제약을 무시하고 timeout_sec만 기준으로 사용합니다.
+    # (예: --force-live로 09:20에 실행 시 09:10 컷오프로 인해 deadline이 과거가 되어
+    #  체결 대기 루프가 0회 실행되는 것을 방지 — BUG-1)
+    if cutoff_dt <= now:
+        return timeout_deadline
     return min(timeout_deadline, cutoff_dt)
 
 
@@ -872,6 +877,81 @@ def _all_orders_filled(results: list[dict[str, Any]]) -> bool:
     return True
 
 
+def _wait_for_cancellations(
+    api: Any,
+    results: list[dict[str, Any]],
+    timeout_sec: int = 5,
+    poll_interval_sec: int = 1,
+) -> None:
+    """취소 요청이 제출된 주문들의 remaining_qty가 0이 될 때까지 폴링 대기한다.
+
+    재주문 전에 호출하여, 원주문 취소가 완료되기 전에 재주문이 나가
+    중복 체결되는 것을 방지합니다. (BUG-2)
+    """
+    cancel_rows = [
+        r for r in results
+        if r.get("cancel_submitted") and r.get("order_id")
+    ]
+    if not cancel_rows:
+        return
+
+    today_krx = _date_to_krx(_now_kst().date())
+    deadline = _now_kst() + dt.timedelta(seconds=max(timeout_sec, 0))
+    print(f"[취소확인] {len(cancel_rows)}건 취소 완료 대기 중 (최대 {timeout_sec}초)...")
+    pending = {str(r["order_id"]): r for r in cancel_rows}
+
+    while pending and _now_kst() < deadline:
+        for order_id in list(pending.keys()):
+            try:
+                status = api.get_order_status(order_id, today=today_krx)
+            except Exception as exc:
+                print(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
+                continue
+            remaining = int(status.get("remaining_qty", 1))
+            if remaining == 0 or not status.get("is_found", True):
+                row = pending.pop(order_id)
+                row["cancel_confirmed"] = True
+                print(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
+        if pending:
+            time.sleep(max(poll_interval_sec, 1))
+
+    for order_id in pending:
+        print(f"[취소확인] {order_id} → 미확인 (타임아웃, 계속 진행)")
+
+
+def _refresh_order_statuses(
+    api: Any,
+    results: list[dict[str, Any]],
+) -> None:
+    """각 주문의 현재 체결 상태를 API로 재조회하여 results를 in-place 업데이트한다.
+
+    재주문 전에 호출하여 실제 체결/잔량을 정확히 파악한 뒤
+    재주문 수량을 계산합니다. (BUG-3)
+    """
+    today_krx = _date_to_krx(_now_kst().date())
+    for row in results:
+        order_id = str(row.get("order_id", "")).strip()
+        if not order_id or not row.get("submitted"):
+            continue
+        try:
+            status = api.get_order_status(order_id, today=today_krx)
+        except Exception as exc:
+            print(f"[상태재조회] {order_id} 조회 실패: {exc}")
+            continue
+        filled_qty = int(status.get("filled_qty", 0))
+        order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
+        remaining_qty = int(status.get("remaining_qty", 0))
+        row["filled_qty"] = max(filled_qty, 0)
+        row["remaining_qty"] = max(remaining_qty, 0)
+        if order_qty > 0:
+            row["requested_qty"] = order_qty
+        row["is_filled"] = status.get("is_filled", False) or (row["remaining_qty"] == 0)
+        print(
+            f"[상태재조회] {row.get('ticker', order_id)} → "
+            f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"
+        )
+
+
 def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     retry_orders: list[dict[str, Any]] = []
     for row in results:
@@ -992,6 +1072,26 @@ def run_daily() -> None:
             )
             print("[안내] 테스트가 목적이라면 LIVE_ORDER_ENABLED=0(드라이런)으로 실행하세요.")
             return
+
+    # --force-live 등으로 컷오프 차단이 꺼진 상태에서 이미 컷오프를 지났으면
+    # 체결 대기 컷오프를 now + FORCE_LIVE_CUTOFF_EXTEND_MIN 분으로 자동 연장합니다.
+    # (기본 10분: 연장 후 BUY_CUTOFF, 절반값: SELL_CUTOFF)
+    if cfg.enable_live_order and (not cfg.block_live_after_cutoff):
+        _now_for_extend = _now_kst()
+        _live_cutoff_hhmm = _earlier_hhmm(cfg.sell_cutoff_time, cfg.buy_cutoff_time)
+        _live_cutoff_dt = dt.datetime.combine(
+            _now_for_extend.date(), _parse_hhmm(_live_cutoff_hhmm), tzinfo=_now_for_extend.tzinfo
+        )
+        if _now_for_extend >= _live_cutoff_dt:
+            _extend_min = int(os.environ.get("FORCE_LIVE_CUTOFF_EXTEND_MIN", "10"))
+            cfg.buy_cutoff_time = (_now_for_extend + dt.timedelta(minutes=_extend_min)).strftime("%H:%M")
+            cfg.sell_cutoff_time = (_now_for_extend + dt.timedelta(minutes=max(_extend_min // 2, 1))).strftime("%H:%M")
+            print(
+                f"[컷오프 연장] 현재 시각({_now_for_extend.strftime('%H:%M:%S')})이 "
+                f"컷오프({_live_cutoff_hhmm}) 이후입니다. "
+                f"자동 연장 → 매도={cfg.sell_cutoff_time}, 매수={cfg.buy_cutoff_time} "
+                f"(FORCE_LIVE_CUTOFF_EXTEND_MIN={_extend_min})"
+            )
 
     now = _now_kst().time()
     plan_time = _parse_hhmm(cfg.plan_time)
@@ -1149,12 +1249,16 @@ def run_daily() -> None:
             latest_buy_prices_after = {}
             latest_sell_prices_after = {}
 
+        # 예수금 안전 마진 적용: 키움 증거금 계산 방식 차이로 인한 증거금 부족을 방지 (BUG-4)
+        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능 (기본: 0.03 = 3%)
+        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", 0.03)
+        _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
         try:
             new_orders = build_rebalance_orders(
                 current_holdings=refreshed_holdings,
                 target_tickers=plan.get("target", []),
                 latest_prices=latest_prices_after,
-                available_cash=refreshed_cash if refreshed_cash is not None else 0.0,
+                available_cash=_effective_cash,
                 latest_buy_prices=latest_buy_prices_after,
                 latest_sell_prices=latest_sell_prices_after,
                 max_positions=cfg.max_positions,
@@ -1166,7 +1270,8 @@ def run_daily() -> None:
             plan["buy_orders"] = new_buy_orders
             print(
                 f"[정보] 매도 후 실제 상태로 매수 주문 재계산: 매수 후보={len(new_buy_orders)}건, "
-                f"예수금={refreshed_cash:,.0f}"
+                f"예수금={refreshed_cash:,.0f} "
+                f"(안전마진 {_budget_safety_margin:.1%} 적용, 실효={_effective_cash:,.0f})"
             )
         except Exception as exc:
             print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
@@ -1195,6 +1300,14 @@ def run_daily() -> None:
                     + (f" (타임아웃)" if r.get("timed_out") else "")
                 )
             if cfg.retry_unfilled_orders:
+                # 취소 완료 폴링(BUG-2) + 실시간 체결 상태 재조회(BUG-3) 후 재주문 수량 확정
+                _wait_for_cancellations(
+                    api,
+                    buy_results,
+                    timeout_sec=int(os.environ.get("CANCEL_CONFIRM_TIMEOUT_SEC", "5")),
+                    poll_interval_sec=cfg.order_poll_interval_sec,
+                )
+                _refresh_order_statuses(api, buy_results)
                 retry_buy_orders = _build_retry_orders(buy_results)
                 if retry_buy_orders:
                     print(f"[재시도] 매수 잔량 재주문 {len(retry_buy_orders)}건 제출")
