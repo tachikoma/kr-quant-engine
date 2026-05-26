@@ -1073,7 +1073,7 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).mean()
 
     print("\n=== 일반 백테스트 결과 ===")
-    print(f"모드: single")
+    print("모드: single")
     print(f"슬리피지: {BASE_SLIPPAGE * 10000:.0f}bp")
     print(f"스프레드: {SPREAD_PCT * 10000:.0f}bp")
     print(f"백테스트 기간: {period['start']} ~ {period['end']} ({period['trading_days']} 거래일, {period['years']:.2f}년)")

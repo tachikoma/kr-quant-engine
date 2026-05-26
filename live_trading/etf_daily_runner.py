@@ -17,7 +17,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import csv
 import sys
 import time
 import uuid
@@ -502,7 +501,7 @@ def _load_recent_trading_dates(reference_ticker: str, lookback_days: int = 120) 
 def _should_rebalance(today: str, state: dict[str, Any], step_days: int, reference_ticker: str) -> bool:
     last = state.get("last_rebalance_date")
     if not last:
-        print(f"[리밸런싱] 마지막 리밸런싱 기록 없음 → 즉시 실행")
+        print("[리밸런싱] 마지막 리밸런싱 기록 없음 → 즉시 실행")
         return True
 
     trading_dates = _load_recent_trading_dates(reference_ticker=reference_ticker, lookback_days=220)
@@ -1156,7 +1155,7 @@ def run_daily() -> None:
             print(f"[경고] 텔레그램 알림 초기화 실패: {_tg_exc}")
 
     # 1) 매도 우선
-    print(f"\n[주문] ─── 매도 단계 ───")
+    print("\n[주문] ─── 매도 단계 ───")
     sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
     if sell_results:
         for r in sell_results:
@@ -1179,7 +1178,7 @@ def run_daily() -> None:
             print(
                 f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                 f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
-                + (f" (타임아웃)" if r.get("timed_out") else "")
+                + (" (타임아웃)" if r.get("timed_out") else "")
             )
         if cfg.retry_unfilled_orders:
             retry_sell_orders = _build_retry_orders(sell_results)
@@ -1275,7 +1274,7 @@ def run_daily() -> None:
             )
         except Exception as exc:
             print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
-    print(f"\n[주문] ─── 매수 단계 ───")
+    print("\n[주문] ─── 매수 단계 ───")
     if can_buy:
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
         if buy_results:
@@ -1297,7 +1296,7 @@ def run_daily() -> None:
                 print(
                     f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                     f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
-                    + (f" (타임아웃)" if r.get("timed_out") else "")
+                    + (" (타임아웃)" if r.get("timed_out") else "")
                 )
             if cfg.retry_unfilled_orders:
                 # 취소 완료 폴링(BUG-2) + 실시간 체결 상태 재조회(BUG-3) 후 재주문 수량 확정
