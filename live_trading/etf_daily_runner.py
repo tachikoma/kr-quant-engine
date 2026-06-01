@@ -28,7 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs
+from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
+    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS
 from config_utils import parse_pct_env
 
 try:
@@ -669,6 +670,8 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
         # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
         slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
+        sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+        taxable_tickers=TAXABLE_ETF_TICKERS,
         generate_orders=rebalance_due,
         ticker_names=ticker_names,
     )
@@ -1283,6 +1286,8 @@ def run_daily() -> None:
                 max_positions=cfg.max_positions,
                 sell_rank_buffer=cfg.sell_rank_buffer,
                 allow_empty_target_sell=not plan.get("risk_on", True),
+                sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+                taxable_tickers=TAXABLE_ETF_TICKERS,
                 generate_orders=True,
             )
             new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]

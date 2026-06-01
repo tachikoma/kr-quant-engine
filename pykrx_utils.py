@@ -2,6 +2,7 @@
 
 - fd 수준(stdout/stderr) 캡처와 주말 범위 스킵 판별 함수를 제공합니다.
 - 원래 `run_etf_backtest.py`에 있던 로직을 공용 모듈로 추출했습니다.
+- KRX ETF 분류 데이터 조회/캐싱 함수를 포함합니다.
 
 모든 주석은 한국어로 작성되어 있으며, 함수 이름은 기존 코드와 호환되도록 언더스코어 접두사를 유지합니다.
 """
@@ -9,8 +10,10 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import contextlib
 import sys
+from pathlib import Path
 import pandas as pd
 
 
@@ -180,6 +183,86 @@ def get_ticker_name(ticker: str) -> str:
         return ticker
     except Exception:
         return ticker
+
+
+TAX_CACHE_PATH = "data_cache/etf_tax_classification.parquet"
+
+
+def _fetch_krx_etf_classification() -> pd.DataFrame:
+    """pykrx 내부 API를 통해 KRX 전종목 ETF 분류 데이터를 조회한다.
+    KRX 로그인(KRX_ID/KRX_PW)이 필요하다.
+    """
+    from pykrx.website.krx.etx.core import ETF_전종목기본종목
+
+    df = ETF_전종목기본종목().fetch()
+    if df is None or df.empty:
+        raise ValueError("ETF classification data is empty (KRX login may be required)")
+    return df
+
+
+def fetch_and_cache_tax_classification(cache_path: str = TAX_CACHE_PATH) -> pd.DataFrame:
+    """KRX ETF 분류 데이터를 조회하여 parquet 캐시에 저장한다.
+    로컬에 KRX_ID/KRX_PW가 설정되어 있어야 한다.
+    """
+    df = _fetch_krx_etf_classification()
+    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    print(f"[pykrx_utils] ETF 분류 데이터 캐시 저장 완료: {cache_path} ({len(df)}개 종목)")
+    return df
+
+
+def load_tax_classification(cache_path: str = TAX_CACHE_PATH) -> pd.DataFrame | None:
+    """캐시에서 ETF 분류 데이터를 로드한다. 없으면 None."""
+    p = Path(cache_path)
+    if p.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            return None
+    return None
+
+
+def get_taxable_tickers(
+    ticker_subset: set[str] | None = None,
+    cache_path: str = TAX_CACHE_PATH,
+    max_age_days: int = 30,
+) -> set[str] | None:
+    """KRX ETF 분류 데이터를 기반으로 과세 대상 ticker set을 반환한다.
+
+    1순위: data_cache/ parquet 캐시 (max_age_days 이내)
+    2순위: KRX API 실시간 조회 (KRX_ID/KRX_PW 필요)
+    실패 시 None 반환 (호출자가 hardcoded fallback 처리)
+
+    ticker_subset이 주어지면 해당 subset 내에서만 필터링한다.
+    """
+    df = None
+
+    # 1순위: 캐시 확인
+    p = Path(cache_path)
+    if p.exists():
+        try:
+            age = time.time() - p.stat().st_mtime
+            if age < max_age_days * 86400:
+                df = pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
+    # 2순위: KRX API 실시간 조회 (캐시가 없거나 만료된 경우)
+    if df is None:
+        try:
+            df = _fetch_krx_etf_classification()
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(cache_path, index=False)
+        except Exception:
+            return None
+
+    if df is None or df.empty:
+        return None
+
+    taxable = set(df.loc[df["TAX_TP_CD"] != "비과세", "ISU_SRT_CD"].unique())
+    if ticker_subset:
+        taxable &= ticker_subset
+    return taxable
 
 
 def format_ticker(ticker: str) -> str:
