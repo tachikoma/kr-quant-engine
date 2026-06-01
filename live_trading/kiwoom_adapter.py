@@ -62,36 +62,6 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_dotenv(dotenv_path: str | Path | None = None) -> None:
-    if dotenv_path is None:
-        dotenv_path = PROJECT_ROOT / ".env"
-    path = Path(dotenv_path)
-    if not path.exists():
-        return
-
-    with path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not (value.startswith('"') and value.endswith('"')) \
-               and not (value.startswith("'") and value.endswith("'")):
-                comment_idx = value.find(" #")
-                if comment_idx > 0:
-                    value = value[:comment_idx].strip()
-            value = value.strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-
-
 class KiwoomAdapter:
     """ETF 드라이런/하루 1회 라이브 러너에서 사용하는 소형 어댑터."""
 
