@@ -12,7 +12,7 @@ ETF 드라이런/라이브 실행용 키움 REST 어댑터.
 - cancel_order()
 
 필수 환경 변수(보통 `.env`에 설정):
-- KIWOOM_BASE_URL
+- ENV_MODE (real / demo, 기본값 real)
 - KIWOOM_APPKEY
 - KIWOOM_SECRETKEY
 
@@ -80,19 +80,27 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if not (value.startswith('"') and value.endswith('"')) \
+               and not (value.startswith("'") and value.endswith("'")):
+                comment_idx = value.find(" #")
+                if comment_idx > 0:
+                    value = value[:comment_idx].strip()
+            value = value.strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
 
-
-load_dotenv()
 
 
 class KiwoomAdapter:
     """ETF 드라이런/하루 1회 라이브 러너에서 사용하는 소형 어댑터."""
 
     def __init__(self) -> None:
-        self.base_url = os.environ.get("KIWOOM_BASE_URL", "").rstrip("/")
+        env_mode = os.environ.get("ENV_MODE", "real").lower()
+        if env_mode == "real":
+            self.base_url = "https://api.kiwoom.com"
+        else:
+            self.base_url = "https://mockapi.kiwoom.com"
         self.app_key = os.environ.get("KIWOOM_APPKEY", "")
         self.secret_key = os.environ.get("KIWOOM_SECRETKEY", "")
         self.account_no = os.environ.get("KIWOOM_ACCOUNT_NO", "")
@@ -122,9 +130,6 @@ class KiwoomAdapter:
         # 스레드 간 호출 간격 예약/동기화를 위한 락과 마지막 예약 타임스탬프
         self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
-
-        if not self.base_url:
-            raise RuntimeError("KIWOOM_BASE_URL is required")
 
         self.access_token = self._issue_token()
 

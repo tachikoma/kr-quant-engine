@@ -37,17 +37,6 @@ except Exception:
     def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
         return ticker
 
-try:
-    from live_trading.kiwoom_adapter import KiwoomAdapter
-except Exception:
-    KiwoomAdapter = None
-
-try:
-    from live_trading.telegram_notifier import TelegramNotifier
-except Exception:
-    TelegramNotifier = None
-
-
 def _load_dotenv(dotenv_path: Path | None = None) -> None:
     path = dotenv_path or (PROJECT_ROOT / ".env")
     if not path.exists():
@@ -64,12 +53,33 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if not (value.startswith('"') and value.endswith('"')) \
+               and not (value.startswith("'") and value.endswith("'")):
+                comment_idx = value.find(" #")
+                if comment_idx > 0:
+                    value = value[:comment_idx].strip()
+            value = value.strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
 
 
 _load_dotenv()
+
+try:
+    from live_trading.kiwoom_adapter import KiwoomAdapter
+except Exception:
+    KiwoomAdapter = None
+
+try:
+    from live_trading.kis_adapter import KisAdapter
+except Exception:
+    KisAdapter = None
+
+try:
+    from live_trading.telegram_notifier import TelegramNotifier
+except Exception:
+    TelegramNotifier = None
 
 import pandas as pd
 from pykrx import stock
@@ -1100,21 +1110,31 @@ def run_daily() -> None:
 
     api = None
     adapter_init_error: Exception | None = None
-    if KiwoomAdapter is not None:
+
+    broker_type = os.environ.get("BROKER_TYPE", "KIWOOM").upper()
+    print(f"[DEBUG] BROKER_TYPE='{os.environ.get('BROKER_TYPE')}' → '{broker_type}'")
+    if broker_type == "KIS":
+        AdapterClass = KisAdapter
+        adapter_name = "KIS"
+    else:
+        AdapterClass = KiwoomAdapter
+        adapter_name = "키움"
+
+    if AdapterClass is not None:
         try:
-            api = KiwoomAdapter()
+            api = AdapterClass()
         except Exception as exc:
             adapter_init_error = exc
-            print(f"[경고] 키움 어댑터 초기화 실패: {exc}")
+            print(f"[경고] {adapter_name} 어댑터 초기화 실패: {exc}")
 
     if cfg.enable_live_order and api is None:
-        if KiwoomAdapter is None:
+        if AdapterClass is None:
             raise RuntimeError(
-                "LIVE_ORDER_ENABLED=1 이지만 키움 어댑터를 로드하지 못했습니다. "
+                f"LIVE_ORDER_ENABLED=1 이지만 {adapter_name} 어댑터를 로드하지 못했습니다. "
                 "실전 모드에서는 API 없이 진행할 수 없습니다."
             )
         raise RuntimeError(
-            "LIVE_ORDER_ENABLED=1 이지만 키움 어댑터 초기화에 실패했습니다. "
+            f"LIVE_ORDER_ENABLED=1 이지만 {adapter_name} 어댑터 초기화에 실패했습니다. "
             "실전 모드에서는 API 없이 진행할 수 없습니다. "
             f"원인: {adapter_init_error}"
         )
