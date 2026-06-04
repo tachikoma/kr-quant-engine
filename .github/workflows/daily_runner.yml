@@ -1,0 +1,89 @@
+name: ETF Daily Runner for KIS
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_live:
+        type: boolean
+        default: false
+        description: '실전 주문 강제 실행 (--force-live)'
+      force_rebalance:
+        type: boolean
+        default: false
+        description: '리밸런싱 강제 실행'
+  repository_dispatch:
+    types: [run-daily]
+
+env:
+  BROKER_TYPE: KIS
+  PYTHONUNBUFFERED: '1'
+  ENV_MODE: ${{ vars.ENV_MODE || 'demo' }}
+  LIVE_ORDER_ENABLED: ${{ vars.LIVE_ORDER_ENABLED || '0' }}
+  KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+  KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+  KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
+  KIS_ACCOUNT_PROD_CD: ${{ secrets.KIS_ACCOUNT_PROD_CD || '01' }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}   # 선택
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}       # 선택
+  KRX_ID: ${{ secrets.KRX_ID }}                           # 선택
+  KRX_PW: ${{ secrets.KRX_PW }}                           # 선택
+
+jobs:
+  daily-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore runtime state
+        id: restore-state
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime_state/
+          key: etf-daily-state-${{ github.run_id }}
+          restore-keys: |
+            etf-daily-state-
+
+      - name: Ensure runtime_state directory
+        run: mkdir -p runtime_state
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Determine runtime flags
+        id: flags
+        run: |
+          FORCE_LIVE=""
+          FORCE_REBALANCE=""
+          if [ "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_live == 'true' }}" = "true" ]; then
+            FORCE_LIVE="--force-live"
+          fi
+          if [ "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.force_live == 'true' }}" = "true" ]; then
+            FORCE_LIVE="--force-live"
+          fi
+          if [ "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_rebalance == 'true' }}" = "true" ]; then
+            FORCE_REBALANCE="1"
+          fi
+          if [ "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.force_rebalance == 'true' }}" = "true" ]; then
+            FORCE_REBALANCE="1"
+          fi
+          echo "force_live_flag=$FORCE_LIVE" >> "$GITHUB_OUTPUT"
+          echo "force_rebalance=$FORCE_REBALANCE" >> "$GITHUB_OUTPUT"
+
+      - name: Run ETF daily runner
+        run: uv run python live_trading/etf_daily_runner.py ${{ steps.flags.outputs.force_live_flag }}
+        env:
+          FORCE_REBALANCE: ${{ steps.flags.outputs.force_rebalance || '0' }}
+
+      - name: Save runtime state
+        uses: actions/cache/save@v4
+        with:
+          path: runtime_state/
+          key: etf-daily-state-${{ github.run_id }}
