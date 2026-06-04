@@ -55,6 +55,28 @@ if env_list:
     if parsed:
         ETF_LIST = parsed
         print(f"[etf_shared] ETF_LIST overridden from env: {len(ETF_LIST)} tickers")
+        # KRX 분류 데이터로 TAXABLE_ETF_TICKERS 자동 산출 (KRX_ID/KRX_PW 필요)
+        try:
+            from pykrx_utils import get_taxable_tickers
+
+            taxable = get_taxable_tickers(ticker_subset=set(ETF_LIST))
+            if taxable is not None:
+                TAXABLE_ETF_TICKERS = taxable
+                print(f"[etf_shared] TAXABLE_ETF_TICKERS auto-computed from KRX data: {len(TAXABLE_ETF_TICKERS)} tickers")
+            else:
+                # KRX API 실패 → hardcoded set에서 ETF_LIST에 있는 것만 유지
+                TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
+                print(f"[etf_shared] TAXABLE_ETF_TICKERS fallback (filtered hardcoded): {len(TAXABLE_ETF_TICKERS)} tickers")
+        except Exception:
+            TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
+
+# TAXABLE_ETF_TICKERS env var가 명시되면 최우선으로 오버라이드
+env_taxable = os.environ.get("TAXABLE_ETF_TICKERS")
+if env_taxable:
+    parsed_taxable = {t.strip() for t in env_taxable.split(",") if t.strip()}
+    if parsed_taxable:
+        TAXABLE_ETF_TICKERS = parsed_taxable
+        print(f"[etf_shared] TAXABLE_ETF_TICKERS overridden from env: {len(TAXABLE_ETF_TICKERS)} tickers")
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 

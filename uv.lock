@@ -523,6 +523,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pykrx" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "tqdm" },
 ]
 
@@ -534,6 +535,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "pykrx", specifier = ">=1.2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.28" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
 
