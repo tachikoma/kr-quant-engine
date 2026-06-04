@@ -318,7 +318,7 @@ def _read_env_config() -> RunnerConfig:
         order_poll_interval_sec=int(os.environ.get("ORDER_POLL_INTERVAL_SEC", "2")),
         sell_fill_timeout_sec=int(os.environ.get("SELL_FILL_TIMEOUT_SEC", "300")),
         buy_fill_timeout_sec=int(os.environ.get("BUY_FILL_TIMEOUT_SEC", "300")),
-        cancel_unfilled_orders=_parse_bool("CANCEL_UNFILLED_ORDERS", True),
+        cancel_unfilled_orders=_parse_bool("CANCEL_UNFILLED_ORDERS", False),
         retry_unfilled_orders=_parse_bool("RETRY_UNFILLED_ORDERS", True),
         retry_order_type=os.environ.get("RETRY_ORDER_TYPE", "MARKET").upper(),
         retry_fill_timeout_sec=int(os.environ.get("RETRY_FILL_TIMEOUT_SEC", "90")),
@@ -1204,6 +1204,7 @@ def run_daily() -> None:
                 + (" (타임아웃)" if r.get("timed_out") else "")
             )
         if cfg.retry_unfilled_orders:
+            _refresh_order_statuses(api, sell_results)
             retry_sell_orders = _build_retry_orders(sell_results)
             if retry_sell_orders:
                 print(f"[재시도] 매도 잔량 재주문 {len(retry_sell_orders)}건 제출")
@@ -1324,13 +1325,6 @@ def run_daily() -> None:
                     + (" (타임아웃)" if r.get("timed_out") else "")
                 )
             if cfg.retry_unfilled_orders:
-                # 취소 완료 폴링(BUG-2) + 실시간 체결 상태 재조회(BUG-3) 후 재주문 수량 확정
-                _wait_for_cancellations(
-                    api,
-                    buy_results,
-                    timeout_sec=int(os.environ.get("CANCEL_CONFIRM_TIMEOUT_SEC", "5")),
-                    poll_interval_sec=cfg.order_poll_interval_sec,
-                )
                 _refresh_order_statuses(api, buy_results)
                 retry_buy_orders = _build_retry_orders(buy_results)
                 if retry_buy_orders:
