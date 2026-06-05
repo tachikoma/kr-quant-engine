@@ -109,8 +109,8 @@ class KiwoomAdapter:
         return f"{self.base_url}/{endpoint.lstrip('/')}"
 
     def _issue_token(self) -> str:
-        token_endpoint = os.environ.get("KIWOOM_TOKEN_ENDPOINT", "/oauth2/token")
-        token_api_id = os.environ.get("KIWOOM_TOKEN_API_ID", "au10001")
+        token_endpoint = "/oauth2/token"
+        token_api_id = "au10001"
         if not self.app_key or not self.secret_key:
             raise RuntimeError("KIWOOM_APPKEY and KIWOOM_SECRETKEY are required to issue token")
 
@@ -302,7 +302,7 @@ class KiwoomAdapter:
         if raw:
             return [p.strip() for p in raw.split(",") if p.strip()]
 
-        primary = os.environ.get("KIWOOM_PRICE_PATH", "sel_fpr_bid").strip() or "sel_fpr_bid"
+        primary = "sel_fpr_bid"
         # 계좌/환경별 응답 래핑(output/data) 차이를 흡수하기 위한 기본 후보들
         paths = [
             primary,
@@ -347,13 +347,13 @@ class KiwoomAdapter:
             raw = os.environ.get("KIWOOM_PRICE_PATH_BUY_CANDIDATES", "").strip()
             if raw:
                 return [p.strip() for p in raw.split(",") if p.strip()]
-            primary = os.environ.get("KIWOOM_PRICE_PATH_BUY", "buy_fpr_bid").strip() or "buy_fpr_bid"
+            primary = "buy_fpr_bid"
             defaults = ["buy_fpr_bid", "sel_fpr_bid"]
         else:
             raw = os.environ.get("KIWOOM_PRICE_PATH_SELL_CANDIDATES", "").strip()
             if raw:
                 return [p.strip() for p in raw.split(",") if p.strip()]
-            primary = os.environ.get("KIWOOM_PRICE_PATH_SELL", "sel_fpr_bid").strip() or "sel_fpr_bid"
+            primary = "sel_fpr_bid"
             defaults = ["sel_fpr_bid", "buy_fpr_bid"]
 
         paths = [
@@ -450,12 +450,12 @@ class KiwoomAdapter:
 
     def get_cash(self) -> float:
         """ETF 매수에 사용할 수 있는 예수금을 반환한다."""
-        endpoint = os.environ.get("KIWOOM_CASH_ENDPOINT", "/api/dostk/acnt")
-        api_id = os.environ.get("KIWOOM_CASH_API_ID", "kt00001")
+        endpoint = "/api/dostk/acnt"
+        api_id = "kt00001"
         payload = self._build_account_payload("KIWOOM_CASH")
         data = self._post(endpoint, payload, api_id)
         self._raise_on_api_error(data, context="get_cash")
-        path = os.environ.get("KIWOOM_CASH_PATH", "ord_alow_amt")
+        path = "ord_alow_amt"
         value = self._get_by_path(data, path)
         if value is None:
             raise RuntimeError(f"Cash response path not found: path={path}, top_keys={list(data.keys())}")
@@ -463,21 +463,21 @@ class KiwoomAdapter:
 
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""
-        endpoint = os.environ.get("KIWOOM_HOLDINGS_ENDPOINT", "/api/dostk/acnt")
-        api_id = os.environ.get("KIWOOM_HOLDINGS_API_ID", "kt00018")
+        endpoint = "/api/dostk/acnt"
+        api_id = "kt00018"
         payload = self._build_account_payload("KIWOOM_HOLDINGS")
         data = self._post(endpoint, payload, api_id)
         self._raise_on_api_error(data, context="get_holdings")
 
-        path = os.environ.get("KIWOOM_HOLDINGS_PATH", "acnt_evlt_remn_indv_tot")
+        path = "acnt_evlt_remn_indv_tot"
         rows = self._get_by_path(data, path, [])
         if isinstance(rows, dict):
             rows = rows.get("list") or rows.get("items") or rows.get("rows") or []
         if not isinstance(rows, list):
             raise RuntimeError(f"Holdings response path did not resolve to list: path={path}, value={rows}")
 
-        ticker_key = os.environ.get("KIWOOM_HOLDINGS_TICKER_KEY", "stk_cd")
-        qty_key = os.environ.get("KIWOOM_HOLDINGS_QTY_KEY", "rmnd_qty")
+        ticker_key = "stk_cd"
+        qty_key = "rmnd_qty"
 
         holdings: dict[str, int] = {}
         for row in rows:
@@ -493,9 +493,9 @@ class KiwoomAdapter:
 
     def get_prices(self, tickers: list[str]) -> dict[str, float]:
         """최근 체결/참조 가격을 ticker -> 가격 형태로 반환한다."""
-        endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT", "/api/dostk/mrkcond")
-        api_id = os.environ.get("KIWOOM_PRICE_API_ID", "ka10004")
-        ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "stk_cd")
+        endpoint = "/api/dostk/mrkcond"
+        api_id = "ka10004"
+        ticker_payload_key = "stk_cd"
         path_candidates = self._candidate_price_paths()
 
         prices: dict[str, float] = {}
@@ -541,9 +541,9 @@ class KiwoomAdapter:
           ...
         }
         """
-        endpoint = os.environ.get("KIWOOM_PRICE_ENDPOINT", "/api/dostk/mrkcond")
-        api_id = os.environ.get("KIWOOM_PRICE_API_ID", "ka10004")
-        ticker_payload_key = os.environ.get("KIWOOM_PRICE_TICKER_KEY", "stk_cd")
+        endpoint = "/api/dostk/mrkcond"
+        api_id = "ka10004"
+        ticker_payload_key = "stk_cd"
         buy_path_candidates = self._candidate_price_paths_for_side("BUY")
         sell_path_candidates = self._candidate_price_paths_for_side("SELL")
 
@@ -598,7 +598,7 @@ class KiwoomAdapter:
         order_type: str = "MARKET",
     ) -> dict[str, Any]:
         """주문을 전송하고 원본 응답과 order_id를 함께 반환한다."""
-        endpoint = os.environ.get("KIWOOM_ORDER_ENDPOINT", "/api/dostk/ordr")
+        endpoint = "/api/dostk/ordr"
 
         side_upper = side.upper()
         if side_upper not in {"BUY", "SELL"}:
@@ -606,19 +606,14 @@ class KiwoomAdapter:
         if qty <= 0:
             raise ValueError(f"qty must be positive: {qty}")
 
-        default_api_id = "kt10000" if side_upper == "BUY" else "kt10001"
-        side_api_id_key = "KIWOOM_ORDER_BUY_API_ID" if side_upper == "BUY" else "KIWOOM_ORDER_SELL_API_ID"
-        api_id = os.environ.get(side_api_id_key) or os.environ.get("KIWOOM_ORDER_API_ID") or default_api_id
-
+        api_id = "kt10000" if side_upper == "BUY" else "kt10001"
         market_code = os.environ.get("KIWOOM_DMST_STEX_TP", "KRX")
-        dmst_stex_key = os.environ.get("KIWOOM_ORDER_EXCHANGE_KEY", "dmst_stex_tp")
-        ticker_key = os.environ.get("KIWOOM_ORDER_TICKER_KEY", "stk_cd")
-        qty_key = os.environ.get("KIWOOM_ORDER_QTY_KEY", "ord_qty")
-        price_key = os.environ.get("KIWOOM_ORDER_PRICE_KEY", "ord_uv")
-        type_key = os.environ.get("KIWOOM_ORDER_TYPE_KEY", "trde_tp")
-        cond_price_key = os.environ.get("KIWOOM_ORDER_COND_PRICE_KEY", "cond_uv")
-        account_key = os.environ.get("KIWOOM_ORDER_ACCOUNT_KEY", "account_no")
-        cond_price = os.environ.get("KIWOOM_ORDER_COND_UV")
+        dmst_stex_key = "dmst_stex_tp"
+        ticker_key = "stk_cd"
+        qty_key = "ord_qty"
+        price_key = "ord_uv"
+        type_key = "trde_tp"
+        account_key = "account_no"
 
         payload: dict[str, Any] = {
             dmst_stex_key: market_code,
@@ -630,12 +625,10 @@ class KiwoomAdapter:
             payload[account_key] = self.account_no
         if price is not None:
             payload[price_key] = str(price)
-        if cond_price:
-            payload[cond_price_key] = str(cond_price)
 
         data = self._post(endpoint, payload, api_id)
         self._raise_on_api_error(data, context=f"place_order:{side_upper}")
-        order_id_path = os.environ.get("KIWOOM_ORDER_ID_PATH", "ord_no")
+        order_id_path = "ord_no"
         order_id = self._get_by_path(data, order_id_path)
         return {
             "order_id": "" if order_id is None else str(order_id),
@@ -654,38 +647,38 @@ class KiwoomAdapter:
         if not order_id:
             raise ValueError("order_id is required")
 
-        endpoint = os.environ.get("KIWOOM_ORDER_STATUS_ENDPOINT", "/api/dostk/acnt")
-        api_id = os.environ.get("KIWOOM_ORDER_STATUS_API_ID", "kt00007")
+        endpoint = "/api/dostk/acnt"
+        api_id = "kt00007"
         market_code = os.environ.get("KIWOOM_DMST_STEX_TP", "KRX")
 
         ord_dt = today or ""
         payload: dict[str, Any] = {
             "ord_dt": ord_dt,
-            "qry_tp": os.environ.get("KIWOOM_ORDER_STATUS_QRY_TP", "1"),
+            "qry_tp": "1",
             "stk_bond_tp": "1",
             "sell_tp": "0",
             "fr_ord_no": order_id,
             "dmst_stex_tp": market_code,
         }
         if self.account_no:
-            account_key = os.environ.get("KIWOOM_ORDER_STATUS_ACCOUNT_KEY", "account_no")
+            account_key = "account_no"
             payload[account_key] = self.account_no
 
         data = self._post(endpoint, payload, api_id)
         self._raise_on_api_error(data, context="get_order_status")
 
-        list_key = os.environ.get("KIWOOM_ORDER_STATUS_LIST_KEY", "acnt_ord_cntr_prps_dtl")
+        list_key = "acnt_ord_cntr_prps_dtl"
         rows = self._get_by_path(data, list_key, [])
         if isinstance(rows, dict):
             rows = rows.get("list") or rows.get("items") or rows.get("rows") or []
         if not isinstance(rows, list):
             rows = []
 
-        order_no_key = os.environ.get("KIWOOM_ORDER_STATUS_ORDER_NO_KEY", "ord_no")
-        filled_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_FILLED_QTY_KEY", "cntr_qty")
-        confirm_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_CONFIRM_QTY_KEY", "cnfm_qty")
-        order_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_ORDER_QTY_KEY", "ord_qty")
-        remaining_qty_key = os.environ.get("KIWOOM_ORDER_STATUS_REMAINING_QTY_KEY", "ord_remnq")
+        order_no_key = "ord_no"
+        filled_qty_key = "cntr_qty"
+        confirm_qty_key = "cnfm_qty"
+        order_qty_key = "ord_qty"
+        remaining_qty_key = "ord_remnq"
 
         # 반드시 주문번호가 일치하는 행만 사용한다.
         # 일치 행이 없으면 다른 주문을 오인하지 않도록 미확인 상태로 반환한다.
@@ -739,20 +732,20 @@ class KiwoomAdapter:
 
     def cancel_order(self, order_id: str, ticker: str, qty: int | None = None) -> dict[str, Any]:
         """미체결 주문 취소를 전송한다."""
-        endpoint = os.environ.get("KIWOOM_ORDER_CANCEL_ENDPOINT", "/api/dostk/ordr")
+        endpoint = "/api/dostk/ordr"
         if not order_id:
             raise ValueError("order_id is required")
         if not ticker:
             raise ValueError("ticker is required")
 
-        api_id = os.environ.get("KIWOOM_ORDER_CANCEL_API_ID", "kt10003")
+        api_id = "kt10003"
         market_code = os.environ.get("KIWOOM_DMST_STEX_TP", "KRX")
 
-        dmst_stex_key = os.environ.get("KIWOOM_ORDER_CANCEL_EXCHANGE_KEY", "dmst_stex_tp")
-        order_id_key = os.environ.get("KIWOOM_ORDER_CANCEL_ID_KEY", "orig_ord_no")
-        ticker_key = os.environ.get("KIWOOM_ORDER_CANCEL_TICKER_KEY", "stk_cd")
-        qty_key = os.environ.get("KIWOOM_ORDER_CANCEL_QTY_KEY", "cncl_qty")
-        account_key = os.environ.get("KIWOOM_ORDER_CANCEL_ACCOUNT_KEY", "account_no")
+        dmst_stex_key = "dmst_stex_tp"
+        order_id_key = "orig_ord_no"
+        ticker_key = "stk_cd"
+        qty_key = "cncl_qty"
+        account_key = "account_no"
 
         payload: dict[str, Any] = {
             dmst_stex_key: market_code,
