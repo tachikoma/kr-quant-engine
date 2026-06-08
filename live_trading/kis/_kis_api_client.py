@@ -100,9 +100,7 @@ class KisApiClient:
                 return self._handle_response(res)
             except KisApiError as e:
                 if attempt < self._max_retries and (
-                    e.http_status == 429
-                    or e.http_status >= 500
-                    or any(c in str(e) for c in ("EGW00201", "EGW02007"))
+                    e.http_status == 429 or e.http_status >= 500
                 ):
                     time.sleep(self._retry_delay)
                     continue
@@ -124,9 +122,7 @@ class KisApiClient:
                 return self._handle_response(res)
             except KisApiError as e:
                 if attempt < self._max_retries and (
-                    e.http_status == 429
-                    or e.http_status >= 500
-                    or any(c in str(e) for c in ("EGW00201", "EGW02007"))
+                    e.http_status == 429 or e.http_status >= 500
                 ):
                     time.sleep(self._retry_delay)
                     continue
