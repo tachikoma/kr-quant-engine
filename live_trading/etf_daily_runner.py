@@ -126,6 +126,7 @@ class RunnerConfig:
     live_slippage_pct: float
     # 실전에서 API가 없을 때의 호가 스프레드 fallback
     spread_pct: float
+    enable_catchup: bool
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -319,7 +320,7 @@ def _read_env_config() -> RunnerConfig:
         sell_fill_timeout_sec=int(os.environ.get("SELL_FILL_TIMEOUT_SEC", "300")),
         buy_fill_timeout_sec=int(os.environ.get("BUY_FILL_TIMEOUT_SEC", "300")),
         cancel_unfilled_orders=_parse_bool("CANCEL_UNFILLED_ORDERS", False),
-        retry_unfilled_orders=_parse_bool("RETRY_UNFILLED_ORDERS", True),
+        retry_unfilled_orders=_parse_bool("RETRY_UNFILLED_ORDERS", False),
         retry_order_type=os.environ.get("RETRY_ORDER_TYPE", "MARKET").upper(),
         retry_fill_timeout_sec=int(os.environ.get("RETRY_FILL_TIMEOUT_SEC", "90")),
         protect_external_holdings=_parse_bool("PROTECT_EXTERNAL_HOLDINGS", True),
@@ -327,6 +328,7 @@ def _read_env_config() -> RunnerConfig:
         apply_slippage_in_live=_parse_bool("APPLY_SLIPPAGE_IN_LIVE", False),
         live_slippage_pct=parse_pct_env("LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)),
         spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
+        enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
     )
 
 
@@ -550,6 +552,61 @@ def _should_rebalance(today: str, state: dict[str, Any], step_days: int, referen
     return due
 
 
+def _needs_catchup(state: dict[str, Any], risk_on: bool, enable_catchup: bool) -> bool:
+    if not enable_catchup or not risk_on:
+        return False
+    return state.get("status") == "PARTIAL_FILLED"
+
+
+def _build_catchup_orders(
+    state: dict[str, Any],
+    latest_buy_prices: dict[str, float],
+    latest_prices: dict[str, float],
+    ticker_names: dict[str, str],
+) -> list[dict[str, Any]]:
+    """state의 미체결 BUY 주문 정보를 읽어 catch-up 매수 주문을 생성한다.
+
+    rebalance_due=False + needs_catchup=True 일 때 호출.
+    build_rebalance_orders를 거치지 않고 직접 남은 수량만큼 매수 주문을 만든다.
+    """
+    orders: list[dict[str, Any]] = []
+    prev_orders = state.get("orders", [])
+    if not prev_orders:
+        print("[캐치업] 상태 파일에 이전 주문 정보 없음 → 주문 생성 생략")
+        return orders
+
+    for o in prev_orders:
+        if o.get("side") != "BUY":
+            continue
+        ticker = str(o.get("ticker", ""))
+        remaining = int(o.get("remaining_qty", 0))
+        if not ticker or remaining <= 0:
+            continue
+
+        price = latest_buy_prices.get(ticker)
+        if price is None or pd.isna(price) or price <= 0:
+            price = latest_prices.get(ticker)
+        if price is None or pd.isna(price) or price <= 0:
+            print(f"[캐치업][스킵] {ticker}: 매수 가격 없음")
+            continue
+
+        cost = remaining * float(price)
+        orders.append({
+            "side": "BUY",
+            "ticker": ticker,
+            "display_name": ticker_names.get(ticker, ticker),
+            "qty": remaining,
+            "reference_price": float(price),
+            "estimated_value": float(cost),
+            "reason": "CATCHUP",
+        })
+        print(f"[캐치업] {ticker_names.get(ticker, ticker)} {remaining}주 매수 (참고가={float(price):,.0f})")
+
+    if not orders:
+        print("[캐치업] 채울 미체결 주문이 없습니다.")
+    return orders
+
+
 def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
     strategy_cfg = get_strategy_config()
     etf_list = strategy_cfg["etf_list"]
@@ -637,18 +694,23 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
     if config.force_rebalance:
         print("[강제] FORCE_REBALANCE=1 — 리밸런싱 주기를 무시하고 강제 실행합니다.")
 
+    needs_catchup = _needs_catchup(state, risk_on, config.enable_catchup)
+    if needs_catchup:
+        print("[캐치업] 전일 미체결 주문 감지 → 오늘 리밸런싱을 실행하여 포지션을 채웁니다.")
+
     # 5단계: 목표 티커 결정
     if not risk_on:
         print("[계획수립] risk_on=False → 전량 매도 모드 (목표 티커 없음)")
         target = []
-    elif not rebalance_due:
+    elif not rebalance_due and not needs_catchup:
         # 리밸런싱 미도달일에는 실제 주문을 생성하지 않지만, 플랜 상에는
         # 현재 보유를 목표로 표시하여 '유지' 의도를 명확히 합니다.
         print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)")
         target = list(holdings_for_rebalance.keys())
     else:
         target = ranked.head(config.max_positions)["ticker"].tolist() if not ranked.empty else []
-        print(f"[계획수립] 목표 티커 확정: {target}")
+        label = "캐치업 목표" if needs_catchup else "목표"
+        print(f"[계획수립] {label} 티커 확정: {target}")
 
     # rebalance_due=False 이고 시장이 위험상태(risk_on=True)인 경우
     # 리밸런싱이 필요 없으므로 주문 생성을 건너뛰고 즉시 빈 주문 계획을 반환한다.
@@ -673,24 +735,27 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
                 sell_text = "N/A" if sell_bad else f"{float(sell_price):,.0f}"
                 print(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
-    orders = build_rebalance_orders(
-        current_holdings=holdings_for_rebalance,
-        target_tickers=target,
-        latest_prices=latest_prices,
-        available_cash=cash,
-        latest_buy_prices=latest_buy_prices,
-        latest_sell_prices=latest_sell_prices,
-        max_positions=config.max_positions,
-        sell_rank_buffer=config.sell_rank_buffer,
-        allow_empty_target_sell=not risk_on,
-        # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
-        # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
-        slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
-        sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
-        taxable_tickers=TAXABLE_ETF_TICKERS,
-        generate_orders=rebalance_due,
-        ticker_names=ticker_names,
-    )
+    if needs_catchup and not rebalance_due:
+        orders = _build_catchup_orders(state, latest_buy_prices, latest_prices, ticker_names)
+    else:
+        orders = build_rebalance_orders(
+            current_holdings=holdings_for_rebalance,
+            target_tickers=target,
+            latest_prices=latest_prices,
+            available_cash=cash,
+            latest_buy_prices=latest_buy_prices,
+            latest_sell_prices=latest_sell_prices,
+            max_positions=config.max_positions,
+            sell_rank_buffer=config.sell_rank_buffer,
+            allow_empty_target_sell=not risk_on,
+            # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
+            # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
+            slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
+            sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+            taxable_tickers=TAXABLE_ETF_TICKERS,
+            generate_orders=(rebalance_due or needs_catchup),
+            ticker_names=ticker_names,
+        )
 
     sell_orders = [o for o in orders if o.get("side") == "SELL"]
     buy_orders = [o for o in orders if o.get("side") == "BUY"]
@@ -699,6 +764,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         "today": today,
         "risk_on": risk_on,
         "rebalance_due": rebalance_due,
+        "needs_catchup": needs_catchup,
         "holdings": holdings,
         "cash": cash,
         "target": target,
@@ -1033,6 +1099,7 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
     print(f"기준일: {plan['today']}")
     print(f"risk_on: {plan['risk_on']}")
     print(f"rebalance_due: {plan['rebalance_due']}")
+    print(f"catchup: {plan.get('needs_catchup', False)}")
     print(f"실주문 모드: {'ON' if cfg.enable_live_order else 'OFF'}")
     print(f"매도 컷오프: {cfg.sell_cutoff_time}, 매수 컷오프: {cfg.buy_cutoff_time}")
     print(f"미체결 재주문: {'ON' if cfg.retry_unfilled_orders else 'OFF'} ({cfg.retry_order_type})")
@@ -1070,7 +1137,7 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
         reason = []
         if not plan['risk_on']:
             reason.append("시장 필터 OFF (risk_on=False)")
-        if not plan['rebalance_due']:
+        if not plan['rebalance_due'] and not plan.get('needs_catchup'):
             reason.append("리밸런싱 주기 미도달")
         if reason:
             print(f"  주문 없음 사유: {', '.join(reason)}")
@@ -1254,6 +1321,17 @@ def run_daily() -> None:
                 + (" (타임아웃)" if r.get("timed_out") else "")
             )
         if cfg.retry_unfilled_orders:
+            for r in sell_results:
+                remain = int(r.get("remaining_qty", 0))
+                oid = str(r.get("order_id", "")).strip()
+                tid = str(r.get("ticker", "")).strip()
+                if remain > 0 and oid:
+                    try:
+                        api.cancel_order(order_id=oid, ticker=tid, qty=remain)
+                        r["cancel_submitted"] = True
+                    except Exception:
+                        pass
+            _wait_for_cancellations(api, sell_results)
             _refresh_order_statuses(api, sell_results)
             retry_sell_orders = _build_retry_orders(sell_results)
             if retry_sell_orders:
@@ -1375,6 +1453,17 @@ def run_daily() -> None:
                     + (" (타임아웃)" if r.get("timed_out") else "")
                 )
             if cfg.retry_unfilled_orders:
+                for r in buy_results:
+                    remain = int(r.get("remaining_qty", 0))
+                    oid = str(r.get("order_id", "")).strip()
+                    tid = str(r.get("ticker", "")).strip()
+                    if remain > 0 and oid:
+                        try:
+                            api.cancel_order(order_id=oid, ticker=tid, qty=remain)
+                            r["cancel_submitted"] = True
+                        except Exception:
+                            pass
+                _wait_for_cancellations(api, buy_results)
                 _refresh_order_statuses(api, buy_results)
                 retry_buy_orders = _build_retry_orders(buy_results)
                 if retry_buy_orders:
