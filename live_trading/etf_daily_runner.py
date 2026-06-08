@@ -773,6 +773,7 @@ def _submit_orders(
             if notifier is not None:
                 notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
         except Exception as exc:
+            error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
             results.append(
                 {
                     "ticker": ticker,
@@ -789,6 +790,7 @@ def _submit_orders(
                     "mode": "LIVE",
                     "order_id": "",
                     "error": str(exc),
+                    "error_code": error_code,
                 }
             )
             if notifier is not None:
@@ -985,9 +987,19 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in results:
         req_qty = int(row.get("requested_qty", row.get("qty", 0)))
         filled_qty = int(row.get("filled_qty", 0))
-        remaining_qty = max(req_qty - filled_qty, 0)
+        remaining_qty = row.get("remaining_qty")
+        if remaining_qty is None:
+            remaining_qty = max(req_qty - filled_qty, 0)
+        else:
+            remaining_qty = max(int(remaining_qty), 0)
         ticker = str(row.get("ticker", "")).strip()
-        if not ticker or remaining_qty <= 0:
+        if not ticker:
+            continue
+        if remaining_qty == 0 and (req_qty - filled_qty) > 0:
+            print(
+                f"[재시도-스킵] {ticker}: API 잔량=0, 자체계산={req_qty - filled_qty} — 재시도 생략"
+            )
+        if remaining_qty <= 0:
             continue
         retry_orders.append(
             {
@@ -1311,8 +1323,8 @@ def run_daily() -> None:
             latest_sell_prices_after = {}
 
         # 예수금 안전 마진 적용: 키움 증거금 계산 방식 차이로 인한 증거금 부족을 방지 (BUG-4)
-        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능 (기본: 0.03 = 3%)
-        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", 0.03)
+        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능 (기본: 0.07 = 7%)
+        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", 0.07)
         _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
         try:
             new_orders = build_rebalance_orders(
