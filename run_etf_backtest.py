@@ -1183,6 +1183,18 @@ def main():
 
     print(f"백테스트 기간: {START} ~ {END} / 모드: {RUN_MODE}")
 
+    from pykrx_utils import check_krx_auth_status, KRX_PASSWORD_CHANGE_URL
+    krx_status = check_krx_auth_status()
+    if krx_status == "password_change_needed":
+        print()
+        print("=" * 60)
+        print("KRX 비밀번호 변경이 필요합니다.")
+        print(f"{KRX_PASSWORD_CHANGE_URL} 에서 비밀번호를 변경한 후")
+        print(".env 파일의 KRX_PW를 업데이트하고 다시 실행하세요.")
+        print("=" * 60)
+        print()
+        exit(1)
+
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     if RUN_MODE not in {"single", "experiment"}:

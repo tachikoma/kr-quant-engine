@@ -185,6 +185,36 @@ def get_ticker_name(ticker: str) -> str:
         return ticker
 
 
+KRX_PASSWORD_CHANGE_URL = "https://data.krx.co.kr"
+
+
+def check_krx_auth_status() -> str:
+    """KRX 세션 인증 상태를 확인한다.
+
+    Returns:
+        "ok"                   — 정상 로그인 상태
+        "no_credentials"       — KRX_ID/KRX_PW 미설정
+        "password_change_needed" — CD010 (비밀번호 변경 필요)
+        "auth_failed"          — 기타 인증 실패
+    """
+    if not (os.environ.get("KRX_ID") and os.environ.get("KRX_PW")):
+        return "no_credentials"
+
+    from pykrx.website.comm.auth import build_krx_session, get_auth_session
+
+    session = get_auth_session()
+    if session is not None and session.is_valid():
+        return "ok"
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        build_krx_session(os.environ["KRX_ID"], os.environ["KRX_PW"])
+    output = buf.getvalue()
+    if "패스워드 변경 필요" in output or "CD010" in output:
+        return "password_change_needed"
+    return "auth_failed"
+
+
 TAX_CACHE_PATH = "data_cache/etf_tax_classification.parquet"
 
 
