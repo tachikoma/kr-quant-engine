@@ -19,6 +19,7 @@ env:
   PYTHONUNBUFFERED: '1'
   ENV_MODE: ${{ vars.ENV_MODE || 'demo' }}
   LIVE_ORDER_ENABLED: ${{ vars.LIVE_ORDER_ENABLED || '0' }}
+  REBALANCE_STEP_DAYS: ${{ vars.REBALANCE_STEP_DAYS || '10' }}
   KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
   KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
   KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
