@@ -8,6 +8,7 @@ pandas.DataFrame 대신 dict / list[dict] 를 반환합니다.
 """
 
 import json
+import threading
 import time
 from typing import Any, List, Optional, Tuple
 
@@ -43,6 +44,12 @@ class KisApiClient:
         self._env_mode = env_mode
         self._is_demo = (env_mode == "demo")
         self._sleep_sec = self._SMART_SLEEP_DEMO if self._is_demo else self._SMART_SLEEP_REAL
+        # 재시도 및 스로틀
+        self._max_retries = 3
+        self._retry_delay = 0.5
+        self._min_interval = self._SMART_SLEEP_DEMO if self._is_demo else 0.1
+        self._last_request_ts = 0.0
+        self._throttle_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 내부 HTTP 헬퍼
@@ -70,29 +77,61 @@ class KisApiClient:
         headers["tr_cont"] = tr_cont
         return headers
 
+    def _throttle(self) -> None:
+        """스레드 안전 최소 호출 간격 보장."""
+        if self._min_interval <= 0:
+            return
+        now = time.monotonic()
+        with self._throttle_lock:
+            expected = max(self._last_request_ts + self._min_interval, now)
+            self._last_request_ts = expected
+        wait = expected - now
+        if wait > 0:
+            time.sleep(wait)
+
     def _get(self, path: str, tr_id: str, params: dict, tr_cont: str = "") -> dict:
-        """GET 요청 수행. 응답 dict 반환."""
-        if self._is_demo:
-            self._smart_sleep()
+        """GET 요청 수행 (재시도 + 스로틀 포함). 응답 dict 반환."""
         url = f"{self._auth.base_url}{path}"
-        headers = self._build_headers(tr_id, tr_cont)
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=15)
-        except requests.RequestException as e:
-            raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
-        return self._handle_response(res)
+        for attempt in range(self._max_retries + 1):
+            self._throttle()
+            headers = self._build_headers(tr_id, tr_cont)
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=15)
+                return self._handle_response(res)
+            except KisApiError as e:
+                if attempt < self._max_retries and (
+                    e.http_status == 429 or "EGW02007" in str(e)
+                ):
+                    time.sleep(self._retry_delay)
+                    continue
+                raise
+            except requests.RequestException as e:
+                if attempt < self._max_retries:
+                    time.sleep(self._retry_delay)
+                    continue
+                raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
 
     def _post(self, path: str, tr_id: str, payload: dict) -> dict:
-        """POST 요청 수행. 응답 dict 반환."""
-        if self._is_demo:
-            self._smart_sleep()
+        """POST 요청 수행 (재시도 + 스로틀 포함). 응답 dict 반환."""
         url = f"{self._auth.base_url}{path}"
-        headers = self._build_headers(tr_id, "")
-        try:
-            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
-        except requests.RequestException as e:
-            raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
-        return self._handle_response(res)
+        for attempt in range(self._max_retries + 1):
+            self._throttle()
+            headers = self._build_headers(tr_id, "")
+            try:
+                res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
+                return self._handle_response(res)
+            except KisApiError as e:
+                if attempt < self._max_retries and (
+                    e.http_status == 429 or "EGW02007" in str(e)
+                ):
+                    time.sleep(self._retry_delay)
+                    continue
+                raise
+            except requests.RequestException as e:
+                if attempt < self._max_retries:
+                    time.sleep(self._retry_delay)
+                    continue
+                raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
 
     def _handle_response(self, res: requests.Response) -> dict:
         """응답을 처리하고 dict 를 반환합니다. 오류 시 KisApiError 를 raise 합니다."""

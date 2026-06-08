@@ -341,20 +341,24 @@ class KiwoomAdapter:
         return candidates
 
     def _candidate_price_paths_for_side(self, side: str) -> list[str]:
-        """매수/매도 기준가 조회용 후보 경로를 반환한다."""
+        """매수/매도 기준가 조회용 후보 경로를 반환한다.
+
+        NOTE: 매수 시 지불해야 하는 가격 = 매도최우선호가(sel_fpr_bid = ask),
+              매도 시 받을 수 있는 가격 = 매수최우선호가(buy_fpr_bid = bid) 이다.
+        """
         side_upper = side.upper()
         if side_upper == "BUY":
             raw = os.environ.get("KIWOOM_PRICE_PATH_BUY_CANDIDATES", "").strip()
             if raw:
                 return [p.strip() for p in raw.split(",") if p.strip()]
-            primary = "buy_fpr_bid"
-            defaults = ["buy_fpr_bid", "sel_fpr_bid"]
+            primary = "sel_fpr_bid"
+            defaults = ["sel_fpr_bid", "buy_fpr_bid"]
         else:
             raw = os.environ.get("KIWOOM_PRICE_PATH_SELL_CANDIDATES", "").strip()
             if raw:
                 return [p.strip() for p in raw.split(",") if p.strip()]
-            primary = "sel_fpr_bid"
-            defaults = ["sel_fpr_bid", "buy_fpr_bid"]
+            primary = "buy_fpr_bid"
+            defaults = ["buy_fpr_bid", "sel_fpr_bid"]
 
         paths = [
             primary,
