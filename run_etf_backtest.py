@@ -16,7 +16,6 @@ from etf_shared import (
     KOSPI_INDEX_CODE,
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
-    REBALANCE_STEP_DAYS,
     TAXABLE_ETF_TICKERS,
     rank_etfs,
     apply_buy_cost,
@@ -56,6 +55,7 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 load_dotenv()
 
 strategy_cfg = get_strategy_config()
+REBALANCE_STEP_DAYS = strategy_cfg["rebalance_step_days"]  # env override 반영 (기본 10)
 SLIPPAGE_PCT = parse_pct_env("ETF_BASE_SLIPPAGE", strategy_cfg.get("default_slippage_pct", 0.0005))
 SPREAD_PCT = parse_pct_env("ETF_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005))
 BASE_SLIPPAGE = SLIPPAGE_PCT

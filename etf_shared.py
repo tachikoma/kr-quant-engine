@@ -91,7 +91,7 @@ def get_strategy_config() -> dict:
         "etf_list": ETF_LIST,
         "max_positions": ETF_MAX_POSITIONS,
         "sell_rank_buffer": ETF_SELL_RANK_BUFFER,
-        "rebalance_step_days": REBALANCE_STEP_DAYS,
+        "rebalance_step_days": int(os.environ.get("REBALANCE_STEP_DAYS", str(REBALANCE_STEP_DAYS))),
         "market_index_code": KOSPI_INDEX_CODE,
         "market_ma_days": MARKET_MA_DAYS,
         "market_slope_days": MARKET_SLOPE_DAYS,
