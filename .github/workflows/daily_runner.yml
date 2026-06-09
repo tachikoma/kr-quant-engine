@@ -8,9 +8,13 @@ on:
         default: false
         description: '실전 주문 강제 실행 (--force-live)'
       force_rebalance:
-        type: boolean
-        default: false
-        description: '리밸런싱 강제 실행'
+         type: boolean
+         default: false
+         description: '리밸런싱 강제 실행'
+      force_run:
+         type: boolean
+         default: false
+         description: '이미 실행 완료된 경우에도 강제 재실행 (DAILY_RUN_FORCE=1)'
   repository_dispatch:
     types: [run-daily]
 
@@ -75,13 +79,22 @@ jobs:
           if [ "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.force_rebalance == 'true' }}" = "true" ]; then
             FORCE_REBALANCE="1"
           fi
+          FORCE_RUN=""
+          if [ "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true' }}" = "true" ]; then
+            FORCE_RUN="1"
+          fi
+          if [ "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.force_run == 'true' }}" = "true" ]; then
+            FORCE_RUN="1"
+          fi
           echo "force_live_flag=$FORCE_LIVE" >> "$GITHUB_OUTPUT"
           echo "force_rebalance=$FORCE_REBALANCE" >> "$GITHUB_OUTPUT"
+          echo "force_run=$FORCE_RUN" >> "$GITHUB_OUTPUT"
 
       - name: Run ETF daily runner
         run: uv run python live_trading/etf_daily_runner.py ${{ steps.flags.outputs.force_live_flag }}
         env:
-          FORCE_REBALANCE: ${{ steps.flags.outputs.force_rebalance || '0' }}
+           FORCE_REBALANCE: ${{ steps.flags.outputs.force_rebalance || '0' }}
+           DAILY_RUN_FORCE: ${{ steps.flags.outputs.force_run || '0' }}
 
       - name: Save runtime state
         uses: actions/cache/save@v4
