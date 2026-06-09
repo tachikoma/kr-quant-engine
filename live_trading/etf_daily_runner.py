@@ -740,20 +740,6 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
                 sell_text = "N/A" if sell_bad else f"{float(sell_price):,.0f}"
                 print(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
-        # KIS: target이 확정된 시점에 새로 매수할 종목으로 주문가능금액 재조회
-        # (cash는 계좌 전체 금액이므로 아무 종목으로 조회해도 동일)
-        if hasattr(api, "get_buyable_info") and target:
-            _buy_targets = [t for t in target if t not in holdings_for_rebalance]
-            if _buy_targets:
-                _tt = _buy_targets[0]
-                _tp = int(latest_buy_prices.get(_tt, 0) or 0)
-                if _tp > 0:
-                    info = api.get_buyable_info(_tt, _tp)
-                    _cash_via_info = float(info.get("ord_psbl_cash", "0"))
-                    if _cash_via_info > 0:
-                        cash = _cash_via_info
-                    print(f"[정보] {ticker_names.get(_tt, _tt)} 기준 주문가능금액 재조회: {cash:,.0f}")
-
     if needs_catchup and not rebalance_due:
         orders = _build_catchup_orders(state, latest_buy_prices, latest_prices, ticker_names)
     else:
