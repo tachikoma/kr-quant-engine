@@ -575,6 +575,8 @@ def _build_catchup_orders(
         print("[캐치업] 상태 파일에 이전 주문 정보 없음 → 주문 생성 생략")
         return orders
 
+    from collections import defaultdict
+    ticker_remaining: dict[str, int] = defaultdict(int)
     for o in prev_orders:
         if o.get("side") != "BUY":
             continue
@@ -582,7 +584,9 @@ def _build_catchup_orders(
         remaining = int(o.get("remaining_qty", 0))
         if not ticker or remaining <= 0:
             continue
+        ticker_remaining[ticker] += remaining
 
+    for ticker, remaining in ticker_remaining.items():
         price = latest_buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
             price = latest_prices.get(ticker)
@@ -1363,6 +1367,7 @@ def run_daily() -> None:
             print(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
         except Exception as exc:
             print(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
+            refreshed_cash = 0.0
 
     # 3) 매도 미완전체결이면 매수 차단
     can_buy = dry_run or _is_side_fully_filled(sell_results, sell_retry_results)
@@ -1371,7 +1376,8 @@ def run_daily() -> None:
 
     # 매도 체결이 완료되어 실제 매수가 가능한 경우(실거래)에는
     # 매도 완료 후의 실제 예수금/보유를 기준으로 매수 주문을 재계산합니다.
-    if can_buy and (not dry_run) and api is not None:
+    # 캐치업 모드에서는 기존 catchup 주문 계획을 그대로 사용합니다.
+    if can_buy and (not dry_run) and api is not None and not plan.get("catchup", False):
         try:
             refreshed_holdings = api.get_holdings()
             print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
@@ -1428,6 +1434,8 @@ def run_daily() -> None:
             )
         except Exception as exc:
             print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
+    elif can_buy and (not dry_run) and api is not None and plan.get("catchup", False):
+        print(f"[정보] 캐치업 모드: 기존 매수 계획 유지 ({len(plan.get('buy_orders', []))}건)")
     print("\n[주문] ─── 매수 단계 ───")
     if can_buy:
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
