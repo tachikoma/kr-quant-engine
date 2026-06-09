@@ -741,7 +741,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
                 print(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
         # KIS: target이 확정된 시점에 새로 매수할 종목으로 주문가능금액 재조회
-        _kis_buy_qty_limit: int | None = None
+        # (cash는 계좌 전체 금액이므로 아무 종목으로 조회해도 동일)
         if hasattr(api, "get_buyable_info") and target:
             _buy_targets = [t for t in target if t not in holdings_for_rebalance]
             if _buy_targets:
@@ -752,10 +752,6 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
                     _cash_via_info = float(info.get("ord_psbl_cash", "0"))
                     if _cash_via_info > 0:
                         cash = _cash_via_info
-                    _nrcvb_qty = int(info.get("nrcvb_buy_qty", "0"))
-                    if _nrcvb_qty > 0:
-                        _kis_buy_qty_limit = _nrcvb_qty
-                        print(f"[KIS] {ticker_names.get(_tt, _tt)} 매수 가능 수량: {_kis_buy_qty_limit}주")
                     print(f"[정보] {ticker_names.get(_tt, _tt)} 기준 주문가능금액 재조회: {cash:,.0f}")
 
     if needs_catchup and not rebalance_due:
@@ -780,15 +776,19 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
             ticker_names=ticker_names,
         )
 
-    # KIS: nrcvb_buy_qty로 매수 주문 수량 제한
-    if _kis_buy_qty_limit is not None:
+    # KIS: 각 매수 주문별로 개별 종목/가격 기준 nrcvb_buy_qty 조회하여 수량 제한
+    if hasattr(api, "get_buyable_info"):
         for o in orders:
             if o.get("side") == "BUY":
-                original_qty = o["qty"]
-                o["qty"] = min(o["qty"], _kis_buy_qty_limit)
-                if o["qty"] < original_qty:
-                    o["estimated_value"] = int(o["qty"]) * float(o.get("reference_price", 0))
-                    print(f"[KIS제한] {o.get('display_name', o.get('ticker', ''))} 수량 {original_qty}→{o['qty']}주")
+                _t = o.get("ticker")
+                _p = int(latest_buy_prices.get(_t, 0) or 0)
+                if _p > 0:
+                    _info = api.get_buyable_info(_t, _p)
+                    _nrcvb_qty = int(_info.get("nrcvb_buy_qty", "0"))
+                    if _nrcvb_qty > 0 and o["qty"] > _nrcvb_qty:
+                        print(f"[KIS제한] {o.get('display_name', o.get('ticker', ''))} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)")
+                        o["qty"] = _nrcvb_qty
+                        o["estimated_value"] = _nrcvb_qty * float(o.get("reference_price", 0))
 
     sell_orders = [o for o in orders if o.get("side") == "SELL"]
     buy_orders = [o for o in orders if o.get("side") == "BUY"]
