@@ -280,20 +280,23 @@ class KisApiClient:
         self,
         cano: str,
         acnt_prdt_cd: str,
-        symbol: str,
-        price: int,
+        symbol: str = "",
+        price: str = "",
     ) -> dict:
-        """매수가능금액 조회 (inquire-psbl-order). output dict 반환."""
+        """매수가능금액 조회 (inquire-psbl-order). output dict 반환.
+        symbol/price를 공란으로 조회 시 매수수량 없이 매수금액만 조회된다."""
         tr_id = self._tr_id("TTTC8908R", "VTTC8908R")
         params = {
             "CANO": cano,
             "ACNT_PRDT_CD": acnt_prdt_cd,
-            "PDNO": symbol,
-            "ORD_UNPR": str(price),
             "ORD_DVSN": "01",
             "CMA_EVLU_AMT_ICLD_YN": "N",
             "OVRS_ICLD_YN": "N",
         }
+        if symbol:
+            params["PDNO"] = symbol
+        if price:
+            params["ORD_UNPR"] = price
         body = self._get(
             "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
             tr_id,

@@ -51,9 +51,7 @@ class KisAdapter:
     def _check_env_mismatch(self) -> None:
         """ENV_MODE와 KIS 앱키 환경이 일치하는지 시세조회로 사전 확인."""
         try:
-            self._api.get_buyable_cash(
-                self._cano, self._acnt_prdt_cd, "069500", 10000
-            )
+            self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd)
         except KisApiError as e:
             if "EGW02007" in str(e):
                 env_mode = os.environ.get("ENV_MODE", "real")
@@ -76,7 +74,7 @@ class KisAdapter:
 
     def get_available_cash(self) -> float:
         """KIS inquire-psbl-order API가 직접 계산한 실제 주문가능금액을 반환한다."""
-        output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, "069500", 1)
+        output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd)
         if not output:
             return 0.0
         return float(output.get("nrcvb_buy_amt", "0"))
