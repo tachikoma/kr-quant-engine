@@ -99,9 +99,13 @@ class KisApiClient:
                 res = requests.get(url, headers=headers, params=params, timeout=15)
                 return self._handle_response(res)
             except KisApiError as e:
-                if attempt < self._max_retries and (
-                    e.http_status >= 500 or e.msg_cd == "EGW00201"
-                ):
+                if attempt < self._max_retries and e.msg_cd == "EGW00201":
+                    print(
+                        f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
+                        f"http_status={e.http_status}, "
+                        f"attempt={attempt+1}/{self._max_retries}). "
+                        f"Retrying in {self._retry_delay}s."
+                    )
                     time.sleep(self._retry_delay)
                     continue
                 raise
@@ -121,9 +125,13 @@ class KisApiClient:
                 res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
                 return self._handle_response(res)
             except KisApiError as e:
-                if attempt < self._max_retries and (
-                    e.http_status >= 500 or e.msg_cd == "EGW00201"
-                ):
+                if attempt < self._max_retries and e.msg_cd == "EGW00201":
+                    print(
+                        f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
+                        f"http_status={e.http_status}, "
+                        f"attempt={attempt+1}/{self._max_retries}). "
+                        f"Retrying in {self._retry_delay}s."
+                    )
                     time.sleep(self._retry_delay)
                     continue
                 raise
