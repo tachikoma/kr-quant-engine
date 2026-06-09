@@ -72,10 +72,12 @@ class KisAdapter:
         nxdy_excc_amt = output2[0].get("nxdy_excc_amt", "0")
         return float(nxdy_excc_amt)
 
-    def get_available_cash(self) -> float:
-        """KIS inquire-psbl-order API가 직접 계산한 실제 주문가능금액을 반환한다."""
-        output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd)
-        print(f"[DEBUG] inquire-psbl-order 응답: {output}")
+    def get_available_cash(self, ticker: str = "", price: int = 0) -> float:
+        """KIS inquire-psbl-order API가 직접 계산한 실제 주문가능금액을 반환한다.
+        ticker/price를 지정하면 해당 종목 기준으로 조회한다."""
+        price_str = str(price) if price else ""
+        output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, ticker, price_str)
+        print(f"[DEBUG] inquire-psbl-order 응답(ticker={ticker}, price={price}): {output}")
         if not output:
             return 0.0
         return float(output.get("ord_psbl_cash", "0"))
