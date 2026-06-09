@@ -50,6 +50,7 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_REFRESH_CACHE` | `0` | Force refetch data |
 | `LIVE_ORDER_ENABLED` | `0` | Live order toggle (0=safe mode) |
 | `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` or `KIS` |
+| `LIQUIDATE_ON_RISK_OFF` | `1` | risk_off 시 전량 매도(1) vs 보유 유지(0) |
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
