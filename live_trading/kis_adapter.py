@@ -71,8 +71,8 @@ class KisAdapter:
         _, output2 = self._api.get_balance(self._cano, self._acnt_prdt_cd)
         if not output2:
             return 0.0
-        dnca_tot_amt = output2[0].get("dnca_tot_amt", "0")
-        return float(dnca_tot_amt)
+        nxdy_excc_amt = output2[0].get("nxdy_excc_amt", "0")
+        return float(nxdy_excc_amt)
 
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""

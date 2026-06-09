@@ -1406,9 +1406,10 @@ def run_daily() -> None:
             latest_buy_prices_after = {}
             latest_sell_prices_after = {}
 
-        # 예수금 안전 마진 적용: 키움 증거금 계산 방식 차이로 인한 증거금 부족을 방지 (BUG-4)
-        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능 (기본: 0.07 = 7%)
-        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", 0.07)
+        # 예수금 안전 마진 적용: KIS는 nxdy_excc_amt(위탁증거금 차감 완료) 사용, Kiwoom은 dnca_tot_amt 사용
+        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능
+        _default_margin = 0.03 if broker_type == "KIS" else 0.07
+        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", _default_margin)
         _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
         try:
             new_orders = build_rebalance_orders(
