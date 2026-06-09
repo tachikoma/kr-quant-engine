@@ -75,12 +75,15 @@ class KisAdapter:
     def get_available_cash(self, ticker: str = "", price: int = 0) -> float:
         """KIS inquire-psbl-order API가 직접 계산한 실제 주문가능금액을 반환한다.
         ticker/price를 지정하면 해당 종목 기준으로 조회한다."""
+        info = self.get_buyable_info(ticker, price)
+        return float(info.get("ord_psbl_cash", "0"))
+
+    def get_buyable_info(self, ticker: str, price: int) -> dict[str, str]:
+        """특정 종목 기준 매수 가능 정보(ord_psbl_cash, nrcvb_buy_qty 등)를 반환한다."""
         price_str = str(price) if price else ""
         output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, ticker, price_str)
-        print(f"[DEBUG] inquire-psbl-order 응답(ticker={ticker}, price={price}): {output}")
-        if not output:
-            return 0.0
-        return float(output.get("ord_psbl_cash", "0"))
+        print(f"[DEBUG] get_buyable_info({ticker}, price={price}): {output}")
+        return output or {}
 
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""
