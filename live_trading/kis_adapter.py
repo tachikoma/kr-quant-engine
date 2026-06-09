@@ -79,7 +79,7 @@ class KisAdapter:
         output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, "069500", 1)
         if not output:
             return 0.0
-        return float(output.get("nrcvb_buy_psbl_amt", "0"))
+        return float(output.get("nrcvb_buy_amt", "0"))
 
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""
