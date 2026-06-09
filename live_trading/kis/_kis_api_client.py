@@ -289,12 +289,11 @@ class KisApiClient:
         params = {
             "CANO": cano,
             "ACNT_PRDT_CD": acnt_prdt_cd,
+            "PDNO": symbol,
             "ORD_DVSN": "01",
             "CMA_EVLU_AMT_ICLD_YN": "N",
             "OVRS_ICLD_YN": "N",
         }
-        if symbol:
-            params["PDNO"] = symbol
         if price:
             params["ORD_UNPR"] = price
         body = self._get(
