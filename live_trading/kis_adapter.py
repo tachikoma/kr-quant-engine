@@ -74,6 +74,13 @@ class KisAdapter:
         nxdy_excc_amt = output2[0].get("nxdy_excc_amt", "0")
         return float(nxdy_excc_amt)
 
+    def get_available_cash(self) -> float:
+        """KIS inquire-psbl-order API가 직접 계산한 실제 주문가능금액을 반환한다."""
+        output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, "069500", 1)
+        if not output:
+            return 0.0
+        return float(output.get("nrcvb_buy_psbl_amt", "0"))
+
     def get_holdings(self) -> dict[str, int]:
         """보유 종목을 ticker -> 수량 형태로 반환한다."""
         output1, _ = self._api.get_balance(self._cano, self._acnt_prdt_cd)

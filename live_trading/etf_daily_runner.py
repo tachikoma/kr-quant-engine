@@ -629,7 +629,8 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         print("[계획수립] 잔고/예수금/현재가 조회 중...", end=" ", flush=True)
         t0 = dt.datetime.now()
         holdings = api.get_holdings()
-        cash = float(api.get_cash())
+        _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
+        cash = float(_get_cash())
 
         if config.protect_external_holdings:
             etf_set = set(etf_list)
@@ -1363,7 +1364,8 @@ def run_daily() -> None:
     refreshed_cash = None
     if (not dry_run) and api is not None:
         try:
-            refreshed_cash = _safe_float(api.get_cash())
+            _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
+            refreshed_cash = _safe_float(_get_cash())
             print(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
         except Exception as exc:
             print(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
