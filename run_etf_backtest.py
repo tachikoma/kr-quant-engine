@@ -127,7 +127,7 @@ def _parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ETF 전용 백테스트 실행기")
     parser.add_argument("--start", "-s", help="시작일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 20160101", default=None)
     parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
-    parser.add_argument("--mode", "-m", choices=["single", "experiment"], help="실행 모드: single 또는 experiment (옵션)", default=None)
+    parser.add_argument("--mode", "-m", choices=["single", "experiment", "risk_off_compare"], help="실행 모드: single | experiment | risk_off_compare (옵션)", default=None)
     return parser.parse_args()
 
 
@@ -634,7 +634,7 @@ def load_etf_price() -> pd.DataFrame:
 
 
 
-def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], index_df: pd.DataFrame, use_market_filter: bool = True, max_positions: int = ETF_MAX_POSITIONS, slippage: float = SLIPPAGE_PCT):
+def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], index_df: pd.DataFrame, use_market_filter: bool = True, max_positions: int = ETF_MAX_POSITIONS, slippage: float = SLIPPAGE_PCT, risk_off_liquidate: bool = True):
     price = load_etf_price()
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
 
@@ -702,7 +702,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 slippage=slippage,
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
-                allow_empty_target_sell=False,
+                allow_empty_target_sell=not risk_on if risk_off_liquidate else False,
                 generate_orders=True,
                 max_asset_pct=max_asset_pct,
             )
@@ -971,6 +971,7 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
     index_df = get_index_data()
     common_dates = list(index_df["date"])
 
+    strategy_cfg = get_strategy_config()
     result, trades = run_etf_strategy(
         INITIAL_CASH,
         common_dates,
@@ -978,6 +979,7 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
         use_market_filter=USE_MARKET_FILTER,
         max_positions=ETF_MAX_POSITIONS,
         slippage=BASE_SLIPPAGE,
+        risk_off_liquidate=strategy_cfg.get("liquidate_on_risk_off", True),
     )
 
     if ENABLE_BENCHMARK:
@@ -1017,8 +1019,11 @@ def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     results = []
     trades_dict = {}
 
+    strategy_cfg = get_strategy_config()
+    risk_off_liquidate = strategy_cfg.get("liquidate_on_risk_off", True)
+
     for slip in SLIPPAGE_OPTIONS:
-        curve, trades = run_etf_strategy(INITIAL_CASH, common_dates, index_df, True, 2, slip)
+        curve, trades = run_etf_strategy(INITIAL_CASH, common_dates, index_df, True, 2, slip, risk_off_liquidate=risk_off_liquidate)
         label = f"slip_{int(slip*10000)}bp"
         curve = curve.rename(
             columns={
@@ -1150,6 +1155,86 @@ def _to_json_serializable(stats: dict) -> dict:
     return serializable
 
 
+def run_risk_off_compare_mode() -> None:
+    """liquidate_on_risk_off=True vs False 비교 실행"""
+    index_df = get_index_data()
+    common_dates = list(index_df["date"])
+
+    print("\n=== Risk-Off 행동 비교: Liquidate(매도) vs Hold(보유) ===")
+    print("실행 중...\n")
+
+    curve_liquidate, trades_liquidate = run_etf_strategy(
+        INITIAL_CASH, common_dates, index_df,
+        use_market_filter=True, max_positions=ETF_MAX_POSITIONS,
+        slippage=BASE_SLIPPAGE, risk_off_liquidate=True,
+    )
+    curve_liquidate = curve_liquidate.rename(columns={
+        "equity": "equity_liquidate",
+        "market_value": "market_value_liquidate",
+    })
+
+    curve_hold, trades_hold = run_etf_strategy(
+        INITIAL_CASH, common_dates, index_df,
+        use_market_filter=True, max_positions=ETF_MAX_POSITIONS,
+        slippage=BASE_SLIPPAGE, risk_off_liquidate=False,
+    )
+    curve_hold = curve_hold.rename(columns={
+        "equity": "equity_hold",
+        "market_value": "market_value_hold",
+    })
+
+    result = curve_liquidate[["date", "equity_liquidate", "market_value_liquidate"]].copy()
+    result = pd.merge(result, curve_hold[["date", "equity_hold", "market_value_hold"]], on="date", how="outer")
+
+    if ENABLE_BENCHMARK:
+        try:
+            benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
+        except Exception as e:
+            print(f"[경고] 벤치마크 수집 실패: {e}")
+            benchmark_curve = pd.DataFrame()
+
+        if isinstance(benchmark_curve, pd.DataFrame) and not benchmark_curve.empty and "equity_kodex200_bh" in benchmark_curve.columns:
+            benchmark_curve["date"] = pd.to_datetime(benchmark_curve["date"])
+            result = pd.merge(result, benchmark_curve[["date", "equity_kodex200_bh"]], on="date", how="outer")
+
+    result = result.sort_values("date")
+    for col in ["equity_liquidate", "equity_hold", "market_value_liquidate", "market_value_hold"]:
+        if col in result.columns:
+            result[col] = result[col].ffill().fillna(INITIAL_CASH if col.startswith("equity") else 0)
+    if "equity_kodex200_bh" in result.columns:
+        result["equity_kodex200_bh"] = result["equity_kodex200_bh"].ffill().fillna(INITIAL_CASH)
+
+    # 통계 출력
+    stats_liquidate = calc_stats(result, "equity_liquidate")
+    stats_hold = calc_stats(result, "equity_hold")
+
+    print("\n=== Risk-Off 행동 비교 결과 ===")
+    print(f"백테스트 기간: {common_dates[0].date()} ~ {common_dates[-1].date()} ({len(common_dates)} 거래일)")
+    print(f"{'전략':<20} {'최종자산':>12} {'수익률':>10} {'CAGR':>8} {'MDD':>8} {'샤프':>8} {'변동성':>8}")
+    print("-" * 74)
+    def _fmt_f(v): return f"{v:>8.2%}" if isinstance(v, float) else f"{v:>8}"
+    def _fmt_d(v): return f"{v:>12,.0f}" if isinstance(v, float) else f"{v:>12}"
+    print(f"{'Liquidate(매도)':<20} {_fmt_d(stats_liquidate['final'])} {_fmt_f(stats_liquidate['total_return'])} {_fmt_f(stats_liquidate['cagr'])} {_fmt_f(stats_liquidate['mdd'])} {stats_liquidate['sharpe']:>8.4f} {_fmt_f(stats_liquidate['volatility'])}")
+    print(f"{'Hold(보유)':<20}     {_fmt_d(stats_hold['final'])} {_fmt_f(stats_hold['total_return'])} {_fmt_f(stats_hold['cagr'])} {_fmt_f(stats_hold['mdd'])} {stats_hold['sharpe']:>8.4f} {_fmt_f(stats_hold['volatility'])}")
+
+    if ENABLE_BENCHMARK and "equity_kodex200_bh" in result.columns:
+        stats_bh = calc_stats(result, "equity_kodex200_bh")
+        print(f"{'KODEX200 BH':<20} {_fmt_d(stats_bh['final'])} {_fmt_f(stats_bh['total_return'])} {_fmt_f(stats_bh['cagr'])} {_fmt_f(stats_bh['mdd'])} {stats_bh['sharpe']:>8.4f} {_fmt_f(stats_bh['volatility'])}")
+
+    print(f"\n매도 거래 수: Liquidate={len(trades_liquidate)}, Hold={len(trades_hold)}")
+
+    # CSV 저장
+    save_cols = ["date", "equity_liquidate", "equity_hold"]
+    if "equity_kodex200_bh" in result.columns:
+        save_cols.append("equity_kodex200_bh")
+    result[save_cols].to_csv(OUTPUT_DIR / "risk_off_comparison.csv", index=False, encoding="utf-8-sig")
+    trades_liquidate.to_csv(OUTPUT_DIR / "etf_trades_liquidate.csv", index=False, encoding="utf-8-sig")
+    trades_hold.to_csv(OUTPUT_DIR / "etf_trades_hold.csv", index=False, encoding="utf-8-sig")
+    print(f"\n저장 완료: {OUTPUT_DIR / 'risk_off_comparison.csv'}")
+    print(f"저장 완료: {OUTPUT_DIR / 'etf_trades_liquidate.csv'}")
+    print(f"저장 완료: {OUTPUT_DIR / 'etf_trades_hold.csv'}")
+
+
 def main():
     # CLI 인자 파싱: 시작/종료일과 모드(옵션)를 받아 전역 변수로 설정
     args = _parse_cli_args()
@@ -1197,10 +1282,23 @@ def main():
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    if RUN_MODE not in {"single", "experiment"}:
+    if RUN_MODE not in {"single", "experiment", "risk_off_compare"}:
         print(f"\n❌ 잘못된 ETF_BACKTEST_MODE 값: {RUN_MODE}")
-        print("   허용값: single | experiment")
+        print("   허용값: single | experiment | risk_off_compare")
         exit(1)
+
+    if RUN_MODE == "risk_off_compare":
+        try:
+            run_risk_off_compare_mode()
+        except RuntimeError as e:
+            print(f"\n❌ 실행 중 오류 발생:\n{str(e)}")
+            exit(1)
+        except Exception as e:
+            print(f"\n❌ 예기치 않은 오류 발생: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+        return
 
     try:
         if RUN_MODE == "single":

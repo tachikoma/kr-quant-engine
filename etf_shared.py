@@ -102,6 +102,9 @@ def get_strategy_config() -> dict:
         # 단위: 비율 (예: 0.0005 == 5bp)
         "default_slippage_pct": 0.0005,
         "spread_pct": 0.0005,
+        # risk_off 시 전량 매도할지 보유 유지할지 결정
+        # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
+        "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
     }
 
 
