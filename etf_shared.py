@@ -180,8 +180,14 @@ def build_rebalance_orders(
     generate_orders: bool = True,
     max_asset_pct: float | None = None,
     ticker_names: dict[str, str] | None = None,
+    market_order_margin_rate: float = 0.0,
 ) -> list[dict]:
-    """리밸런싱 주문 목록을 생성한다."""
+    """리밸런싱 주문 목록을 생성한다.
+
+    market_order_margin_rate: 시장가 주문 시 증권사가 추가로 확보하는 증거금 할증률
+        (예: 0.20 = 20%). Kiwoom MARKET(시장가) 주문 시 필요.
+        LIMIT 주문이나 KIS는 0.0으로 유지.
+    """
     orders: list[dict] = []
     # 로그/display_name용: ticker_names가 있으면 '종목명(코드)' 형태, 없으면 코드 그대로
     _dn = lambda t: (ticker_names or {}).get(t, t)  # noqa: E731
@@ -360,7 +366,7 @@ def build_rebalance_orders(
             continue
 
         try:
-            unit_cost = apply_buy_cost(float(price), slippage)
+            unit_cost = apply_buy_cost(float(price), slippage) * (1 + market_order_margin_rate)
         except Exception as e:
             print(f"[주문계산][매수오류] {_dn(ticker)} unit_cost 계산 실패: {e}")
             continue

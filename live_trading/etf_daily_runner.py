@@ -611,7 +611,11 @@ def _build_catchup_orders(
     return orders
 
 
-def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
+def _build_plan(
+    config: RunnerConfig,
+    api: Any | None,
+    market_order_margin_rate: float = 0.0,
+) -> dict[str, Any]:
     strategy_cfg = get_strategy_config()
     etf_list = strategy_cfg["etf_list"]
     external_holdings: dict[str, int] = {}
@@ -760,6 +764,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
             taxable_tickers=TAXABLE_ETF_TICKERS,
             generate_orders=(rebalance_due or needs_catchup),
             ticker_names=ticker_names,
+            market_order_margin_rate=market_order_margin_rate,
         )
 
     # KIS: 각 매수 주문별로 개별 종목/가격 기준 nrcvb_buy_qty 조회하여 수량 제한
@@ -793,6 +798,7 @@ def _build_plan(config: RunnerConfig, api: Any | None) -> dict[str, Any]:
         "sell_orders": sell_orders,
         "buy_orders": buy_orders,
         "all_orders": orders,
+        "market_order_margin_rate": market_order_margin_rate,
     }
 
 
@@ -1124,6 +1130,9 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
     print(f"미체결 재주문: {'ON' if cfg.retry_unfilled_orders else 'OFF'} ({cfg.retry_order_type})")
     print(f"유니버스 외 보유 매도 차단: {'ON' if cfg.protect_external_holdings else 'OFF'}")
     print(f"컷오프 이후 실주문 차단: {'ON' if cfg.block_live_after_cutoff else 'OFF'}")
+    _margin_rate = plan.get("market_order_margin_rate", 0.0)
+    if _margin_rate > 0:
+        print(f"시장가 증거금 할증률: {_margin_rate:.0%}")
     print(f"보유종목수: {len(plan['holdings'])}, 예수금: {plan['cash']:,.0f}")
     if plan['holdings']:
         print("  현재 보유:")
@@ -1279,7 +1288,11 @@ def run_daily() -> None:
         )
 
     run_id = str(uuid.uuid4())
-    plan = _build_plan(cfg, api)
+    _market_order_margin_rate = parse_pct_env(
+        "MARKET_ORDER_MARGIN_RATE",
+        0.20 if broker_type == "KIWOOM" else 0.0,
+    )
+    plan = _build_plan(cfg, api, market_order_margin_rate=_market_order_margin_rate)
     _print_plan(plan, cfg)
 
     if not plan["all_orders"]:
@@ -1441,6 +1454,7 @@ def run_daily() -> None:
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
                 generate_orders=True,
+                market_order_margin_rate=_market_order_margin_rate,
             )
             new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
             plan["buy_orders"] = new_buy_orders
