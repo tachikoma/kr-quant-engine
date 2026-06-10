@@ -1405,8 +1405,8 @@ def run_daily() -> None:
 
     # 매도 체결이 완료되어 실제 매수가 가능한 경우(실거래)에는
     # 매도 완료 후의 실제 예수금/보유를 기준으로 매수 주문을 재계산합니다.
-    # 캐치업 모드에서는 기존 catchup 주문 계획을 그대로 사용합니다.
-    if can_buy and (not dry_run) and api is not None and not plan.get("needs_catchup", False):
+    # 캐치업 모드에서도 동일하게 재계산하여 market_order_margin_rate 등을 적용합니다.
+    if can_buy and (not dry_run) and api is not None:
         try:
             refreshed_holdings = api.get_holdings()
             print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
