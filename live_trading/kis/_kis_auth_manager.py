@@ -9,7 +9,6 @@ ENV_MODE 공통 환경변수 사용:
   - "demo" → 모의 (https://openapivts.koreainvestment.com:29443)
 """
 
-import copy
 import json
 import os
 from datetime import datetime
@@ -63,6 +62,8 @@ class KisAuthManager:
             "charset": "UTF-8",
             "User-Agent": _DEFAULT_USER_AGENT,
         }
+        self._session = requests.Session()
+        self._auth_timeout = float(os.environ.get("KIS_AUTH_TIMEOUT", "10"))
 
     # ------------------------------------------------------------------
     # 로깅 헬퍼
@@ -190,11 +191,11 @@ class KisAuthManager:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        headers = copy.deepcopy(self._base_headers)
+        headers = self._base_headers.copy()
         headers.pop("authorization", None)
 
         try:
-            res = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+            res = self._session.post(url, data=json.dumps(payload), headers=headers, timeout=self._auth_timeout)
         except requests.RequestException as e:
             raise RuntimeError(f"KIS 토큰 발급 요청 실패: {e}") from e
 
@@ -226,7 +227,7 @@ class KisAuthManager:
 
     def get_base_headers(self) -> dict:
         """API 호출용 기본 헤더의 복사본을 반환합니다."""
-        return copy.deepcopy(self._base_headers)
+        return self._base_headers.copy()
 
     def get_websocket_approval_key(self) -> Optional[str]:
         """WebSocket 접속키(approval_key)를 새로 발급하고 반환합니다."""
@@ -236,11 +237,11 @@ class KisAuthManager:
             "appkey": self.app_key,
             "secretkey": self.app_secret,
         }
-        headers = copy.deepcopy(self._base_headers)
+        headers = self._base_headers.copy()
         headers.pop("authorization", None)
 
         try:
-            res = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+            res = self._session.post(url, data=json.dumps(payload), headers=headers, timeout=self._auth_timeout)
         except requests.RequestException as e:
             self._log_warning(f"WebSocket 접속키 발급 요청 실패: {e}")
             return None
@@ -252,3 +253,7 @@ class KisAuthManager:
         else:
             self._log_warning(f"WebSocket 접속키 발급 실패: HTTP {res.status_code} - {res.text[:200]}")
             return None
+
+    def close(self) -> None:
+        """HTTP 세션을 종료합니다."""
+        self._session.close()

@@ -8,11 +8,13 @@ pandas.DataFrame 대신 dict / list[dict] 를 반환합니다.
 """
 
 import json
+import os
 import threading
 import time
 from typing import Any, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from ._kis_auth_manager import KisAuthManager
 
@@ -50,6 +52,12 @@ class KisApiClient:
         self._min_interval = self._SMART_SLEEP_DEMO if self._is_demo else 0.1
         self._last_request_ts = 0.0
         self._throttle_lock = threading.Lock()
+
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._api_timeout = float(os.environ.get("KIS_API_TIMEOUT", "15"))
 
     # ------------------------------------------------------------------
     # 내부 HTTP 헬퍼
@@ -96,7 +104,7 @@ class KisApiClient:
             self._throttle()
             headers = self._build_headers(tr_id, tr_cont)
             try:
-                res = requests.get(url, headers=headers, params=params, timeout=15)
+                res = self._session.get(url, headers=headers, params=params, timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
                 if attempt < self._max_retries and e.msg_cd == "EGW00201":
@@ -122,7 +130,7 @@ class KisApiClient:
             self._throttle()
             headers = self._build_headers(tr_id, "")
             try:
-                res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
+                res = self._session.post(url, headers=headers, data=json.dumps(payload), timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
                 if attempt < self._max_retries and e.msg_cd == "EGW00201":
@@ -460,3 +468,17 @@ class KisApiClient:
                 break
 
         return out1, out2
+
+    # ------------------------------------------------------------------
+    # 세션 관리
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """HTTP 세션을 종료합니다."""
+        self._session.close()
+
+    def __enter__(self) -> "KisApiClient":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()

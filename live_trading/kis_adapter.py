@@ -289,3 +289,7 @@ class KisAdapter:
             "cancel_order_id": str(cancel_order_id),
             "response": output,
         }
+
+    def close(self) -> None:
+        """HTTP 세션을 종료합니다."""
+        self._api.close()
