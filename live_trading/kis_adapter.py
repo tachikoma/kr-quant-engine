@@ -244,10 +244,10 @@ class KisAdapter:
             }
 
         order_qty = int(target_row.get("ord_qty", 0))
-        filled_qty = int(target_row.get("ccld_qty", 0))
+        filled_qty = int(target_row.get("tot_ccld_qty", 0))
         remaining_qty = int(target_row.get("rmn_qty", 0))
 
-        is_filled = remaining_qty == 0 or filled_qty >= order_qty
+        is_filled = filled_qty > 0 and (remaining_qty == 0 or filled_qty >= order_qty)
 
         return {
             "order_id": order_id,

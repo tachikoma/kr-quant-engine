@@ -936,7 +936,7 @@ def _poll_and_finalize_orders(
             row["requested_qty"] = req_qty
             row["filled_qty"] = max(filled_qty, 0)
             row["remaining_qty"] = max(req_qty - filled_qty, 0)
-            row["is_filled"] = bool(status.get("is_filled", False)) or (row["remaining_qty"] == 0)
+            row["is_filled"] = (bool(status.get("is_filled", False)) and int(status.get("filled_qty", 0)) > 0) or (row["remaining_qty"] == 0)
             row["last_status"] = status
 
             if row["is_filled"]:
