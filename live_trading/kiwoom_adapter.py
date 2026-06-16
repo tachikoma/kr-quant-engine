@@ -57,6 +57,7 @@ import threading
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +102,11 @@ class KiwoomAdapter:
         self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
 
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
         self.access_token = self._issue_token()
 
     def _resolve_url(self, endpoint: str) -> str:
@@ -128,7 +134,7 @@ class KiwoomAdapter:
 
         # 토큰 발급도 전체 호출 간 딜레이 규칙을 따르도록 한다.
         self._throttle_request()
-        response = requests.post(token_url, headers=headers, json=payload, timeout=self.timeout)
+        response = self._session.post(token_url, headers=headers, json=payload, timeout=self.timeout)
         with self._throttle_lock:
             self._last_request_ts = time.monotonic()
         response.raise_for_status()
@@ -183,7 +189,7 @@ class KiwoomAdapter:
         response: requests.Response | None = None
         for attempt in range(self.http_max_retries + 1):
             self._throttle_request()
-            response = requests.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
+            response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
             # 실제 요청 시작 시각을 최신 값으로 갱신(락으로 동기화)
             with self._throttle_lock:
                 self._last_request_ts = time.monotonic()
@@ -777,3 +783,13 @@ class KiwoomAdapter:
             "cancel_order_id": str(cancel_order_id),
             "response": data,
         }
+
+    def close(self) -> None:
+        """HTTP 세션을 종료합니다."""
+        self._session.close()
+
+    def __enter__(self) -> "KiwoomAdapter":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
