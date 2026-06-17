@@ -107,7 +107,7 @@ class KisApiClient:
                 res = self._session.get(url, headers=headers, params=params, timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
-                if attempt < self._max_retries and e.msg_cd == "EGW00201":
+                if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
                     print(
                         f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
                         f"http_status={e.http_status}, "
@@ -133,7 +133,7 @@ class KisApiClient:
                 res = self._session.post(url, headers=headers, data=json.dumps(payload), timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
-                if attempt < self._max_retries and e.msg_cd == "EGW00201":
+                if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
                     print(
                         f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
                         f"http_status={e.http_status}, "
@@ -152,11 +152,12 @@ class KisApiClient:
     def _handle_response(self, res: requests.Response) -> dict:
         """응답을 처리하고 dict 를 반환합니다. 오류 시 KisApiError 를 raise 합니다."""
         if res.status_code != 200:
-            raise KisApiError(
-                str(res.status_code),
-                res.text[:500],
-                http_status=res.status_code,
-            )
+            try:
+                body = res.json()
+                msg_cd = body.get("msg_cd", str(res.status_code))
+            except Exception:
+                msg_cd = str(res.status_code)
+            raise KisApiError(msg_cd, res.text[:500], http_status=res.status_code)
         try:
             body = res.json()
         except Exception as e:
