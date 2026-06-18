@@ -117,7 +117,7 @@ class KisApiClient:
                     time.sleep(self._retry_delay)
                     continue
                 raise
-            except requests.RequestException as e:
+            except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self._max_retries:
                     time.sleep(self._retry_delay)
                     continue
@@ -143,7 +143,7 @@ class KisApiClient:
                     time.sleep(self._retry_delay)
                     continue
                 raise
-            except requests.RequestException as e:
+            except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self._max_retries:
                     time.sleep(self._retry_delay)
                     continue

@@ -189,7 +189,19 @@ class KiwoomAdapter:
         response: requests.Response | None = None
         for attempt in range(self.http_max_retries + 1):
             self._throttle_request()
-            response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
+            try:
+                response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < self.http_max_retries:
+                    delay = self.http_retry_delay
+                    if self.http_debug_response:
+                        print(
+                            f"[HTTP][재시도] 네트워크 오류 ({type(e).__name__}) "
+                            f"-> {delay:.1f}초 대기 후 재시도"
+                        )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"HTTP request failed (network error): {url}") from e
             # 실제 요청 시작 시각을 최신 값으로 갱신(락으로 동기화)
             with self._throttle_lock:
                 self._last_request_ts = time.monotonic()
