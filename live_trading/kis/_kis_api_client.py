@@ -48,7 +48,8 @@ class KisApiClient:
         self._sleep_sec = self._SMART_SLEEP_DEMO if self._is_demo else self._SMART_SLEEP_REAL
         # 재시도 및 스로틀
         self._max_retries = 3
-        self._retry_delay = 0.5
+        _default_retry = str(self._SMART_SLEEP_DEMO if self._is_demo else self._SMART_SLEEP_REAL)
+        self._retry_delay = float(os.environ.get("KIS_RETRY_DELAY", _default_retry))
         self._min_interval = self._SMART_SLEEP_DEMO if self._is_demo else 0.1
         self._last_request_ts = 0.0
         self._throttle_lock = threading.Lock()
@@ -119,7 +120,8 @@ class KisApiClient:
                 raise
             except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self._max_retries:
-                    time.sleep(self._retry_delay)
+                    _backoff = self._retry_delay * (2 ** attempt)
+                    time.sleep(_backoff)
                     continue
                 raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
 
@@ -145,7 +147,8 @@ class KisApiClient:
                 raise
             except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self._max_retries:
-                    time.sleep(self._retry_delay)
+                    _backoff = self._retry_delay * (2 ** attempt)
+                    time.sleep(_backoff)
                     continue
                 raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
 

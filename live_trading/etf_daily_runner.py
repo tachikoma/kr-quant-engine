@@ -1409,6 +1409,13 @@ def run_daily() -> None:
     if can_buy and (not dry_run) and api is not None:
         try:
             refreshed_holdings = api.get_holdings()
+            if cfg.protect_external_holdings:
+                _strategy_cfg = get_strategy_config()
+                _etf_set = set(_strategy_cfg["etf_list"])
+                _before = len(refreshed_holdings)
+                refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t in _etf_set}
+                if len(refreshed_holdings) < _before:
+                    print(f"[보호] 매도 후 재조회된 유니버스 외 {_before - len(refreshed_holdings)}개는 매수계산에서 제외합니다.")
             print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
         except Exception as exc:
             print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
