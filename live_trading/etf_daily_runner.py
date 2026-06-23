@@ -1327,153 +1327,176 @@ def run_daily() -> None:
             print(f"[경고] 텔레그램 알림 초기화 실패: {_tg_exc}")
 
     # 1) 매도 우선
-    print("\n[주문] ─── 매도 단계 ───")
-    sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
-    if sell_results:
-        for r in sell_results:
-            status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
-            print(f"  SELL {r['ticker']} {r['qty']}주 → {status_txt}")
-    sell_retry_results: list[dict[str, Any]] = []
-
-    if (not dry_run) and api is not None:
-        print(f"[주문] 매도 체결 대기 중 (타임아웃={cfg.sell_fill_timeout_sec}초, 컷오프={cfg.sell_cutoff_time})")
-        sell_results = _poll_and_finalize_orders(
-            api=api,
-            submitted_results=sell_results,
-            timeout_sec=cfg.sell_fill_timeout_sec,
-            poll_interval_sec=cfg.order_poll_interval_sec,
-            cutoff_time_hhmm=cfg.sell_cutoff_time,
-            cancel_unfilled_orders=cfg.cancel_unfilled_orders,
-            notifier=notifier,
-        )
-        for r in sell_results:
-            print(
-                f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
-                f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
-                + (" (타임아웃)" if r.get("timed_out") else "")
-            )
-        if cfg.retry_unfilled_orders:
+    if plan["sell_orders"]:
+        print("\n[주문] ─── 매도 단계 ───")
+        sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
+        if sell_results:
             for r in sell_results:
-                remain = int(r.get("remaining_qty", 0))
-                oid = str(r.get("order_id", "")).strip()
-                tid = str(r.get("ticker", "")).strip()
-                if remain > 0 and oid:
-                    try:
-                        api.cancel_order(order_id=oid, ticker=tid, qty=remain)
-                        r["cancel_submitted"] = True
-                    except Exception:
-                        pass
-            _wait_for_cancellations(api, sell_results)
-            _refresh_order_statuses(api, sell_results)
-            retry_sell_orders = _build_retry_orders(sell_results)
-            if retry_sell_orders:
-                print(f"[재시도] 매도 잔량 재주문 {len(retry_sell_orders)}건 제출")
-                sell_retry_results = _submit_orders(
-                    api,
-                    "SELL",
-                    retry_sell_orders,
-                    dry_run=False,
-                    order_type=cfg.retry_order_type,
-                    attempt=2,
-                    notifier=notifier,
-                )
-                sell_retry_results = _poll_and_finalize_orders(
-                    api=api,
-                    submitted_results=sell_retry_results,
-                    timeout_sec=cfg.retry_fill_timeout_sec,
-                    poll_interval_sec=cfg.order_poll_interval_sec,
-                    cutoff_time_hhmm=cfg.sell_cutoff_time,
-                    cancel_unfilled_orders=cfg.cancel_unfilled_orders,
-                    notifier=notifier,
-                )
+                status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
+                print(f"  SELL {r['ticker']} {r['qty']}주 → {status_txt}")
+        sell_retry_results: list[dict[str, Any]] = []
 
-    # 2) 매도 후 예수금 재확인(실주문 모드에서만)
-    refreshed_cash = None
-    if (not dry_run) and api is not None:
-        try:
-            _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
-            refreshed_cash = _safe_float(_get_cash())
-            print(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
-        except Exception as exc:
-            print(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
-            refreshed_cash = 0.0
-
-    # 3) 매도 미완전체결이면 매수 차단
-    can_buy = dry_run or _is_side_fully_filled(sell_results, sell_retry_results)
-    buy_results: list[dict[str, Any]] = []
-    buy_retry_results: list[dict[str, Any]] = []
-
-    # 매도 체결이 완료되어 실제 매수가 가능한 경우(실거래)에는
-    # 매도 완료 후의 실제 예수금/보유를 기준으로 매수 주문을 재계산합니다.
-    # 캐치업 모드에서도 동일하게 재계산하여 market_order_margin_rate 등을 적용합니다.
-    if can_buy and (not dry_run) and api is not None:
-        try:
-            refreshed_holdings = api.get_holdings()
-            if cfg.protect_external_holdings:
-                _strategy_cfg = get_strategy_config()
-                _etf_set = set(_strategy_cfg["etf_list"])
-                _before = len(refreshed_holdings)
-                refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t in _etf_set}
-                if len(refreshed_holdings) < _before:
-                    print(f"[보호] 매도 후 재조회된 유니버스 외 {_before - len(refreshed_holdings)}개는 매수계산에서 제외합니다.")
-            print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
-        except Exception as exc:
-            print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
-            refreshed_holdings = plan.get("holdings", {})
-
-        price_tickers = list(set(plan.get("target", [])) | set(refreshed_holdings.keys()))
-        try:
-            latest_prices_after = api.get_prices(price_tickers)
-            latest_buy_prices_after = dict(latest_prices_after)
-            latest_sell_prices_after = dict(latest_prices_after)
-            if hasattr(api, "get_bid_ask_prices"):
-                bid_ask = api.get_bid_ask_prices(price_tickers)
-                for ticker in price_tickers:
-                    row = bid_ask.get(ticker, {})
-                    buy_price = row.get("buy_price")
-                    sell_price = row.get("sell_price")
-                    if buy_price is not None:
-                        latest_buy_prices_after[ticker] = float(buy_price)
-                    if sell_price is not None:
-                        latest_sell_prices_after[ticker] = float(sell_price)
-        except Exception as exc:
-            print(f"[경고] 매도 후 가격 재조회 실패: {exc}")
-            latest_prices_after = {}
-            latest_buy_prices_after = {}
-            latest_sell_prices_after = {}
-
-        # 예수금 안전 마진 적용: KIS는 nxdy_excc_amt(위탁증거금 차감 완료) 사용, Kiwoom은 dnca_tot_amt 사용
-        # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능
-        _default_margin = 0.03 if broker_type == "KIS" else 0.07
-        _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", _default_margin)
-        _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
-        try:
-            new_orders = build_rebalance_orders(
-                current_holdings=refreshed_holdings,
-                target_tickers=plan.get("target", []),
-                latest_prices=latest_prices_after,
-                available_cash=_effective_cash,
-                latest_buy_prices=latest_buy_prices_after,
-                latest_sell_prices=latest_sell_prices_after,
-                max_positions=cfg.max_positions,
-                sell_rank_buffer=cfg.sell_rank_buffer,
-                allow_empty_target_sell=not plan.get("risk_on", True),
-                sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
-                taxable_tickers=TAXABLE_ETF_TICKERS,
-                generate_orders=True,
-                market_order_margin_rate=_market_order_margin_rate,
+        if (not dry_run) and api is not None:
+            print(f"[주문] 매도 체결 대기 중 (타임아웃={cfg.sell_fill_timeout_sec}초, 컷오프={cfg.sell_cutoff_time})")
+            sell_results = _poll_and_finalize_orders(
+                api=api,
+                submitted_results=sell_results,
+                timeout_sec=cfg.sell_fill_timeout_sec,
+                poll_interval_sec=cfg.order_poll_interval_sec,
+                cutoff_time_hhmm=cfg.sell_cutoff_time,
+                cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+                notifier=notifier,
             )
-            new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
-            plan["buy_orders"] = new_buy_orders
-            print(
-                f"[정보] 매도 후 실제 상태로 매수 주문 재계산: 매수 후보={len(new_buy_orders)}건, "
-                f"예수금={refreshed_cash:,.0f} "
-                f"(안전마진 {_budget_safety_margin:.1%} 적용, 실효={_effective_cash:,.0f})"
-            )
-        except Exception as exc:
-            print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
-    elif can_buy and (not dry_run) and api is not None and plan.get("needs_catchup", False):
-        print(f"[정보] 캐치업 모드: 기존 매수 계획 유지 ({len(plan.get('buy_orders', []))}건)")
+            for r in sell_results:
+                print(
+                    f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+                    f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
+                    + (" (타임아웃)" if r.get("timed_out") else "")
+                )
+            if cfg.retry_unfilled_orders:
+                for r in sell_results:
+                    remain = int(r.get("remaining_qty", 0))
+                    oid = str(r.get("order_id", "")).strip()
+                    tid = str(r.get("ticker", "")).strip()
+                    if remain > 0 and oid:
+                        try:
+                            api.cancel_order(order_id=oid, ticker=tid, qty=remain)
+                            r["cancel_submitted"] = True
+                        except Exception:
+                            pass
+                _wait_for_cancellations(api, sell_results)
+                _refresh_order_statuses(api, sell_results)
+                retry_sell_orders = _build_retry_orders(sell_results)
+                if retry_sell_orders:
+                    print(f"[재시도] 매도 잔량 재주문 {len(retry_sell_orders)}건 제출")
+                    sell_retry_results = _submit_orders(
+                        api,
+                        "SELL",
+                        retry_sell_orders,
+                        dry_run=False,
+                        order_type=cfg.retry_order_type,
+                        attempt=2,
+                        notifier=notifier,
+                    )
+                    sell_retry_results = _poll_and_finalize_orders(
+                        api=api,
+                        submitted_results=sell_retry_results,
+                        timeout_sec=cfg.retry_fill_timeout_sec,
+                        poll_interval_sec=cfg.order_poll_interval_sec,
+                        cutoff_time_hhmm=cfg.sell_cutoff_time,
+                        cancel_unfilled_orders=cfg.cancel_unfilled_orders,
+                        notifier=notifier,
+                    )
+
+        # 2) 매도 후 예수금 재확인(실주문 모드에서만)
+        refreshed_cash = None
+        if (not dry_run) and api is not None:
+            try:
+                _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
+                refreshed_cash = _safe_float(_get_cash())
+                print(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
+            except Exception as exc:
+                print(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
+                refreshed_cash = 0.0
+
+        # 3) 매도 미완전체결이면 매수 차단
+        can_buy = dry_run or _is_side_fully_filled(sell_results, sell_retry_results)
+        buy_results: list[dict[str, Any]] = []
+        buy_retry_results: list[dict[str, Any]] = []
+
+        # 매도 체결이 완료되어 실제 매수가 가능한 경우(실거래)에는
+        # 매도 완료 후의 실제 예수금/보유를 기준으로 매수 주문을 재계산합니다.
+        # 캐치업 모드에서도 동일하게 재계산하여 market_order_margin_rate 등을 적용합니다.
+        if can_buy and (not dry_run) and api is not None:
+            try:
+                refreshed_holdings = api.get_holdings()
+                if cfg.protect_external_holdings:
+                    _strategy_cfg = get_strategy_config()
+                    _etf_set = set(_strategy_cfg["etf_list"])
+                    _before = len(refreshed_holdings)
+                    refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t in _etf_set}
+                    if len(refreshed_holdings) < _before:
+                        print(f"[보호] 매도 후 재조회된 유니버스 외 {_before - len(refreshed_holdings)}개는 매수계산에서 제외합니다.")
+                print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
+            except Exception as exc:
+                print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
+                refreshed_holdings = plan.get("holdings", {})
+
+            price_tickers = list(set(plan.get("target", [])) | set(refreshed_holdings.keys()))
+            try:
+                latest_prices_after = api.get_prices(price_tickers)
+                latest_buy_prices_after = dict(latest_prices_after)
+                latest_sell_prices_after = dict(latest_prices_after)
+                if hasattr(api, "get_bid_ask_prices"):
+                    bid_ask = api.get_bid_ask_prices(price_tickers)
+                    for ticker in price_tickers:
+                        row = bid_ask.get(ticker, {})
+                        buy_price = row.get("buy_price")
+                        sell_price = row.get("sell_price")
+                        if buy_price is not None:
+                            latest_buy_prices_after[ticker] = float(buy_price)
+                        if sell_price is not None:
+                            latest_sell_prices_after[ticker] = float(sell_price)
+            except Exception as exc:
+                print(f"[경고] 매도 후 가격 재조회 실패: {exc}")
+                latest_prices_after = {}
+                latest_buy_prices_after = {}
+                latest_sell_prices_after = {}
+
+            # 예수금 안전 마진 적용: KIS는 nxdy_excc_amt(위탁증거금 차감 완료) 사용, Kiwoom은 dnca_tot_amt 사용
+            # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능
+            _default_margin = 0.03 if broker_type == "KIS" else 0.07
+            _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", _default_margin)
+            _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
+            try:
+                new_orders = build_rebalance_orders(
+                    current_holdings=refreshed_holdings,
+                    target_tickers=plan.get("target", []),
+                    latest_prices=latest_prices_after,
+                    available_cash=_effective_cash,
+                    latest_buy_prices=latest_buy_prices_after,
+                    latest_sell_prices=latest_sell_prices_after,
+                    max_positions=cfg.max_positions,
+                    sell_rank_buffer=cfg.sell_rank_buffer,
+                    allow_empty_target_sell=not plan.get("risk_on", True),
+                    sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+                    taxable_tickers=TAXABLE_ETF_TICKERS,
+                    generate_orders=True,
+                    market_order_margin_rate=_market_order_margin_rate,
+                )
+                new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
+                plan["buy_orders"] = new_buy_orders
+                print(
+                    f"[정보] 매도 후 실제 상태로 매수 주문 재계산: 매수 후보={len(new_buy_orders)}건, "
+                    f"예수금={refreshed_cash:,.0f} "
+                    f"(안전마진 {_budget_safety_margin:.1%} 적용, 실효={_effective_cash:,.0f})"
+                )
+                # KIS: 각 매수 주문별로 개별 종목/가격 기준 nrcvb_buy_qty 조회하여 수량 제한 (재계산)
+                if hasattr(api, "get_buyable_info"):
+                    for o in plan["buy_orders"]:
+                        if o.get("side") == "BUY":
+                            _t = o.get("ticker")
+                            _p = int(latest_buy_prices_after.get(_t, 0) or 0)
+                            if _p > 0:
+                                _info = api.get_buyable_info(_t, _p)
+                                _nrcvb_qty = int(_info.get("nrcvb_buy_qty", "0"))
+                                if _nrcvb_qty > 0 and o["qty"] > _nrcvb_qty:
+                                    dn = o.get("display_name", _t)
+                                    print(f"[KIS제한-재계산] {dn} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)")
+                                    o["qty"] = _nrcvb_qty
+                                    o["estimated_value"] = _nrcvb_qty * float(o.get("reference_price", 0))
+            except Exception as exc:
+                print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
+        elif can_buy and (not dry_run) and api is not None and plan.get("needs_catchup", False):
+            print(f"[정보] 캐치업 모드: 기존 매수 계획 유지 ({len(plan.get('buy_orders', []))}건)")
+    else:
+        print("\n[주문] 매도 대상 없음 — 매도 단계를 건너뜁니다.")
+        sell_results = []
+        sell_retry_results = []
+        refreshed_cash = None
+        can_buy = True
+        buy_results = []
+        buy_retry_results = []
     print("\n[주문] ─── 매수 단계 ───")
     if can_buy:
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
