@@ -34,7 +34,7 @@ class KisApiClient:
 
     # 모의투자 throttle (실전보다 느림)
     _SMART_SLEEP_REAL = 0.05
-    _SMART_SLEEP_DEMO = 0.9
+    _SMART_SLEEP_DEMO = 1.0
 
     def __init__(self, auth: KisAuthManager, env_mode: str):
         """
@@ -45,7 +45,6 @@ class KisApiClient:
         self._auth = auth
         self._env_mode = env_mode
         self._is_demo = (env_mode == "demo")
-        self._sleep_sec = self._SMART_SLEEP_DEMO if self._is_demo else self._SMART_SLEEP_REAL
         # 재시도 및 스로틀
         self._max_retries = 3
         _default_retry = str(self._SMART_SLEEP_DEMO if self._is_demo else self._SMART_SLEEP_REAL)
@@ -179,9 +178,6 @@ class KisApiClient:
         body["_tr_id"] = res.headers.get("tr_id", "")
         return body
 
-    def _smart_sleep(self) -> None:
-        time.sleep(self._sleep_sec)
-
     # ------------------------------------------------------------------
     # 시세 조회
     # ------------------------------------------------------------------
@@ -290,7 +286,6 @@ class KisApiClient:
                 params["CTX_AREA_FK100"] = body.get("ctx_area_fk100", "")
                 params["CTX_AREA_NK100"] = body.get("ctx_area_nk100", "")
                 tr_cont = "N"
-                self._smart_sleep()
             else:
                 break
 
@@ -467,7 +462,6 @@ class KisApiClient:
                 params["CTX_AREA_FK100"] = body.get("ctx_area_fk100", "")
                 params["CTX_AREA_NK100"] = body.get("ctx_area_nk100", "")
                 tr_cont = "N"
-                self._smart_sleep()
             else:
                 break
 
