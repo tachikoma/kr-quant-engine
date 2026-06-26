@@ -935,11 +935,16 @@ def _poll_and_finalize_orders(
             order_qty = int(status.get("order_qty", req_qty))
             if order_qty > 0:
                 req_qty = order_qty
+            remaining_qty_raw = status.get("remaining_qty")
+            if remaining_qty_raw is None:
+                remaining_qty = max(req_qty - filled_qty, 0)
+            else:
+                remaining_qty = max(int(remaining_qty_raw), 0)
 
             row["requested_qty"] = req_qty
             row["filled_qty"] = max(filled_qty, 0)
-            row["remaining_qty"] = max(req_qty - filled_qty, 0)
-            row["is_filled"] = (bool(status.get("is_filled", False)) and int(status.get("filled_qty", 0)) > 0) or (row["remaining_qty"] == 0)
+            row["remaining_qty"] = remaining_qty
+            row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
             row["last_status"] = status
 
             if row["is_filled"]:
@@ -1069,7 +1074,7 @@ def _refresh_order_statuses(
         row["remaining_qty"] = max(remaining_qty, 0)
         if order_qty > 0:
             row["requested_qty"] = order_qty
-        row["is_filled"] = status.get("is_filled", False) or (row["remaining_qty"] == 0)
+        row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
         print(
             f"[상태재조회] {row.get('ticker', order_id)} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"

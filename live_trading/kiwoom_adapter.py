@@ -78,9 +78,9 @@ class KiwoomAdapter:
         self.access_token = ""
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
         self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
-        # Rate limit defaults by ENV_MODE: 실전=0.1s(10/sec, 50% margin), 모의=0.6s(1.67/sec, 17% margin)
+        # Rate limit defaults by ENV_MODE: 실전=0.1s(10/sec, 50% margin), 모의=1.0s(1/sec, 40% margin)
         _env_mode = os.environ.get("ENV_MODE", "real").lower()
-        _default_interval = 0.1 if _env_mode == "real" else 0.6
+        _default_interval = 0.1 if _env_mode == "real" else 1.0
         self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", str(_default_interval)))
         # Retry delay unified with throttle interval (same value)
         self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))
@@ -672,6 +672,7 @@ class KiwoomAdapter:
         - 요청 필수: qry_tp, stk_bond_tp, sell_tp, dmst_stex_tp
         - 응답 리스트 키: acnt_ord_cntr_prps_dtl
           - ord_no: 주문번호, cntr_qty: 체결수량, ord_qty: 주문수량, ord_remnq: 주문잔량
+          - cnfm_qty: 주문 확인/접수 수량이며 체결수량으로 취급하지 않는다.
         """
         if not order_id:
             raise ValueError("order_id is required")
@@ -731,10 +732,8 @@ class KiwoomAdapter:
                 "response": data,
             }
 
-        filled_qty = int(self._to_number(target_row.get(filled_qty_key, 0)))
         confirm_qty = int(self._to_number(target_row.get(confirm_qty_key, 0)))
-        if confirm_qty > filled_qty:
-            filled_qty = confirm_qty
+        filled_qty = int(self._to_number(target_row.get(filled_qty_key, 0)))
 
         order_qty = int(self._to_number(target_row.get(order_qty_key, 0)))
         remaining_qty_raw = target_row.get(remaining_qty_key)
@@ -743,15 +742,14 @@ class KiwoomAdapter:
         else:
             remaining_qty = int(self._to_number(remaining_qty_raw))
 
-        # ord_remnq == 0 이거나 cntr_qty >= ord_qty면 전량체결로 간주
-        if order_qty > 0:
-            is_filled = remaining_qty == 0 or filled_qty >= order_qty
-        else:
-            is_filled = False
+        # 주문 확인(cnfm_qty)과 실제 체결(cntr_qty)을 구분한다.
+        # 잔량이 0이어도 취소/거부 케이스가 있을 수 있으므로 체결수량까지 확인한다.
+        is_filled = order_qty > 0 and remaining_qty == 0 and filled_qty >= order_qty
 
         return {
             "order_id": order_id,
             "filled_qty": filled_qty,
+            "confirmed_qty": confirm_qty,
             "order_qty": order_qty,
             "remaining_qty": remaining_qty,
             "is_filled": is_filled,
