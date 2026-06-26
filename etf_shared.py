@@ -246,7 +246,6 @@ def build_rebalance_orders(
 
     # 대상 티커 목록을 문자열 리스트로 정리
     targets: list[str] = [str(t) for t in target_tickers] if target_tickers else []
-    target_set = set(targets[:max_positions])
     target_rank = {ticker: idx + 1 for idx, ticker in enumerate(targets)}
 
     # generate_orders=False이면 주문 생성 건너뜀
@@ -346,18 +345,16 @@ def build_rebalance_orders(
         max_allowed_per_asset = None
 
     # --- 매수 후보 선정 ---
-    slots = max(max_positions - len(holdings), 0)
-    buy_list = [ticker for ticker in targets if ticker not in holdings][:slots]
-    print(f"[주문계산] 매수 슬롯={slots}, 매수후보={buy_list}")
+    buy_list = targets[:max_positions]
+    buy_count = len(buy_list)
+    budget = cash / buy_count if buy_count > 0 else 0
+    print(f"[주문계산] 매수 종목={buy_list} (균등분배, 종목당 약 {budget:,.0f})")
     if not buy_list or cash <= 0:
         if not buy_list:
             print("[주문계산] 매수 대상 없음 → 주문 생성 종료")
         if cash <= 0:
             print(f"[주문계산] 예수금 부족(cash={cash:,.0f}) → 주문 생성 종료")
         return orders
-
-    budget = cash / len(buy_list)
-    print(f"[주문계산] 종목당 예산={budget:,.0f}")
 
     for ticker in buy_list:
         price = buy_prices.get(ticker)
