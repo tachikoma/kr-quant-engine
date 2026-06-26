@@ -127,6 +127,7 @@ class RunnerConfig:
     # 실전에서 API가 없을 때의 호가 스프레드 fallback
     spread_pct: float
     enable_catchup: bool
+    max_asset_pct: float = 0.50
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -329,6 +330,7 @@ def _read_env_config() -> RunnerConfig:
         live_slippage_pct=parse_pct_env("LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)),
         spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
         enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
+        max_asset_pct=parse_pct_env("MAX_ASSET_PCT", 0.50),
     )
 
 
@@ -755,6 +757,7 @@ def _build_plan(
             latest_buy_prices=latest_buy_prices,
             latest_sell_prices=latest_sell_prices,
             max_positions=config.max_positions,
+            max_asset_pct=config.max_asset_pct,
             sell_rank_buffer=config.sell_rank_buffer,
             allow_empty_target_sell=not risk_on,
             # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
@@ -1457,7 +1460,9 @@ def run_daily() -> None:
                     latest_buy_prices=latest_buy_prices_after,
                     latest_sell_prices=latest_sell_prices_after,
                     max_positions=cfg.max_positions,
+                    max_asset_pct=cfg.max_asset_pct,
                     sell_rank_buffer=cfg.sell_rank_buffer,
+                    slippage=(0.0 if (api is not None and cfg.enable_live_order and not cfg.apply_slippage_in_live) else cfg.live_slippage_pct),
                     allow_empty_target_sell=not plan.get("risk_on", True),
                     sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                     taxable_tickers=TAXABLE_ETF_TICKERS,
