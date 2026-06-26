@@ -1425,6 +1425,13 @@ def run_daily() -> None:
                 print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
                 refreshed_holdings = plan.get("holdings", {})
 
+            sold_this_cycle = {o["ticker"] for o in plan.get("sell_orders", []) if o.get("ticker")}
+            if sold_this_cycle:
+                _before_sold = len(refreshed_holdings)
+                refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t not in sold_this_cycle}
+                if len(refreshed_holdings) < _before_sold:
+                    print(f"[방어] D+2 미결제 매도종목 {_before_sold - len(refreshed_holdings)}개를 보유에서 제외했습니다.")
+
             price_tickers = list(set(plan.get("target", [])) | set(refreshed_holdings.keys()))
             try:
                 latest_prices_after = api.get_prices(price_tickers)

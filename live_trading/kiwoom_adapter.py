@@ -78,8 +78,12 @@ class KiwoomAdapter:
         self.access_token = ""
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
         self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
-        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", "0.2"))
-        self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", "0.2"))
+        # Rate limit defaults by ENV_MODE: 실전=0.1s(10/sec, 50% margin), 모의=0.6s(1.67/sec, 17% margin)
+        _env_mode = os.environ.get("ENV_MODE", "real").lower()
+        _default_interval = 0.1 if _env_mode == "real" else 0.6
+        self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", str(_default_interval)))
+        # Retry delay unified with throttle interval (same value)
+        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))
         self.http_debug_response = os.environ.get("KIWOOM_HTTP_DEBUG_RESPONSE", "0").strip().lower() in {
             "1",
             "true",
@@ -95,9 +99,6 @@ class KiwoomAdapter:
             "on",
         }
         self.http_debug_body_limit = int(os.environ.get("KIWOOM_HTTP_DEBUG_BODY_LIMIT", "800"))
-        # 재시도 지연값 통합: 이제 재시도 대기값은 KIWOOM_HTTP_RETRY_DELAY 하나로 관리합니다.
-        # (기존 KIWOOM_API_RATE_LIMIT_RETRY_DELAY 환경변수는 더 이상 사용하지 않습니다.)
-        self.api_rate_limit_retry_delay = self.http_retry_delay
         # 스레드 간 호출 간격 예약/동기화를 위한 락과 마지막 예약 타임스탬프
         self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
@@ -193,13 +194,14 @@ class KiwoomAdapter:
                 response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self.http_max_retries:
-                    delay = self.http_retry_delay
+                    delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
                     if self.http_debug_response:
                         print(
                             f"[HTTP][재시도] 네트워크 오류 ({type(e).__name__}) "
-                            f"-> {delay:.1f}초 대기 후 재시도"
+                            f"-> {delay:.1f}초 대기 후 재시도 (attempt {attempt+1}/{self.http_max_retries})"
                         )
                     time.sleep(delay)
+                    # retry delay counts toward throttle interval (no separate timestamp update)
                     continue
                 raise RuntimeError(f"HTTP request failed (network error): {url}") from e
             # 실제 요청 시작 시각을 최신 값으로 갱신(락으로 동기화)
@@ -217,6 +219,7 @@ class KiwoomAdapter:
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
+                # retry delay counts toward throttle interval (no separate timestamp update)
                 continue
 
             response.raise_for_status()
@@ -227,7 +230,7 @@ class KiwoomAdapter:
 
             # 키움은 HTTP 200이어도 return_code로 API 제한(예: 5)을 내려줄 수 있다.
             if self._is_api_rate_limited(data) and attempt < self.http_max_retries:
-                wait_sec = max(0.0, self.api_rate_limit_retry_delay)
+                wait_sec = max(0.0, self.http_retry_delay)
                 if self.http_debug_response:
                     code = data.get("return_code")
                     msg = str(data.get("return_msg", "")).strip()
@@ -236,6 +239,7 @@ class KiwoomAdapter:
                         f"-> {wait_sec:.1f}초 대기 후 재시도"
                     )
                 time.sleep(wait_sec)
+                # retry delay counts toward throttle interval (no separate timestamp update)
                 continue
 
             return data
@@ -415,9 +419,7 @@ class KiwoomAdapter:
         raise RuntimeError(f"Kiwoom API error ({context}): return_code={code_text}, return_msg={message}")
 
     # prefix별 qry_tp / dmst_stex_tp 기본값 (.env.sample 기준)
-    _DEFAULT_QRY_TP: dict[str, str] = {
-        "KIWOOM_CASH": "2",
-    }
+    _DEFAULT_QRY_TP: dict[str, str] = {}
     _DEFAULT_DMST_STEX_TP: dict[str, str] = {
         "KIWOOM_HOLDINGS": "KRX",
     }
@@ -471,16 +473,21 @@ class KiwoomAdapter:
         return payload
 
     def get_cash(self) -> float:
-        """ETF 매수에 사용할 수 있는 예수금을 반환한다."""
+        """ETF 매수에 사용할 수 있는 주문가능 추정예수금을 반환한다."""
+        return self.get_available_cash()
+
+    def get_available_cash(self) -> float:
+        """추정예수금(D+2 매도대금 포함)을 반환한다. KIS duck-type 호환."""
         endpoint = "/api/dostk/acnt"
         api_id = "kt00001"
         payload = self._build_account_payload("KIWOOM_CASH")
+        payload["qry_tp"] = "3"
         data = self._post(endpoint, payload, api_id)
-        self._raise_on_api_error(data, context="get_cash")
+        self._raise_on_api_error(data, context="get_available_cash")
         path = "ord_alow_amt"
         value = self._get_by_path(data, path)
         if value is None:
-            raise RuntimeError(f"Cash response path not found: path={path}, top_keys={list(data.keys())}")
+            raise RuntimeError(f"Available cash response path not found: path={path}, top_keys={list(data.keys())}")
         return self._to_number(value)
 
     def get_holdings(self) -> dict[str, int]:
