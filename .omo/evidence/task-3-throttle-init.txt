@@ -1,0 +1,23 @@
+Task 3: ENV_MODE-based throttle init — Verification
+=====================================================
+
+1. grep -A3 "http_min_interval" → shows _default_interval = 0.1 if _env_mode == "real" else 0.6
+$ grep -A3 "http_min_interval" live_trading/kiwoom_adapter.py | head -10
+        self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", str(_default_interval)))
+        # Retry delay unified with throttle interval (same value)
+        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))
+
+2. grep "http_retry_delay" → references self.http_min_interval for default
+$ grep "http_retry_delay" live_trading/kiwoom_adapter.py | head -5
+        self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))
+        return max(0.0, self.http_retry_delay)
+                    delay = self.http_retry_delay
+                wait_sec = max(0.0, self.http_retry_delay)
+
+3. grep -n "api_rate_limit_retry_delay" → no references found
+$ grep -n "api_rate_limit_retry_delay" live_trading/kiwoom_adapter.py
+(empty)
+
+4. ruff check → only pre-existing F841 unused-variable warnings (7), zero new errors
+$ ruff check live_trading/kiwoom_adapter.py
+(7 pre-existing F841 warnings, unrelated to this change)

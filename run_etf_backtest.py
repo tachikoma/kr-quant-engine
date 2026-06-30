@@ -29,7 +29,7 @@ from etf_shared import (
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
-from config_utils import parse_pct_env
+from config_utils import parse_pct_env, parse_fraction_env
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
     path = Path(dotenv_path) if dotenv_path is not None else Path(__file__).resolve().parent / ".env"
     if not path.exists():
@@ -701,7 +701,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
             # 실전 주문 생성 로직 재사용
-            max_asset_pct = parse_pct_env("MAX_ASSET_PCT", 0.50)
+            max_asset_pct = parse_fraction_env("MAX_ASSET_PCT", 0.50)
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,

@@ -64,7 +64,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `ETF_BASE_SLIPPAGE` | `0.0005` (5bp) | 기본 슬리피지 |
 | `ETF_SPREAD_PCT` | `0.0005` (5bp) | 호가 스프레드 |
 | `ETF_ENABLE_BENCHMARK` | `1` | KODEX200 비교 포함 여부 |
-| `MAX_ASSET_PCT` | 없음 | 자산별 최대 비중 제한 (예: 0.20) |
+| `MAX_ASSET_PCT` | `0.50` | 자산별 최대 비중 제한 (0: 제한 없음) |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |

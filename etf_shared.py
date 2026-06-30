@@ -144,11 +144,20 @@ def get_strategy_config() -> dict:
 
 
 def filter_etf_by_liquidity(price: pd.DataFrame) -> pd.DataFrame:
-    avg_tv = price.groupby("ticker")["trading_value"].transform("mean")
-    low_liquidity = price["ticker"][avg_tv < MIN_AVG_TRADING_VALUE].unique()
-    if len(low_liquidity):
-        print(f"[유동성필터] 제외: {list(low_liquidity)} (평균거래대금 < {MIN_AVG_TRADING_VALUE:,.0f})")
+    price = price.sort_values(["ticker", "date"])
+    # look-ahead bias 방지: 각 날짜 기준 trailing 60일 평균(최소 20일)으로 유동성 판단
+    price["_trailing_avg_tv"] = price.groupby("ticker")["trading_value"].transform(
+        lambda x: x.rolling(60, min_periods=20).mean()
+    )
+    # trailing 평균이 MIN_AVG_TRADING_VALUE 미만인 비율이 50% 초과면 제외
+    pct_below = price.groupby("ticker")["_trailing_avg_tv"].apply(
+        lambda x: (x < MIN_AVG_TRADING_VALUE).mean()
+    )
+    low_liquidity = pct_below[pct_below > 0.5].index.tolist()
+    if low_liquidity:
+        print(f"[유동성필터] 제외: {low_liquidity} (trailing 60일 중 과반수 < {MIN_AVG_TRADING_VALUE:,.0f})")
         price = price[~price["ticker"].isin(low_liquidity)].copy()
+    price = price.drop(columns=["_trailing_avg_tv"])
     return price
 
 
@@ -431,6 +440,19 @@ def build_rebalance_orders(
             print(f"[주문계산] 예수금 부족(cash={cash:,.0f}) → 주문 생성 종료")
         return orders
 
+    # 기존 보유 종목의 평가액을 미리 계산 (cap이 total exposure를 제한하도록)
+    existing_value_for_target: dict[str, float] = {}
+    for ticker in buy_list:
+        held_qty = int(holdings.get(ticker, 0))
+        if held_qty > 0:
+            held_price = sell_prices.get(ticker)
+            if held_price is not None and not pd.isna(held_price):
+                existing_value_for_target[ticker] = held_qty * float(held_price)
+            else:
+                existing_value_for_target[ticker] = 0.0
+        else:
+            existing_value_for_target[ticker] = 0.0
+
     for ticker in buy_list:
         price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
@@ -455,14 +477,16 @@ def build_rebalance_orders(
             )
             continue
 
-        # 자산별 최대 노출 제한 적용
+        # 자산별 최대 노출 제한 적용 (기존 보유분 포함 total exposure 기준)
         if max_allowed_per_asset is not None:
-            allowed_qty = int(max_allowed_per_asset // unit_cost)
+            existing_value = existing_value_for_target.get(ticker, 0.0)
+            remaining_allowed = max_allowed_per_asset - existing_value
+            allowed_qty = max(0, int(remaining_allowed // unit_cost))
             if allowed_qty <= 0:
-                print(f"[주문계산][cap] {_dn(ticker)} cap으로 인해 매수 불가 (allowed_qty=0)")
+                print(f"[주문계산][cap] {_dn(ticker)} cap 초과 (기존 {existing_value:,.0f} + 신규 불가, max={max_allowed_per_asset:,.0f})")
                 continue
             if qty > allowed_qty:
-                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty}")
+                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty} (기존 {existing_value:,.0f} + 신규 {allowed_qty * unit_cost:,.0f} <= {max_allowed_per_asset:,.0f})")
                 qty = allowed_qty
 
         cost = qty * unit_cost

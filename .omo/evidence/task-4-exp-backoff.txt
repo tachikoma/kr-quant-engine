@@ -1,0 +1,88 @@
+                    delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
+                    delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
+last_request_ts count:
+5
+ruff check:
+F841 Local variable `last_data` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:564:21
+    |
+562 |                     data = self._post(endpoint, payload, api_id)
+563 |                     self._raise_on_api_error(data, context=f"get_prices:{request_ticker}")
+564 |                     last_data = data
+    |                     ^^^^^^^^^
+565 |                 except Exception as exc:
+566 |                     last_error = str(exc)
+    |
+help: Remove assignment to unused variable `last_data`
+
+F841 Local variable `last_error` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:566:21
+    |
+564 |                     last_data = data
+565 |                 except Exception as exc:
+566 |                     last_error = str(exc)
+    |                     ^^^^^^^^^^
+567 |                     continue
+    |
+help: Remove assignment to unused variable `last_error`
+
+F841 Local variable `resolved_path` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:572:21
+    |
+570 |                 if price > 0:
+571 |                     resolved_price = price
+572 |                     resolved_path = used_path
+    |                     ^^^^^^^^^^^^^
+573 |                     used_request_ticker = request_ticker
+574 |                     break
+    |
+help: Remove assignment to unused variable `resolved_path`
+
+F841 Local variable `used_request_ticker` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:573:21
+    |
+571 |                     resolved_price = price
+572 |                     resolved_path = used_path
+573 |                     used_request_ticker = request_ticker
+    |                     ^^^^^^^^^^^^^^^^^^^
+574 |                     break
+    |
+help: Remove assignment to unused variable `used_request_ticker`
+
+F841 Local variable `last_data` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:614:21
+    |
+612 |                     data = self._post(endpoint, payload, api_id)
+613 |                     self._raise_on_api_error(data, context=f"get_bid_ask_prices:{request_ticker}")
+614 |                     last_data = data
+    |                     ^^^^^^^^^
+615 |                 except Exception as exc:
+616 |                     last_error = str(exc)
+    |
+help: Remove assignment to unused variable `last_data`
+
+F841 Local variable `last_error` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:616:21
+    |
+614 |                     last_data = data
+615 |                 except Exception as exc:
+616 |                     last_error = str(exc)
+    |                     ^^^^^^^^^^
+617 |                     continue
+    |
+help: Remove assignment to unused variable `last_error`
+
+F841 Local variable `used_request_ticker` is assigned to but never used
+   --> live_trading/kiwoom_adapter.py:621:17
+    |
+619 |                 sell_price, used_sell_path = self._extract_price_from_response(data, sell_path_candidates)
+620 |                 buy_price, used_buy_path = self._extract_price_from_response(data, buy_path_candidates)
+621 |                 used_request_ticker = request_ticker
+    |                 ^^^^^^^^^^^^^^^^^^^
+622 |
+623 |                 if sell_price > 0 or buy_price > 0:
+    |
+help: Remove assignment to unused variable `used_request_ticker`
+
+Found 7 errors.
+No fixes available (7 hidden fixes can be enabled with the `--unsafe-fixes` option).

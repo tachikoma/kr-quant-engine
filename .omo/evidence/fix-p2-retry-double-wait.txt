@@ -1,0 +1,18 @@
+P2 — Retry waits effectively doubled in kiwoom_adapter.py:_post()
+
+Fix: Removed 3 `_last_request_ts = time.monotonic()` updates from retry paths:
+1. Network error retry (was line 204-205)
+2. 429 retry (was line 223-224)
+3. API rate limit retry (was line 244-245)
+
+Rationale: Each retry path slept for the retry delay THEN reset _last_request_ts,
+causing _throttle_request() to add an additional min_interval wait on the next
+iteration. Since the sleep itself already acts as a delay, resetting the timestamp
+effectively doubled the throttle wait.
+
+Remaining _last_request_ts assignments (both valid):
+- Line 140: token request init (not in _post)
+- Line 209: success path after successful post (intentionally kept)
+
+grep -c: 2 (1 success + 1 token init, not the 3 retry paths)
+ruff: 7 pre-existing F841 errors, none new
