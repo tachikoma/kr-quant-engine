@@ -1110,6 +1110,49 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return retry_orders
 
 
+def _build_failed_retry_orders(
+    results: list[dict[str, Any]],
+    api: Any,
+    latest_buy_prices: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """제출 실패(submitted=False)한 매수 주문을 KIS get_buyable_info로 가능 수량 확인 후 재시도.
+
+    Kiwoom(hasattr 없다)은 항상 빈 리스트를 반환한다.
+    """
+    if not hasattr(api, "get_buyable_info"):
+        return []
+    retry: list[dict[str, Any]] = []
+    for row in results:
+        if row.get("submitted", True) or row.get("side") != "BUY":
+            continue
+        ticker = str(row.get("ticker", "")).strip()
+        orig_qty = int(row.get("qty", 0))
+        if not ticker or orig_qty <= 0:
+            continue
+        price = int(row.get("reference_price", 0))
+        if latest_buy_prices and ticker in latest_buy_prices:
+            price = int(latest_buy_prices[ticker])
+        if price <= 0:
+            continue
+        try:
+            info = api.get_buyable_info(ticker, price)
+            max_qty = int(info.get("nrcvb_buy_qty", "0"))
+        except Exception:
+            continue
+        if max_qty <= 0 or max_qty >= orig_qty:
+            continue
+        dn = row.get("display_name", ticker)
+        print(f"[KIS재시도] {dn} 수량 {orig_qty}→{max_qty}주 (nrcvb_buy_qty, 오류코드={row.get('error_code', '')})")
+        retry.append(
+            {
+                "ticker": ticker,
+                "qty": max_qty,
+                "retry_from_order_id": "",
+            }
+        )
+    return retry
+
+
 def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, Any]]) -> bool:
     required = 0
     filled = 0
@@ -1356,10 +1399,17 @@ def run_daily() -> None:
                 notifier=notifier,
             )
             for r in sell_results:
+                if r.get("is_filled"):
+                    _status = "✓ 완료"
+                elif not r.get("submitted"):
+                    _status = f"✗ 오류({r.get('error_code', '')})"
+                elif r.get("timed_out"):
+                    _status = "✗ 미체결 (타임아웃)"
+                else:
+                    _status = "✗ 미체결"
                 print(
                     f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
-                    f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
-                    + (" (타임아웃)" if r.get("timed_out") else "")
+                    f"{_status}"
                 )
             if cfg.retry_unfilled_orders:
                 for r in sell_results:
@@ -1558,10 +1608,17 @@ def run_daily() -> None:
                 notifier=notifier,
             )
             for r in buy_results:
+                if r.get("is_filled"):
+                    _status = "✓ 완료"
+                elif not r.get("submitted"):
+                    _status = f"✗ 오류({r.get('error_code', '')})"
+                elif r.get("timed_out"):
+                    _status = "✗ 미체결 (타임아웃)"
+                else:
+                    _status = "✗ 미체결"
                 print(
                     f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
-                    f"{'✓ 완료' if r.get('is_filled') else '✗ 미체결'}"
-                    + (" (타임아웃)" if r.get("timed_out") else "")
+                    f"{_status}"
                 )
             if cfg.retry_unfilled_orders:
                 for r in buy_results:
@@ -1577,12 +1634,17 @@ def run_daily() -> None:
                 _wait_for_cancellations(api, buy_results)
                 _refresh_order_statuses(api, buy_results)
                 retry_buy_orders = _build_retry_orders(buy_results)
-                if retry_buy_orders:
-                    print(f"[재시도] 매수 잔량 재주문 {len(retry_buy_orders)}건 제출")
+                failed_retry_orders = _build_failed_retry_orders(buy_results, api)
+                all_retry_orders = retry_buy_orders + failed_retry_orders
+                if all_retry_orders:
+                    print(
+                        f"[재시도] 매수 재주문 {len(all_retry_orders)}건 "
+                        f"(미체결 {len(retry_buy_orders)}, 실패재시도 {len(failed_retry_orders)})"
+                    )
                     buy_retry_results = _submit_orders(
                         api,
                         "BUY",
-                        retry_buy_orders,
+                        all_retry_orders,
                         dry_run=False,
                         order_type=cfg.retry_order_type,
                         attempt=2,
