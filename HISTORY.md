@@ -1,50 +1,50 @@
-# History
+# 변경 이력
 
-Key completed changes to this codebase. See individual commits for full detail.
+주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
-## 2026-06 — ETF equal-weight rebalancing fix
+## 2026-06 — ETF 균등분배 리밸런싱 수정
 
-**Problem:** Slot-based `buy_list` (`targets not in holdings`) excluded already-held target tickers from buy allocation, causing the entire budget to flow to a single new ticker (e.g., rank-2 got 90%, rank-1 got only 10%).
+**문제:** 슬롯 기반 `buy_list`(`targets not in holdings`)가 이미 보유 중인 target 종목을 매수 후보에서 제외하여, 예산이 하나의 신규 종목에 집중되는 현상 발생 (예: 2위 90%, 1위 10%).
 
-**Changes:**
-- `etf_shared.py`: `buy_list = targets[:max_positions]` (equal distribution across all rank-N targets, regardless of current holdings)
-- `live_trading/etf_daily_runner.py`: Wired `MAX_ASSET_PCT=0.50` default into RunnerConfig + both `build_rebalance_orders()` call sites
-- Fixed pre-existing slippage inconsistency: 2nd call site now passes `slippage=` parameter instead of defaulting to 0.0005
+**변경:**
+- `etf_shared.py`: `buy_list = targets[:max_positions]` — 보유 여부와 무관하게 모든 rank-N target에 균등 분배
+- `live_trading/etf_daily_runner.py`: `MAX_ASSET_PCT=0.50` 기본값 RunnerConfig + 두 `build_rebalance_orders()` 호출 지점에 연결
+- 기존 slippage 불일치 수정: 2차 호출 지점이 0.0005 고정 대신 `slippage=` 파라미터를 전달하도록 변경
 
-**Performance (single mode, 5bp slippage, 2021–2026):**
+**성과 (single mode, 5bp 슬리피지, 2021–2026):**
 
-| Metric | Before | After | Δ |
+| 지표 | Before | After | Δ |
 |---|---|---|---|
 | CAGR | 41.71% | 46.91% | +5.20% |
 | MDD | -22.16% | -22.32% | -0.16% |
 | Sharpe | 1.43 | 1.50 | +0.07 |
-| Trade count | 84 | 116 | +32 |
+| 거래 수 | 84 | 116 | +32 |
 
-**Files:** `etf_shared.py`, `live_trading/etf_daily_runner.py`, `scripts/test_rebalance_fix.py`
-
----
-
-## 2026-06 — Kiwoom cash double-count & rate-limit fixes
-
-**Problem:** D+2 unsettled sell proceeds caused Kiwoom to return already-sold tickers in the 2nd holdings refresh, leading to cash double-counting. Real/demo throttling was not differentiated (same 0.1s interval for both), causing 429 errors in demo.
-
-**Changes:**
-- `kiwoom_adapter.py`: Added `get_available_cash()` with hardcoded `qry_tp=3` (추정예수금)
-- `etf_daily_runner.py`: Filter sold tickers from 2nd `build_rebalance_orders()` input
-- `kiwoom_adapter.py`: ENV_MODE-based throttle defaults (real=0.1s, demo=0.6s)
-- `kiwoom_adapter.py`: Exponential backoff for network errors (2^attempt × delay, cap 10s), distinct retry handling per error type
-
-**Files:** `live_trading/kiwoom_adapter.py`, `live_trading/etf_daily_runner.py`
+**파일:** `etf_shared.py`, `live_trading/etf_daily_runner.py`, `scripts/test_rebalance_fix.py`
 
 ---
 
-## 2026-06 — KIS sell-recalc qty limit & demo throttle fix
+## 2026-06 — Kiwoom 현금 이중가산 및 rate-limit 수정
 
-**Problem:** After sell recalculation, `nrcvb_buy_qty` limit was not re-applied, causing `[40250000]` order failures in KIS demo. Demo API throttle (0.9s) was insufficient, causing 25+ rate-limit hits per cycle.
+**문제:** D+2 미결제 매도대금으로 인해 Kiwoom이 2차 보유종목 조회에서 이미 매도 완료된 종목을 다시 반환 → 현금 이중가산 발생. 실전/모의 API throttle이 동일(0.1s)하여 모의 환경에서 429 에러 빈발.
 
-**Changes:**
-- `etf_daily_runner.py`: Applied `get_buyable_info()` / `nrcvb_buy_qty` cap in post-sell recalculation (same logic as initial plan)
-- `_kis_api_client.py`: Demo throttle 0.9s → 1.0s; removed now-redundant `_smart_sleep()` method and `_sleep_sec` attribute
-- `etf_daily_runner.py`: Skip sell-phase entirely when `plan["sell_orders"]` is empty
+**변경:**
+- `kiwoom_adapter.py`: `get_available_cash()` 추가 (`qry_tp=3` 하드코딩, 추정예수금)
+- `etf_daily_runner.py`: 2차 `build_rebalance_orders()` 입력에서 매도 완료 종목 필터링
+- `kiwoom_adapter.py`: ENV_MODE 기반 throttle 기본값 (실전=0.1s, 모의=0.6s)
+- `kiwoom_adapter.py`: 네트워크 오류에 지수 백오프 (2^attempt × delay, 최대 10s), 오류 유형별 개별 재시도 처리
 
-**Files:** `live_trading/etf_daily_runner.py`, `live_trading/kis/_kis_api_client.py`
+**파일:** `live_trading/kiwoom_adapter.py`, `live_trading/etf_daily_runner.py`
+
+---
+
+## 2026-06 — KIS 매도 후 재계산 수량제한 및 모의 throttle 수정
+
+**문제:** 매도 후 재계산 시 `nrcvb_buy_qty` 제한이 재적용되지 않아 KIS 모의에서 `[40250000]` 주문 실패 발생. 모의 API throttle(0.9s)이 불충분하여 사이클당 25회 이상 rate-limit hit.
+
+**변경:**
+- `etf_daily_runner.py`: 매도 후 재계산 구간에 `get_buyable_info()` / `nrcvb_buy_qty` 캡 적용 (초기 계획과 동일한 로직)
+- `_kis_api_client.py`: 모의 throttle 0.9s → 1.0s; 불필요해진 `_smart_sleep()` 메서드 및 `_sleep_sec` 속성 제거
+- `etf_daily_runner.py`: `plan["sell_orders"]`가 비어있으면 sell-phase 전체 스킵
+
+**파일:** `live_trading/etf_daily_runner.py`, `live_trading/kis/_kis_api_client.py`
