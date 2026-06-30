@@ -55,6 +55,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `ENV_MODE=real|demo`: 운영 모드 (기본 real)
 - `BROKER_TYPE=KIWOOM|KIS`: 증권사 선택 (기본 KIWOOM)
 - `ETF_LIST`: 티커 쉼표 목록으로 ETF 후보풀 오버라이드 (예: `069500,091160`)
+- `MIN_AVG_TRADING_VALUE`: trailing 60거래일 평균 거래대금 기준 유동성 임계값(원). 기본 `1000000000` (10억). 미달 시 리밸런싱 snapshot에서 제외 (백테스트/라이브 공통)
 
 ### 백테스트(run_etf_backtest.py)
 
@@ -64,7 +65,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `ETF_BASE_SLIPPAGE` | `0.0005` (5bp) | 기본 슬리피지 |
 | `ETF_SPREAD_PCT` | `0.0005` (5bp) | 호가 스프레드 |
 | `ETF_ENABLE_BENCHMARK` | `1` | KODEX200 비교 포함 여부 |
-| `MAX_ASSET_PCT` | 없음 | 자산별 최대 비중 제한 (예: 0.20) |
+| `MAX_ASSET_PCT` | `0.50` | 자산별 최대 비중 제한 (0: 제한 없음) |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |
@@ -192,6 +193,10 @@ uv run scripts/monitor_outputs.py                        # 출력 파일 모니�
 - **패키지 추가**: `uv add package-name`
 - **패키지 제거**: `uv remove package-name`
 - **락파일 갱신**: `uv lock`
+
+## 알려진 한계 (Known Limitations)
+
+- **분배금 미반영**: 현재 백테스트는 가격수익률(price return)만 반영합니다. `etf_shared.py:add_price_basis_columns()` 에서 `close_adj = close`로 고정되어 있어 배당/분배금이 수익률에 포함되지 않습니다. 고배당 ETF, 커버드콜 ETF, 해외형 ETF의 경우 실제 총수익률(total return)과 차이가 있을 수 있습니다. 성과 해석 시 주의하세요.
 
 ## 주의사항
 

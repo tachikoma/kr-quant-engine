@@ -20,7 +20,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import run_etf_backtest as rtb
-import pandas as pd
 
 OUT = ROOT / "outputs_grid"
 

@@ -80,6 +80,41 @@ if env_taxable:
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
+# ETF 유동성 필터: 최소 평균 일 거래대금 (원). 리밸런싱 snapshot 시점에 liquidity_ok=False면 랭킹에서 제외.
+MIN_AVG_TRADING_VALUE = int(os.environ.get("MIN_AVG_TRADING_VALUE", "1_000_000_000"))
+
+# ETF 그룹 분류: 그룹별 시장필터 override에 사용
+# foreign_investment / commodity 그룹은 KOSPI risk_off여도 보유/매수 가능
+ETF_TICKER_GROUPS: dict[str, str] = {
+    "069500": "domestic_equity",   # KODEX 200
+    "091160": "domestic_equity",   # KODEX 반도체
+    "102110": "domestic_equity",   # TIGER 200
+    "0101N0": "domestic_equity",   # RISE AI전력인프라
+    "463250": "domestic_equity",   # TIGER K방산&우주
+    "161510": "domestic_equity",   # PLUS 고배당주
+    "091170": "domestic_equity",   # KODEX 은행
+    "367760": "domestic_equity",   # RISE 네트워크인프라
+    "143850": "foreign_investment",   # TIGER 미국S&P500선물(H)
+    "360200": "foreign_investment",   # ACE 미국S&P500
+    "360750": "foreign_investment",   # TIGER 미국S&P500
+    "133690": "foreign_investment",   # TIGER 미국나스닥100
+    "472150": "foreign_investment",   # TIGER 배당커버드콜액티브
+    "486290": "foreign_investment",   # TIGER 미국나스닥100타겟데일리커버드콜
+    "498400": "foreign_investment",   # KODEX 200타겟위클리커버드콜
+    "411060": "commodity",            # ACE KRX금현물
+}
+
+# KOSPI risk_off여도 거래를 허용할 그룹 (외국 투자, 원자재는 방어자산 역할)
+GROUP_RISK_OVERRIDE: set[str] = {"foreign_investment", "commodity"}
+
+def get_etf_group(ticker: str) -> str:
+    return ETF_TICKER_GROUPS.get(ticker, "domestic_equity")
+
+def is_ticker_risk_on(ticker: str, kospi_risk_on: bool) -> bool:
+    if kospi_risk_on:
+        return True
+    return get_etf_group(ticker) in GROUP_RISK_OVERRIDE
+
 
 # (기존 .env 로드 로직 제거) 백테스트 전용 환경 변수는
 # 백테스트 모듈에서 관리하도록 이동했습니다.
@@ -104,8 +139,26 @@ def get_strategy_config() -> dict:
         "spread_pct": 0.0005,
         # risk_off 시 전량 매도할지 보유 유지할지 결정
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
-        "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "0") == "1",
+        "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
     }
+
+
+def add_liquidity_flag(price: pd.DataFrame) -> pd.DataFrame:
+    price = price.sort_values(["ticker", "date"])
+    # look-ahead bias 방지: 각 날짜 기준 trailing 60일 평균(최소 20일)으로 유동성 판단
+    trailing_avg_tv = price.groupby("ticker")["trading_value"].transform(
+        lambda x: x.rolling(60, min_periods=20).mean()
+    )
+    # trailing 평균이 MIN_AVG_TRADING_VALUE 이상이면 liquidity_ok=True
+    # 초기 20일 미만 데이터는 fillna로 True 처리 (데이터 부족 시 허용)
+    price["liquidity_ok"] = trailing_avg_tv.fillna(MIN_AVG_TRADING_VALUE) >= MIN_AVG_TRADING_VALUE
+    return price
+
+
+def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
+    price = price.copy()
+    price["close_adj"] = price["close"]
+    return price
 
 
 def zscore(series: pd.Series) -> pd.Series:
@@ -122,6 +175,8 @@ def zscore(series: pd.Series) -> pd.Series:
 
 def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
     df = snapshot.copy()
+    if "liquidity_ok" in df.columns:
+        df = df[df["liquidity_ok"]].copy()
     df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
     if df.empty:
         return df
@@ -356,6 +411,19 @@ def build_rebalance_orders(
             print(f"[주문계산] 예수금 부족(cash={cash:,.0f}) → 주문 생성 종료")
         return orders
 
+    # 기존 보유 종목의 평가액을 미리 계산 (cap이 total exposure를 제한하도록)
+    existing_value_for_target: dict[str, float] = {}
+    for ticker in buy_list:
+        held_qty = int(holdings.get(ticker, 0))
+        if held_qty > 0:
+            held_price = sell_prices.get(ticker)
+            if held_price is not None and not pd.isna(held_price):
+                existing_value_for_target[ticker] = held_qty * float(held_price)
+            else:
+                existing_value_for_target[ticker] = 0.0
+        else:
+            existing_value_for_target[ticker] = 0.0
+
     for ticker in buy_list:
         price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
@@ -380,14 +448,16 @@ def build_rebalance_orders(
             )
             continue
 
-        # 자산별 최대 노출 제한 적용
+        # 자산별 최대 노출 제한 적용 (기존 보유분 포함 total exposure 기준)
         if max_allowed_per_asset is not None:
-            allowed_qty = int(max_allowed_per_asset // unit_cost)
+            existing_value = existing_value_for_target.get(ticker, 0.0)
+            remaining_allowed = max_allowed_per_asset - existing_value
+            allowed_qty = max(0, int(remaining_allowed // unit_cost))
             if allowed_qty <= 0:
-                print(f"[주문계산][cap] {_dn(ticker)} cap으로 인해 매수 불가 (allowed_qty=0)")
+                print(f"[주문계산][cap] {_dn(ticker)} cap 초과 (기존 {existing_value:,.0f} + 신규 불가, max={max_allowed_per_asset:,.0f})")
                 continue
             if qty > allowed_qty:
-                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty}")
+                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty} (기존 {existing_value:,.0f} + 신규 {allowed_qty * unit_cost:,.0f} <= {max_allowed_per_asset:,.0f})")
                 qty = allowed_qty
 
         cost = qty * unit_cost

@@ -7,26 +7,12 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
-from etf_shared import (
-    ETF_LIST,
-    ETF_MAX_POSITIONS,
-    ETF_SELL_RANK_BUFFER,
-    ETF_TAXABLE_SELL_TAX_PCT,
-    KOSPI_INDEX_CODE,
-    MARKET_MA_DAYS,
-    MARKET_SLOPE_DAYS,
-    TAXABLE_ETF_TICKERS,
-    rank_etfs,
-    apply_buy_cost,
-    build_rebalance_orders,
-    get_strategy_config,
-)
-
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
-from config_utils import parse_pct_env
+from config_utils import parse_pct_env, parse_fraction_env
+
+
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
     path = Path(dotenv_path) if dotenv_path is not None else Path(__file__).resolve().parent / ".env"
     if not path.exists():
@@ -44,7 +30,13 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
                     continue
                 key, value = line.split("=", 1)
                 key = key.strip()
-                value = value.strip().strip('"').strip("'")
+                value = value.strip()
+                if not (value.startswith('"') and value.endswith('"')) \
+                   and not (value.startswith("'") and value.endswith("'")):
+                    comment_idx = value.find(" #")
+                    if comment_idx > 0:
+                        value = value[:comment_idx].strip()
+                value = value.strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = value
     except Exception:
@@ -53,6 +45,26 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 
 load_dotenv()
+
+
+from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
+from etf_shared import (
+    ETF_LIST,
+    ETF_MAX_POSITIONS,
+    ETF_SELL_RANK_BUFFER,
+    ETF_TAXABLE_SELL_TAX_PCT,
+    KOSPI_INDEX_CODE,
+    MARKET_MA_DAYS,
+    MARKET_SLOPE_DAYS,
+    TAXABLE_ETF_TICKERS,
+    rank_etfs,
+    apply_buy_cost,
+    build_rebalance_orders,
+    add_liquidity_flag,
+    add_price_basis_columns,
+    get_strategy_config,
+    is_ticker_risk_on,
+)
 
 strategy_cfg = get_strategy_config()
 REBALANCE_STEP_DAYS = strategy_cfg["rebalance_step_days"]  # env override 반영 (기본 10)
@@ -100,8 +112,8 @@ PERIODS = [
     ("2024_2026", "2024-01-01", "2026-04-30"),
 ]
 
-# 백테스트 기본 기간: 시작일 기본은 20160101, 종료일 기본은 오늘(또는 마지막 영업일)
-START_DEFAULT = "20160101"
+# 백테스트 기본 기간: 시작일 기본은 20160105, 종료일 기본은 오늘(또는 마지막 영업일)
+START_DEFAULT = "20160105"
 END_DEFAULT = date.today().strftime("%Y%m%d")
 START = START_DEFAULT
 END = END_DEFAULT
@@ -624,12 +636,16 @@ def load_etf_price() -> pd.DataFrame:
             price["ticker"] = price["ticker"].astype(str)
         except Exception:
             price["ticker"] = price["ticker"].apply(lambda x: str(x))
+
+    price = add_liquidity_flag(price)
+    price = add_price_basis_columns(price)
+
     grouped = price.groupby("ticker")
-    price["ret_60"] = grouped["close"].pct_change(60)
-    price["ret_120"] = grouped["close"].pct_change(120)
-    price["ma20"] = grouped["close"].transform(lambda x: x.rolling(20).mean())
-    price["ma60"] = grouped["close"].transform(lambda x: x.rolling(60).mean())
-    price["trend_ok"] = (price["close"] > price["ma20"]) & (price["ma20"] > price["ma60"])
+    price["ret_60"] = grouped["close_adj"].pct_change(60)
+    price["ret_120"] = grouped["close_adj"].pct_change(120)
+    price["ma20"] = grouped["close_adj"].transform(lambda x: x.rolling(20).mean())
+    price["ma60"] = grouped["close_adj"].transform(lambda x: x.rolling(60).mean())
+    price["trend_ok"] = (price["close_adj"] > price["ma20"]) & (price["ma20"] > price["ma60"])
     return price
 
 
@@ -661,10 +677,23 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
-            risk_on = is_risk_on(index_df, dt) if use_market_filter else True
+            kospi_risk_on = is_risk_on(index_df, dt) if use_market_filter else True
             ranked = rank_etfs(today.reset_index())
             # targets를 문자열 리스트로 통일
-            targets = [str(t) for t in ranked.head(max_positions)["ticker"].tolist()] if risk_on else []
+            if not ranked.empty:
+                ticker_list = [str(t) for t in ranked["ticker"]]
+                if kospi_risk_on:
+                    targets = ticker_list[:max_positions + ETF_SELL_RANK_BUFFER]
+                elif risk_off_liquidate:
+                    # KOSPI risk_off + liquidate: foreign/commodity만 buy target
+                    # (domestic ETFs는 targets에서 제외되어 매도됨)
+                    targets = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+                    targets = targets[:max_positions + ETF_SELL_RANK_BUFFER]
+                else:
+                    # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
+                    targets = []
+            else:
+                targets = []
 
             # 최신 참조가격(다음 시가)을 기반으로 호가 스프레드를 적용한 매수/매도 참조가격 사전 생성
             latest_prices = next_open.to_dict()
@@ -681,13 +710,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
             # 실전 주문 생성 로직 재사용
-            max_asset_pct_env = os.environ.get("MAX_ASSET_PCT")
-            max_asset_pct = None
-            if max_asset_pct_env is not None and max_asset_pct_env.strip() != "" and float(max_asset_pct_env) > 0:
-                try:
-                    max_asset_pct = float(max_asset_pct_env)
-                except Exception:
-                    max_asset_pct = None
+            max_asset_pct = parse_fraction_env("MAX_ASSET_PCT", 0.50)
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,
@@ -702,7 +725,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 slippage=slippage,
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
-                allow_empty_target_sell=not risk_on if risk_off_liquidate else False,
+                allow_empty_target_sell=not kospi_risk_on if risk_off_liquidate else False,
                 generate_orders=True,
                 max_asset_pct=max_asset_pct,
             )

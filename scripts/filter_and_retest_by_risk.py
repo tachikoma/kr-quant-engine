@@ -44,7 +44,7 @@ def load_filtered_list():
 def compute_metrics(ticker: str, recent_years: int):
     try:
         df = rtb.get_price(str(ticker))
-    except Exception as e:
+    except Exception:
         return None
     if df is None or df.empty:
         return None

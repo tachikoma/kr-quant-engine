@@ -45,12 +45,14 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_BASE_SLIPPAGE` | `0.0005` | Backtest slippage fraction |
 | `ETF_SPREAD_PCT` | `0.0005` | Bid-ask spread |
 | `ETF_ENABLE_BENCHMARK` | `1` | Include KODEX200 comparison in single mode |
-| `MAX_ASSET_PCT` | — | Per-asset position cap (e.g. `0.20`) |
+| `MAX_ASSET_PCT` | `0.50` | Per-asset position cap. `0` = unlimited |
 | `ETF_USE_CACHE` | `1` | Use parquet data cache |
 | `ETF_REFRESH_CACHE` | `0` | Force refetch data |
 | `LIVE_ORDER_ENABLED` | `0` | Live order toggle (0=safe mode) |
 | `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` or `KIS` |
 | `LIQUIDATE_ON_RISK_OFF` | `1` | risk_off 시 전량 매도(1) vs 보유 유지(0) |
+| `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
+
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
@@ -70,6 +72,8 @@ Full list in `README.md` and `.env.sample`.
 ## Architecture notes
 
 - `etf_shared.py` holds the shared constants and core strategy: ETF_LIST, fees (buy 0.015%, sell 0.015%), `REBALANCE_STEP_DAYS=10`, `MARKET_MA_DAYS=120`, `MARKET_SLOPE_DAYS=20`, `ETF_MAX_POSITIONS=2`, `ETF_SELL_RANK_BUFFER=3`, `TAXABLE_ETF_TICKERS` (8 tickers).
+- `ETF_TICKER_GROUPS` (16 tickers) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Hardcoded, no env override.
+- `add_liquidity_flag()` adds a `liquidity_ok` boolean column based on trailing 60-day avg trading value vs `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest. Filtering is as-of per rebalance snapshot.
 - `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.

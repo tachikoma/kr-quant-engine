@@ -12,7 +12,7 @@ KiwoomAdapter와 동일한 7개 메서드 인터페이스를 제공:
 
 import os
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from live_trading.kis import KisApiClient, KisAuthManager, KisApiError
 

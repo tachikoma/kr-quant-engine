@@ -16,7 +16,6 @@
 
 from pathlib import Path
 import pandas as pd
-import numpy as np
 import json
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +28,6 @@ FIG = OUT / "figures"
 FIG.mkdir(parents=True, exist_ok=True)
 
 # 프로젝트 루트를 sys.path에 추가하여 로컬 모듈(run_etf_backtest) 임포트 허용
-import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import run_etf_backtest as rtb

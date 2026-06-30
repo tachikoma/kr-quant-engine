@@ -23,3 +23,8 @@ package = false
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+"run_etf_backtest.py" = ["E402"]
+"live_trading/etf_daily_runner.py" = ["E402"]
+"scripts/*.py" = ["E402"]

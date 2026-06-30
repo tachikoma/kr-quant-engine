@@ -28,15 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
-    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS
-from config_utils import parse_pct_env
-
-try:
-    from pykrx_utils import format_ticker as _format_ticker
-except Exception:
-    def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
-        return ticker
 
 def _load_dotenv(dotenv_path: Path | None = None) -> None:
     path = dotenv_path or (PROJECT_ROOT / ".env")
@@ -66,6 +57,18 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
 
 
 _load_dotenv()
+
+
+from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
+    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
+    add_liquidity_flag, add_price_basis_columns
+from config_utils import parse_pct_env, parse_fraction_env
+
+try:
+    from pykrx_utils import format_ticker as _format_ticker
+except Exception:
+    def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
+        return ticker
 
 try:
     from live_trading.kiwoom_adapter import KiwoomAdapter
@@ -128,6 +131,7 @@ class RunnerConfig:
     spread_pct: float
     enable_catchup: bool
     max_asset_pct: float = 0.50
+    liquidate_on_risk_off: bool = True
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -330,7 +334,8 @@ def _read_env_config() -> RunnerConfig:
         live_slippage_pct=parse_pct_env("LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)),
         spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
         enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
-        max_asset_pct=parse_pct_env("MAX_ASSET_PCT", 0.50),
+        max_asset_pct=parse_fraction_env("MAX_ASSET_PCT", 0.50),
+        liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
     )
 
 
@@ -445,12 +450,15 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
         raise RuntimeError("ETF 가격 데이터가 비어 있습니다.")
 
     price_df = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).copy()
+    # 백테스트와 동일 전처리: 유동성 플래그 + 기준가 컬럼
+    price_df = add_liquidity_flag(price_df)
+    price_df = add_price_basis_columns(price_df)
     grouped = price_df.groupby("ticker")
-    price_df["ret_60"] = grouped["close"].pct_change(60)
-    price_df["ret_120"] = grouped["close"].pct_change(120)
-    price_df["ma20"] = grouped["close"].transform(lambda x: x.rolling(20).mean())
-    price_df["ma60"] = grouped["close"].transform(lambda x: x.rolling(60).mean())
-    price_df["trend_ok"] = (price_df["close"] > price_df["ma20"]) & (price_df["ma20"] > price_df["ma60"])
+    price_df["ret_60"] = grouped["close_adj"].pct_change(60)
+    price_df["ret_120"] = grouped["close_adj"].pct_change(120)
+    price_df["ma20"] = grouped["close_adj"].transform(lambda x: x.rolling(20).mean())
+    price_df["ma60"] = grouped["close_adj"].transform(lambda x: x.rolling(60).mean())
+    price_df["trend_ok"] = (price_df["close_adj"] > price_df["ma20"]) & (price_df["ma20"] > price_df["ma60"])
 
     snapshot = price_df.groupby("ticker").tail(1).reset_index(drop=True)
     return snapshot
@@ -711,15 +719,29 @@ def _build_plan(
 
     # 5단계: 목표 티커 결정
     if not risk_on:
-        print("[계획수립] risk_on=False → 전량 매도 모드 (목표 티커 없음)")
-        target = []
+        if config.liquidate_on_risk_off:
+            # KOSPI risk_off: foreign/commodity만 buy target 유지, domestic은 매도
+            if not ranked.empty:
+                ticker_list = [str(t) for t in ranked["ticker"]]
+                target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+                target = target[:config.max_positions + config.sell_rank_buffer]
+            else:
+                target = []
+            if target:
+                print(f"[계획수립] risk_on=False → foreign/commodity만 목표: {target}")
+            else:
+                print("[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)")
+        else:
+            # LIQUIDATE_ON_RISK_OFF=0: 기존 보유 유지, 신규 매수 없음
+            print("[계획수립] risk_on=False + liquidate_on_risk_off=False → 기존 보유 유지 (신규 매수 없음)")
+            target = []
     elif not rebalance_due and not needs_catchup:
         # 리밸런싱 미도달일에는 실제 주문을 생성하지 않지만, 플랜 상에는
         # 현재 보유를 목표로 표시하여 '유지' 의도를 명확히 합니다.
         print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)")
         target = list(holdings_for_rebalance.keys())
     else:
-        target = ranked.head(config.max_positions)["ticker"].tolist() if not ranked.empty else []
+        target = ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist() if not ranked.empty else []
         label = "캐치업 목표" if needs_catchup else "목표"
         print(f"[계획수립] {label} 티커 확정: {target}")
 
@@ -759,7 +781,7 @@ def _build_plan(
             max_positions=config.max_positions,
             max_asset_pct=config.max_asset_pct,
             sell_rank_buffer=config.sell_rank_buffer,
-            allow_empty_target_sell=not risk_on,
+            allow_empty_target_sell=not risk_on if config.liquidate_on_risk_off else False,
             # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
             # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
             slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
