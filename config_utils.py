@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 
 def parse_pct_env(name: str, default: float) -> float:

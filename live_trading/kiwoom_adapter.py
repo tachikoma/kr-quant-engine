@@ -532,11 +532,7 @@ class KiwoomAdapter:
             if not str(ticker).strip():
                 continue
 
-            last_error: str | None = None
-            last_data: dict[str, Any] | None = None
             resolved_price = 0.0
-            resolved_path: str | None = None
-            used_request_ticker = str(ticker)
 
             for request_ticker in self._candidate_price_tickers(str(ticker)):
                 payload = {
@@ -545,16 +541,12 @@ class KiwoomAdapter:
                 try:
                     data = self._post(endpoint, payload, api_id)
                     self._raise_on_api_error(data, context=f"get_prices:{request_ticker}")
-                    last_data = data
-                except Exception as exc:
-                    last_error = str(exc)
+                except Exception:
                     continue
 
-                price, used_path = self._extract_price_from_response(data, path_candidates)
+                price = self._extract_price_from_response(data, path_candidates)[0]
                 if price > 0:
                     resolved_price = price
-                    resolved_path = used_path
-                    used_request_ticker = request_ticker
                     break
 
             if resolved_price > 0:
@@ -582,27 +574,19 @@ class KiwoomAdapter:
             if not ticker_text:
                 continue
 
-            last_error: str | None = None
-            last_data: dict[str, Any] | None = None
             buy_price = 0.0
             sell_price = 0.0
-            used_buy_path: str | None = None
-            used_sell_path: str | None = None
-            used_request_ticker = ticker_text
 
             for request_ticker in self._candidate_price_tickers(ticker_text):
                 payload = {ticker_payload_key: request_ticker}
                 try:
                     data = self._post(endpoint, payload, api_id)
                     self._raise_on_api_error(data, context=f"get_bid_ask_prices:{request_ticker}")
-                    last_data = data
-                except Exception as exc:
-                    last_error = str(exc)
+                except Exception:
                     continue
 
-                sell_price, used_sell_path = self._extract_price_from_response(data, sell_path_candidates)
-                buy_price, used_buy_path = self._extract_price_from_response(data, buy_path_candidates)
-                used_request_ticker = request_ticker
+                sell_price = self._extract_price_from_response(data, sell_path_candidates)[0]
+                buy_price = self._extract_price_from_response(data, buy_path_candidates)[0]
 
                 if sell_price > 0 or buy_price > 0:
                     break

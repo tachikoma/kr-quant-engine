@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
     ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
-    filter_etf_by_liquidity, apply_total_return_adjustment
+    add_liquidity_flag, add_price_basis_columns
 from config_utils import parse_pct_env, parse_fraction_env
 
 try:
@@ -448,9 +448,9 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
         raise RuntimeError("ETF 가격 데이터가 비어 있습니다.")
 
     price_df = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).copy()
-    # 백테스트와 동일 전처리: 유동성 필터 + 수정종가
-    price_df = filter_etf_by_liquidity(price_df)
-    price_df = apply_total_return_adjustment(price_df)
+    # 백테스트와 동일 전처리: 유동성 플래그 + 기준가 컬럼
+    price_df = add_liquidity_flag(price_df)
+    price_df = add_price_basis_columns(price_df)
     grouped = price_df.groupby("ticker")
     price_df["ret_60"] = grouped["close_adj"].pct_change(60)
     price_df["ret_120"] = grouped["close_adj"].pct_change(120)

@@ -20,8 +20,8 @@ from etf_shared import (
     rank_etfs,
     apply_buy_cost,
     build_rebalance_orders,
-    filter_etf_by_liquidity,
-    apply_total_return_adjustment,
+    add_liquidity_flag,
+    add_price_basis_columns,
     get_strategy_config,
     is_ticker_risk_on,
 )
@@ -628,8 +628,8 @@ def load_etf_price() -> pd.DataFrame:
         except Exception:
             price["ticker"] = price["ticker"].apply(lambda x: str(x))
 
-    price = filter_etf_by_liquidity(price)
-    price = apply_total_return_adjustment(price)
+    price = add_liquidity_flag(price)
+    price = add_price_basis_columns(price)
 
     grouped = price.groupby("ticker")
     price["ret_60"] = grouped["close_adj"].pct_change(60)

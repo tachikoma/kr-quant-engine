@@ -114,7 +114,6 @@ def _worker_analyze_ticker(ticker: str) -> Optional[dict]:
     """
     try:
         import run_etf_backtest as rtb_local
-        import pandas as pd
     except Exception as e:  # pragma: no cover - 환경 문제 방지
         return {"ticker": ticker, "error": f"import 실패: {e}"}
 

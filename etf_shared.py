@@ -143,51 +143,20 @@ def get_strategy_config() -> dict:
     }
 
 
-def filter_etf_by_liquidity(price: pd.DataFrame) -> pd.DataFrame:
+def add_liquidity_flag(price: pd.DataFrame) -> pd.DataFrame:
     price = price.sort_values(["ticker", "date"])
     # look-ahead bias 방지: 각 날짜 기준 trailing 60일 평균(최소 20일)으로 유동성 판단
-    price["_trailing_avg_tv"] = price.groupby("ticker")["trading_value"].transform(
+    trailing_avg_tv = price.groupby("ticker")["trading_value"].transform(
         lambda x: x.rolling(60, min_periods=20).mean()
     )
-    # trailing 평균이 MIN_AVG_TRADING_VALUE 미만인 비율이 50% 초과면 제외
-    pct_below = price.groupby("ticker")["_trailing_avg_tv"].apply(
-        lambda x: (x < MIN_AVG_TRADING_VALUE).mean()
-    )
-    low_liquidity = pct_below[pct_below > 0.5].index.tolist()
-    if low_liquidity:
-        print(f"[유동성필터] 제외: {low_liquidity} (trailing 60일 중 과반수 < {MIN_AVG_TRADING_VALUE:,.0f})")
-        price = price[~price["ticker"].isin(low_liquidity)].copy()
-    price = price.drop(columns=["_trailing_avg_tv"])
+    # trailing 평균이 MIN_AVG_TRADING_VALUE 이상이면 liquidity_ok=True
+    # 초기 20일 미만 데이터는 fillna로 True 처리 (데이터 부족 시 허용)
+    price["liquidity_ok"] = trailing_avg_tv.fillna(MIN_AVG_TRADING_VALUE) >= MIN_AVG_TRADING_VALUE
     return price
 
 
-USE_TOTAL_RETURN = os.environ.get("USE_TOTAL_RETURN", "0") == "1"
-
-def apply_total_return_adjustment(price: pd.DataFrame) -> pd.DataFrame:
-    if not USE_TOTAL_RETURN:
-        price["close_adj"] = price["close"]
-        return price
-
-    try:
-        from pykrx import stock as _stock
-        tickers = price["ticker"].unique()
-        for ticker in tickers:
-            mask = price["ticker"] == ticker
-            sub = price.loc[mask].sort_values("date")
-            if sub.empty:
-                continue
-            start = sub["date"].iloc[0].strftime("%Y%m%d")
-            end = sub["date"].iloc[-1].strftime("%Y%m%d")
-            try:
-                div = _stock.get_etf_price_deviation(start, end, ticker)
-            except Exception:
-                div = None
-            if div is not None and not div.empty and "괴리율" in div.columns:
-                pass
-        print("[TotalReturn] USE_TOTAL_RETURN=1 — 배당/분배금 데이터 미지원, close 사용")
-    except Exception:
-        print("[TotalReturn] 배당 데이터 조회 실패, close 사용")
-
+def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
+    price = price.copy()
     price["close_adj"] = price["close"]
     return price
 
@@ -206,6 +175,8 @@ def zscore(series: pd.Series) -> pd.Series:
 
 def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
     df = snapshot.copy()
+    if "liquidity_ok" in df.columns:
+        df = df[df["liquidity_ok"]].copy()
     df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
     if df.empty:
         return df

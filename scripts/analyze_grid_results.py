@@ -12,15 +12,12 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-import os
-import json
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
 import run_etf_backtest as rtb

@@ -52,7 +52,7 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` or `KIS` |
 | `LIQUIDATE_ON_RISK_OFF` | `1` | risk_off 시 전량 매도(1) vs 보유 유지(0) |
 | `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
-| `USE_TOTAL_RETURN` | `0` | Use adjusted close for dividend-adjusted returns (stub, same as close) |
+
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
@@ -73,7 +73,7 @@ Full list in `README.md` and `.env.sample`.
 
 - `etf_shared.py` holds the shared constants and core strategy: ETF_LIST, fees (buy 0.015%, sell 0.015%), `REBALANCE_STEP_DAYS=10`, `MARKET_MA_DAYS=120`, `MARKET_SLOPE_DAYS=20`, `ETF_MAX_POSITIONS=2`, `ETF_SELL_RANK_BUFFER=3`, `TAXABLE_ETF_TICKERS` (8 tickers).
 - `ETF_TICKER_GROUPS` (16 tickers) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Hardcoded, no env override.
-- `filter_etf_by_liquidity()` removes tickers with average daily trading value below `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest.
+- `add_liquidity_flag()` adds a `liquidity_ok` boolean column based on trailing 60-day avg trading value vs `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest. Filtering is as-of per rebalance snapshot.
 - `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
