@@ -1334,7 +1334,8 @@ def run_daily() -> None:
             )
         raise RuntimeError(
             f"LIVE_ORDER_ENABLED=1 이지만 {adapter_name} 어댑터 초기화에 실패했습니다. "
-            "실전 모드에서는 API 없이 진행할 수 없습니다. "
+            "GitHub Actions Runner 환경에서는 증권사 API 서버에 연결되지 않을 수 있습니다. "
+            "로컬 실행 또는 Self-hosted Runner 사용을 고려하세요.\n"
             f"원인: {adapter_init_error}"
         )
 

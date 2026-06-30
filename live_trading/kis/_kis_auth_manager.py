@@ -197,7 +197,9 @@ class KisAuthManager:
         try:
             res = self._session.post(url, data=json.dumps(payload), headers=headers, timeout=self._auth_timeout)
         except requests.RequestException as e:
-            raise RuntimeError(f"KIS 토큰 발급 요청 실패: {e}") from e
+            raise RuntimeError(
+                f"KIS 토큰 발급 요청 실패 — KIS 서버({self.base_url}) 연결 불가: {e}"
+            ) from e
 
         if res.status_code != 200:
             raise RuntimeError(f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}")
