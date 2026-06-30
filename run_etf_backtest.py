@@ -103,8 +103,8 @@ PERIODS = [
     ("2024_2026", "2024-01-01", "2026-04-30"),
 ]
 
-# 백테스트 기본 기간: 시작일 기본은 20160101, 종료일 기본은 오늘(또는 마지막 영업일)
-START_DEFAULT = "20160101"
+# 백테스트 기본 기간: 시작일 기본은 20160105, 종료일 기본은 오늘(또는 마지막 영업일)
+START_DEFAULT = "20160105"
 END_DEFAULT = date.today().strftime("%Y%m%d")
 START = START_DEFAULT
 END = END_DEFAULT
