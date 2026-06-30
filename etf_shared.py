@@ -80,7 +80,7 @@ if env_taxable:
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
-# ETF 유동성 필터: 최소 평균 일 거래대금 (원). 10억 미만이면 후보풀에서 제외.
+# ETF 유동성 필터: 최소 평균 일 거래대금 (원). 리밸런싱 snapshot 시점에 liquidity_ok=False면 랭킹에서 제외.
 MIN_AVG_TRADING_VALUE = int(os.environ.get("MIN_AVG_TRADING_VALUE", "1_000_000_000"))
 
 # ETF 그룹 분류: 그룹별 시장필터 override에 사용

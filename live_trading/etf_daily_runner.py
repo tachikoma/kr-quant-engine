@@ -28,16 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
-    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
-    add_liquidity_flag, add_price_basis_columns
-from config_utils import parse_pct_env, parse_fraction_env
-
-try:
-    from pykrx_utils import format_ticker as _format_ticker
-except Exception:
-    def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
-        return ticker
 
 def _load_dotenv(dotenv_path: Path | None = None) -> None:
     path = dotenv_path or (PROJECT_ROOT / ".env")
@@ -67,6 +57,18 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
 
 
 _load_dotenv()
+
+
+from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
+    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
+    add_liquidity_flag, add_price_basis_columns
+from config_utils import parse_pct_env, parse_fraction_env
+
+try:
+    from pykrx_utils import format_ticker as _format_ticker
+except Exception:
+    def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
+        return ticker
 
 try:
     from live_trading.kiwoom_adapter import KiwoomAdapter

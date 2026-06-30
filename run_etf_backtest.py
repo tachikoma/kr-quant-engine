@@ -7,29 +7,12 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
-from etf_shared import (
-    ETF_LIST,
-    ETF_MAX_POSITIONS,
-    ETF_SELL_RANK_BUFFER,
-    ETF_TAXABLE_SELL_TAX_PCT,
-    KOSPI_INDEX_CODE,
-    MARKET_MA_DAYS,
-    MARKET_SLOPE_DAYS,
-    TAXABLE_ETF_TICKERS,
-    rank_etfs,
-    apply_buy_cost,
-    build_rebalance_orders,
-    add_liquidity_flag,
-    add_price_basis_columns,
-    get_strategy_config,
-    is_ticker_risk_on,
-)
-
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
 from config_utils import parse_pct_env, parse_fraction_env
+
+
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
     path = Path(dotenv_path) if dotenv_path is not None else Path(__file__).resolve().parent / ".env"
     if not path.exists():
@@ -56,6 +39,26 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 
 
 load_dotenv()
+
+
+from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
+from etf_shared import (
+    ETF_LIST,
+    ETF_MAX_POSITIONS,
+    ETF_SELL_RANK_BUFFER,
+    ETF_TAXABLE_SELL_TAX_PCT,
+    KOSPI_INDEX_CODE,
+    MARKET_MA_DAYS,
+    MARKET_SLOPE_DAYS,
+    TAXABLE_ETF_TICKERS,
+    rank_etfs,
+    apply_buy_cost,
+    build_rebalance_orders,
+    add_liquidity_flag,
+    add_price_basis_columns,
+    get_strategy_config,
+    is_ticker_risk_on,
+)
 
 strategy_cfg = get_strategy_config()
 REBALANCE_STEP_DAYS = strategy_cfg["rebalance_step_days"]  # env override 반영 (기본 10)
