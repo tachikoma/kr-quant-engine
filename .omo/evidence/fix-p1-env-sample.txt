@@ -1,5 +1,0 @@
-# (이제 ENV_MODE 기반 자동 설정: 실전 0.1s / 모의 0.6s)
-# 필요시 아래 주석 해제하여 개별 오버라이드
-# KIWOOM_HTTP_RETRY_DELAY=0.1
-# KIWOOM_HTTP_MIN_INTERVAL=0.1
-
