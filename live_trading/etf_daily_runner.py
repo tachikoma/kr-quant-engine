@@ -1298,7 +1298,7 @@ def run_daily() -> None:
     run_id = str(uuid.uuid4())
     _market_order_margin_rate = parse_pct_env(
         "MARKET_ORDER_MARGIN_RATE",
-        0.20 if broker_type == "KIWOOM" else 0.0,
+        0.20 if broker_type == "KIWOOM" else 0.10,
     )
     plan = _build_plan(cfg, api, market_order_margin_rate=_market_order_margin_rate)
     _print_plan(plan, cfg)
@@ -1502,6 +1502,28 @@ def run_daily() -> None:
                                     print(f"[KIS제한-재계산] {dn} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)")
                                     o["qty"] = _nrcvb_qty
                                     o["estimated_value"] = _nrcvb_qty * float(o.get("reference_price", 0))
+                # 복수 매수 주문 합계가 가용 현금 초과 시 마지막 주문 조정
+                if len(plan["buy_orders"]) > 1 and refreshed_cash is not None:
+                    _total_actual = sum(
+                        int(o.get("qty", 0)) * float(o.get("reference_price", 0))
+                        for o in plan["buy_orders"]
+                    )
+                    if _total_actual > refreshed_cash:
+                        last = plan["buy_orders"][-1]
+                        _price = float(last.get("reference_price", 0))
+                        _qty = int(last.get("qty", 0))
+                        if _price > 0 and _qty > 0:
+                            _reduce = int((_total_actual - refreshed_cash) / _price) + 1
+                            _reduce = min(_reduce, _qty - 1)
+                            if _reduce > 0:
+                                new_qty = _qty - _reduce
+                                dn = last.get("display_name", last["ticker"])
+                                print(
+                                    f"[현금초과] {dn} 수량 {_qty}→{new_qty}주 "
+                                    f"(실합계 {_total_actual:,.0f} > 가용 {refreshed_cash:,.0f})"
+                                )
+                                last["qty"] = new_qty
+                                last["estimated_value"] = new_qty * float(last.get("reference_price", 0))
             except Exception as exc:
                 print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
         elif can_buy and (not dry_run) and api is not None and plan.get("needs_catchup", False):
@@ -1516,6 +1538,9 @@ def run_daily() -> None:
         buy_retry_results = []
     print("\n[주문] ─── 매수 단계 ───")
     if can_buy:
+        # 중요도(랭킹) 순으로 매수 주문 정렬 — 1순위 종목이 먼저 제출되어 현금 확보
+        _target_order = {t: i for i, t in enumerate(plan.get("target", []))}
+        plan["buy_orders"].sort(key=lambda o: _target_order.get(o["ticker"], 999))
         buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
         if buy_results:
             for r in buy_results:
