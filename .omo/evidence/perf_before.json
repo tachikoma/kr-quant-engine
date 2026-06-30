@@ -1,5 +1,6 @@
 {
   "mode": "single",
+  "note": "Price return only; dividends/distributions not included.",
   "slippage": 0.0005,
   "period": {
     "start": "2021-01-05",

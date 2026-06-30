@@ -30,7 +30,13 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
                     continue
                 key, value = line.split("=", 1)
                 key = key.strip()
-                value = value.strip().strip('"').strip("'")
+                value = value.strip()
+                if not (value.startswith('"') and value.endswith('"')) \
+                   and not (value.startswith("'") and value.endswith("'")):
+                    comment_idx = value.find(" #")
+                    if comment_idx > 0:
+                        value = value[:comment_idx].strip()
+                value = value.strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = value
     except Exception:

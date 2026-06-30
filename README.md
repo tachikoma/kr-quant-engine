@@ -194,6 +194,10 @@ uv run scripts/monitor_outputs.py                        # 출력 파일 모니�
 - **패키지 제거**: `uv remove package-name`
 - **락파일 갱신**: `uv lock`
 
+## 알려진 한계 (Known Limitations)
+
+- **분배금 미반영**: 현재 백테스트는 가격수익률(price return)만 반영합니다. `etf_shared.py:add_price_basis_columns()` 에서 `close_adj = close`로 고정되어 있어 배당/분배금이 수익률에 포함되지 않습니다. 고배당 ETF, 커버드콜 ETF, 해외형 ETF의 경우 실제 총수익률(total return)과 차이가 있을 수 있습니다. 성과 해석 시 주의하세요.
+
 ## 주의사항
 
 - pykrx 데이터는 제공처 정책/호출 제한을 준수해야 합니다.
