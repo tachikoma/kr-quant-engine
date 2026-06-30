@@ -24,6 +24,9 @@ def parse_pct_env(name: str, default: float) -> float:
         return float(default)
 
     s = str(raw).strip()
+    # 인라인 주석(#) 제거 (dotenv가 처리하지 못한 경우 방어)
+    if "#" in s:
+        s = s[: s.index("#")].strip()
     if not s:
         return float(default)
 
@@ -57,6 +60,8 @@ def parse_fraction_env(name: str, default: float) -> float:
     if raw is None:
         return float(default)
     s = str(raw).strip()
+    if "#" in s:
+        s = s[: s.index("#")].strip()
     if not s:
         return float(default)
     try:
