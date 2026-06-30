@@ -80,6 +80,41 @@ if env_taxable:
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
+# ETF 유동성 필터: 최소 평균 일 거래대금 (원). 10억 미만이면 후보풀에서 제외.
+MIN_AVG_TRADING_VALUE = int(os.environ.get("MIN_AVG_TRADING_VALUE", "1_000_000_000"))
+
+# ETF 그룹 분류: 그룹별 시장필터 override에 사용
+# foreign_investment / commodity 그룹은 KOSPI risk_off여도 보유/매수 가능
+ETF_TICKER_GROUPS: dict[str, str] = {
+    "069500": "domestic_equity",   # KODEX 200
+    "091160": "domestic_equity",   # KODEX 반도체
+    "102110": "domestic_equity",   # TIGER 200
+    "0101N0": "domestic_equity",   # RISE AI전력인프라
+    "463250": "domestic_equity",   # TIGER K방산&우주
+    "161510": "domestic_equity",   # PLUS 고배당주
+    "091170": "domestic_equity",   # KODEX 은행
+    "367760": "domestic_equity",   # RISE 네트워크인프라
+    "143850": "foreign_investment",   # TIGER 미국S&P500선물(H)
+    "360200": "foreign_investment",   # ACE 미국S&P500
+    "360750": "foreign_investment",   # TIGER 미국S&P500
+    "133690": "foreign_investment",   # TIGER 미국나스닥100
+    "472150": "foreign_investment",   # TIGER 배당커버드콜액티브
+    "486290": "foreign_investment",   # TIGER 미국나스닥100타겟데일리커버드콜
+    "498400": "foreign_investment",   # KODEX 200타겟위클리커버드콜
+    "411060": "commodity",            # ACE KRX금현물
+}
+
+# KOSPI risk_off여도 거래를 허용할 그룹 (외국 투자, 원자재는 방어자산 역할)
+GROUP_RISK_OVERRIDE: set[str] = {"foreign_investment", "commodity"}
+
+def get_etf_group(ticker: str) -> str:
+    return ETF_TICKER_GROUPS.get(ticker, "domestic_equity")
+
+def is_ticker_risk_on(ticker: str, kospi_risk_on: bool) -> bool:
+    if kospi_risk_on:
+        return True
+    return get_etf_group(ticker) in GROUP_RISK_OVERRIDE
+
 
 # (기존 .env 로드 로직 제거) 백테스트 전용 환경 변수는
 # 백테스트 모듈에서 관리하도록 이동했습니다.
@@ -104,8 +139,48 @@ def get_strategy_config() -> dict:
         "spread_pct": 0.0005,
         # risk_off 시 전량 매도할지 보유 유지할지 결정
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
-        "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "0") == "1",
+        "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
     }
+
+
+def filter_etf_by_liquidity(price: pd.DataFrame) -> pd.DataFrame:
+    avg_tv = price.groupby("ticker")["trading_value"].transform("mean")
+    low_liquidity = price["ticker"][avg_tv < MIN_AVG_TRADING_VALUE].unique()
+    if len(low_liquidity):
+        print(f"[유동성필터] 제외: {list(low_liquidity)} (평균거래대금 < {MIN_AVG_TRADING_VALUE:,.0f})")
+        price = price[~price["ticker"].isin(low_liquidity)].copy()
+    return price
+
+
+USE_TOTAL_RETURN = os.environ.get("USE_TOTAL_RETURN", "0") == "1"
+
+def apply_total_return_adjustment(price: pd.DataFrame) -> pd.DataFrame:
+    if not USE_TOTAL_RETURN:
+        price["close_adj"] = price["close"]
+        return price
+
+    try:
+        from pykrx import stock as _stock
+        tickers = price["ticker"].unique()
+        for ticker in tickers:
+            mask = price["ticker"] == ticker
+            sub = price.loc[mask].sort_values("date")
+            if sub.empty:
+                continue
+            start = sub["date"].iloc[0].strftime("%Y%m%d")
+            end = sub["date"].iloc[-1].strftime("%Y%m%d")
+            try:
+                div = _stock.get_etf_price_deviation(start, end, ticker)
+            except Exception:
+                div = None
+            if div is not None and not div.empty and "괴리율" in div.columns:
+                pass
+        print("[TotalReturn] USE_TOTAL_RETURN=1 — 배당/분배금 데이터 미지원, close 사용")
+    except Exception:
+        print("[TotalReturn] 배당 데이터 조회 실패, close 사용")
+
+    price["close_adj"] = price["close"]
+    return price
 
 
 def zscore(series: pd.Series) -> pd.Series:

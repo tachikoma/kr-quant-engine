@@ -20,7 +20,10 @@ from etf_shared import (
     rank_etfs,
     apply_buy_cost,
     build_rebalance_orders,
+    filter_etf_by_liquidity,
+    apply_total_return_adjustment,
     get_strategy_config,
+    is_ticker_risk_on,
 )
 
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
@@ -624,12 +627,16 @@ def load_etf_price() -> pd.DataFrame:
             price["ticker"] = price["ticker"].astype(str)
         except Exception:
             price["ticker"] = price["ticker"].apply(lambda x: str(x))
+
+    price = filter_etf_by_liquidity(price)
+    price = apply_total_return_adjustment(price)
+
     grouped = price.groupby("ticker")
-    price["ret_60"] = grouped["close"].pct_change(60)
-    price["ret_120"] = grouped["close"].pct_change(120)
-    price["ma20"] = grouped["close"].transform(lambda x: x.rolling(20).mean())
-    price["ma60"] = grouped["close"].transform(lambda x: x.rolling(60).mean())
-    price["trend_ok"] = (price["close"] > price["ma20"]) & (price["ma20"] > price["ma60"])
+    price["ret_60"] = grouped["close_adj"].pct_change(60)
+    price["ret_120"] = grouped["close_adj"].pct_change(120)
+    price["ma20"] = grouped["close_adj"].transform(lambda x: x.rolling(20).mean())
+    price["ma60"] = grouped["close_adj"].transform(lambda x: x.rolling(60).mean())
+    price["trend_ok"] = (price["close_adj"] > price["ma20"]) & (price["ma20"] > price["ma60"])
     return price
 
 
@@ -661,10 +668,23 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
-            risk_on = is_risk_on(index_df, dt) if use_market_filter else True
+            kospi_risk_on = is_risk_on(index_df, dt) if use_market_filter else True
             ranked = rank_etfs(today.reset_index())
             # targets를 문자열 리스트로 통일
-            targets = [str(t) for t in ranked.head(max_positions)["ticker"].tolist()] if risk_on else []
+            if not ranked.empty:
+                ticker_list = [str(t) for t in ranked["ticker"]]
+                if kospi_risk_on:
+                    targets = ticker_list[:max_positions + ETF_SELL_RANK_BUFFER]
+                elif risk_off_liquidate:
+                    # KOSPI risk_off + liquidate: foreign/commodity만 buy target
+                    # (domestic ETFs는 targets에서 제외되어 매도됨)
+                    targets = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+                    targets = targets[:max_positions + ETF_SELL_RANK_BUFFER]
+                else:
+                    # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
+                    targets = []
+            else:
+                targets = []
 
             # 최신 참조가격(다음 시가)을 기반으로 호가 스프레드를 적용한 매수/매도 참조가격 사전 생성
             latest_prices = next_open.to_dict()
@@ -681,13 +701,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                     latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
             # 실전 주문 생성 로직 재사용
-            max_asset_pct_env = os.environ.get("MAX_ASSET_PCT")
-            max_asset_pct = None
-            if max_asset_pct_env is not None and max_asset_pct_env.strip() != "" and float(max_asset_pct_env) > 0:
-                try:
-                    max_asset_pct = float(max_asset_pct_env)
-                except Exception:
-                    max_asset_pct = None
+            max_asset_pct = parse_pct_env("MAX_ASSET_PCT", 0.50)
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,
@@ -702,7 +716,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 slippage=slippage,
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
-                allow_empty_target_sell=not risk_on if risk_off_liquidate else False,
+                allow_empty_target_sell=not kospi_risk_on if risk_off_liquidate else False,
                 generate_orders=True,
                 max_asset_pct=max_asset_pct,
             )

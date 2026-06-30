@@ -29,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
-    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS
+    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on
 from config_utils import parse_pct_env
 
 try:
@@ -711,15 +711,24 @@ def _build_plan(
 
     # 5단계: 목표 티커 결정
     if not risk_on:
-        print("[계획수립] risk_on=False → 전량 매도 모드 (목표 티커 없음)")
-        target = []
+        # KOSPI risk_off여도 foreign/commodity는 buy target 유지
+        if not ranked.empty:
+            ticker_list = [str(t) for t in ranked["ticker"]]
+            target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+            target = target[:config.max_positions + config.sell_rank_buffer]
+        else:
+            target = []
+        if target:
+            print(f"[계획수립] risk_on=False → foreign/commodity만 목표: {target}")
+        else:
+            print("[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)")
     elif not rebalance_due and not needs_catchup:
         # 리밸런싱 미도달일에는 실제 주문을 생성하지 않지만, 플랜 상에는
         # 현재 보유를 목표로 표시하여 '유지' 의도를 명확히 합니다.
         print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)")
         target = list(holdings_for_rebalance.keys())
     else:
-        target = ranked.head(config.max_positions)["ticker"].tolist() if not ranked.empty else []
+        target = ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist() if not ranked.empty else []
         label = "캐치업 목표" if needs_catchup else "목표"
         print(f"[계획수립] {label} 티커 확정: {target}")
 
