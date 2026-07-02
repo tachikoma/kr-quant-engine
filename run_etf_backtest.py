@@ -660,6 +660,8 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
     trades = []
     equity_rows = []
 
+    ticker_names: dict[str, str] = {t: get_ticker_name(t) for t in ETF_LIST}
+
     warmup_days = max(120, MARKET_MA_DAYS + MARKET_SLOPE_DAYS)
     for i, dt in enumerate(common_dates[:-1]):
         if i < warmup_days:
@@ -728,6 +730,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                 allow_empty_target_sell=not kospi_risk_on if risk_off_liquidate else False,
                 generate_orders=True,
                 max_asset_pct=max_asset_pct,
+                ticker_names=ticker_names,
             )
 
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)

@@ -601,7 +601,7 @@ def _build_catchup_orders(
         if price is None or pd.isna(price) or price <= 0:
             price = latest_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[캐치업][스킵] {ticker}: 매수 가격 없음")
+            print(f"[캐치업][스킵] {ticker_names.get(ticker, ticker)}: 매수 가격 없음")
             continue
 
         cost = remaining * float(price)
@@ -728,7 +728,7 @@ def _build_plan(
             else:
                 target = []
             if target:
-                print(f"[계획수립] risk_on=False → foreign/commodity만 목표: {target}")
+                print(f"[계획수립] risk_on=False → foreign/commodity만 목표: {[ticker_names.get(t, t) for t in target]}")
             else:
                 print("[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)")
         else:
@@ -743,7 +743,7 @@ def _build_plan(
     else:
         target = ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist() if not ranked.empty else []
         label = "캐치업 목표" if needs_catchup else "목표"
-        print(f"[계획수립] {label} 티커 확정: {target}")
+        print(f"[계획수립] {label} 티커 확정: {[ticker_names.get(t, t) for t in target]}")
 
     # rebalance_due=False 이고 시장이 위험상태(risk_on=True)인 경우
     # 리밸런싱이 필요 없으므로 주문 생성을 건너뛰고 즉시 빈 주문 계획을 반환한다.
@@ -1098,7 +1098,7 @@ def _refresh_order_statuses(
             row["requested_qty"] = order_qty
         row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
         print(
-            f"[상태재조회] {row.get('ticker', order_id)} → "
+            f"[상태재조회] {row.get('display_name', row.get('ticker', order_id))} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"
         )
 
@@ -1407,7 +1407,7 @@ def run_daily() -> None:
         if sell_results:
             for r in sell_results:
                 status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
-                print(f"  SELL {r['ticker']} {r['qty']}주 → {status_txt}")
+                print(f"  SELL {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}")
         sell_retry_results: list[dict[str, Any]] = []
 
         if (not dry_run) and api is not None:
@@ -1431,7 +1431,7 @@ def run_daily() -> None:
                 else:
                     _status = "✗ 미체결"
                 print(
-                    f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+                    f"  SELL {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                     f"{_status}"
                 )
             if cfg.retry_unfilled_orders:
@@ -1618,7 +1618,7 @@ def run_daily() -> None:
         if buy_results:
             for r in buy_results:
                 status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
-                print(f"  BUY  {r['ticker']} {r['qty']}주 → {status_txt}")
+                print(f"  BUY  {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}")
         if (not dry_run) and api is not None:
             print(f"[주문] 매수 체결 대기 중 (타임아웃={cfg.buy_fill_timeout_sec}초, 컷오프={cfg.buy_cutoff_time})")
             buy_results = _poll_and_finalize_orders(
@@ -1640,7 +1640,7 @@ def run_daily() -> None:
                 else:
                     _status = "✗ 미체결"
                 print(
-                    f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+                    f"  BUY  {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                     f"{_status}"
                 )
             if cfg.retry_unfilled_orders:
@@ -1717,12 +1717,12 @@ def run_daily() -> None:
     print(f"실행 상태: {run_status}")
     for r in sell_results + sell_retry_results:
         print(
-            f"  SELL {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+            f"  SELL {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
             f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
         )
     for r in buy_results + buy_retry_results:
         print(
-            f"  BUY  {r['ticker']} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
+            f"  BUY  {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
             f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
         )
     print(f"매도 제출 건수: {len(sell_results)}")

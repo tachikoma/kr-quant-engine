@@ -403,7 +403,7 @@ def build_rebalance_orders(
     buy_list = targets[:max_positions]
     buy_count = len(buy_list)
     budget = cash / buy_count if buy_count > 0 else 0
-    print(f"[주문계산] 매수 종목={buy_list} (균등분배, 종목당 약 {budget:,.0f})")
+    print(f"[주문계산] 매수 종목={[_dn(t) for t in buy_list]} (균등분배, 종목당 약 {budget:,.0f})")
     if not buy_list or cash <= 0:
         if not buy_list:
             print("[주문계산] 매수 대상 없음 → 주문 생성 종료")
