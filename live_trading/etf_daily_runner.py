@@ -1125,6 +1125,7 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         retry_orders.append(
             {
                 "ticker": ticker,
+                "display_name": row.get("display_name", ticker),
                 "qty": remaining_qty,
                 "retry_from_order_id": row.get("order_id", ""),
             }
@@ -1173,6 +1174,7 @@ def _build_failed_retry_orders(
         retry.append(
             {
                 "ticker": ticker,
+                "display_name": row.get("display_name", ticker),
                 "qty": max_qty,
                 "retry_from_order_id": "",
             }
@@ -1557,6 +1559,7 @@ def run_daily() -> None:
                     sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                     taxable_tickers=TAXABLE_ETF_TICKERS,
                     generate_orders=True,
+                    ticker_names=plan.get("ticker_names", {}),
                     market_order_margin_rate=_market_order_margin_rate,
                 )
                 new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
