@@ -1159,6 +1159,11 @@ def _build_failed_retry_orders(
         try:
             info = api.get_buyable_info(ticker, price)
             max_qty = int(info.get("nrcvb_buy_qty", "0"))
+            error_code = str(row.get("error_code", ""))
+            if "40250000" in error_code:
+                ord_psbl_cash = float(info.get("ord_psbl_cash", "0"))
+                if ord_psbl_cash > 0:
+                    max_qty = max(1, int(ord_psbl_cash // price))
         except Exception:
             continue
         if max_qty <= 0 or max_qty >= orig_qty:
@@ -1614,7 +1619,27 @@ def run_daily() -> None:
         # 중요도(랭킹) 순으로 매수 주문 정렬 — 1순위 종목이 먼저 제출되어 현금 확보
         _target_order = {t: i for i, t in enumerate(plan.get("target", []))}
         plan["buy_orders"].sort(key=lambda o: _target_order.get(o["ticker"], 999))
-        buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
+        # KIS simulated env: 순차 제출 (선행 주문의 cash reservation 반영을 위해 주문별로 get_buyable_info 재조회)
+        _seq_submit = (not dry_run) and api is not None and hasattr(api, "get_buyable_info") and len(plan["buy_orders"]) > 1
+        if _seq_submit:
+            buy_results = []
+            for _bo in plan["buy_orders"]:
+                _bt = str(_bo.get("ticker", ""))
+                _bp = int(_bo.get("reference_price", 0) or 0)
+                if _bt and _bp > 0:
+                    try:
+                        _bi = api.get_buyable_info(_bt, _bp)
+                        _bnq = int(_bi.get("nrcvb_buy_qty", "0"))
+                        if _bnq > 0 and int(_bo.get("qty", 0)) > _bnq:
+                            _bdn = _bo.get("display_name", _bt)
+                            print(f"[KIS제한-순차] {_bdn} 수량 {_bo['qty']}→{_bnq}주 (잔여 nrcvb_buy_qty={_bnq})")
+                            _bo["qty"] = _bnq
+                            _bo["estimated_value"] = _bnq * float(_bo.get("reference_price", 0))
+                    except Exception:
+                        pass
+                buy_results.extend(_submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier))
+        else:
+            buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
         if buy_results:
             for r in buy_results:
                 status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
@@ -1716,14 +1741,16 @@ def run_daily() -> None:
     print("=== 실행 결과 ===")
     print(f"실행 상태: {run_status}")
     for r in sell_results + sell_retry_results:
+        _es_s = "완료" if r.get("is_filled") else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
         print(
             f"  SELL {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
-            f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
+            f"({_es_s}, {r.get('mode', '')})"
         )
     for r in buy_results + buy_retry_results:
+        _es_b = "완료" if r.get("is_filled") else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
         print(
             f"  BUY  {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
-            f"({'완료' if r.get('is_filled') else '미체결'}, {r.get('mode', '')})"
+            f"({_es_b}, {r.get('mode', '')})"
         )
     print(f"매도 제출 건수: {len(sell_results)}")
     print(f"매수 제출 건수: {len(buy_results)}")
