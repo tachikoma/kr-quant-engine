@@ -1203,7 +1203,7 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     return strategy_stats, benchmark_stats, period
 
 
-def summarize_experiment(df: pd.DataFrame, trades_dict: dict):
+def summarize_experiment(df: pd.DataFrame, trades_dict: dict) -> tuple[dict, list[dict], list[dict]]:
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     period = get_backtest_period(df, "equity_kodex200_bh")
@@ -1224,6 +1224,7 @@ def summarize_experiment(df: pd.DataFrame, trades_dict: dict):
     display_cols = ["strategy", "final", "total_return", "cagr", "mdd", "volatility", "sharpe"]
     print(comparison[display_cols].to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
 
+    details = []
     for slip in SLIPPAGE_OPTIONS:
         label = f"slip_{int(slip*10000)}bp"
         trades = trades_dict[label]
@@ -1232,6 +1233,13 @@ def summarize_experiment(df: pd.DataFrame, trades_dict: dict):
         print(f"\n=== ETF {label} 상세 ===")
         print(f"거래 수: {len(trades)}")
         print(f"평균 투자 비중: {invested_ratio:.4f}")
+        details.append({
+            "strategy": f"ETF_{label}",
+            "trade_count": int(len(trades)),
+            "avg_invested_ratio": float(invested_ratio),
+        })
+
+    return period, comparison.to_dict(orient="records"), details
 
 
 def _to_json_serializable(stats: dict) -> dict:
@@ -1244,6 +1252,27 @@ def _to_json_serializable(stats: dict) -> dict:
         else:
             serializable[key] = value
     return serializable
+
+
+def _build_performance_config() -> dict:
+    """performance.json에 기록할 실행 설정 블록을 반환한다."""
+    return {
+        "run_mode": RUN_MODE,
+        "return_basis": strategy_cfg.get("return_basis", "price"),
+        "min_listing_days": strategy_cfg.get("min_listing_days", 60),
+        "max_premium_discount": strategy_cfg.get("max_premium_discount", 0.02),
+        "min_avg_trading_value": strategy_cfg.get("min_avg_trading_value", 1_000_000_000),
+        "max_asset_pct": parse_fraction_env("MAX_ASSET_PCT", 0.50),
+        "liquidate_on_risk_off": strategy_cfg.get("liquidate_on_risk_off", True),
+        "slippage": BASE_SLIPPAGE,
+        "spread_pct": SPREAD_PCT,
+        "rebalance_step_days": strategy_cfg.get("rebalance_step_days", 10),
+        "market_ma_days": strategy_cfg.get("market_ma_days", 120),
+        "market_slope_days": strategy_cfg.get("market_slope_days", 20),
+        "max_positions": strategy_cfg.get("max_positions", 2),
+        "sell_rank_buffer": strategy_cfg.get("sell_rank_buffer", 3),
+        "enable_benchmark": ENABLE_BENCHMARK,
+    }
 
 
 def run_risk_off_compare_mode() -> None:
@@ -1424,6 +1453,7 @@ def main():
             "period": _to_json_serializable(period),
             "strategy": _to_json_serializable(strategy_stats),
             "benchmark": _to_json_serializable(benchmark_stats) if benchmark_stats is not None else None,
+            "config": _to_json_serializable(_build_performance_config()),
         }
         with (OUTPUT_DIR / "performance.json").open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -1440,12 +1470,25 @@ def main():
         cols = ["date", "equity_kodex200_bh"] + [f"equity_slip_{int(s*10000)}bp" for s in SLIPPAGE_OPTIONS]
         result[cols].to_csv(OUTPUT_DIR / "slippage_comparison.csv", index=False, encoding="utf-8-sig")
 
-        summarize_experiment(result, trades_dict)
+        period, comparison_records, details = summarize_experiment(result, trades_dict)
+
+        experiment_payload = {
+            "mode": "experiment",
+            "period": _to_json_serializable(period),
+            "slippage_options": SLIPPAGE_OPTIONS,
+            "slippage_comparison": [_to_json_serializable(row) for row in comparison_records],
+            "details": [_to_json_serializable(row) for row in details],
+            "config": _to_json_serializable(_build_performance_config()),
+        }
+        with (OUTPUT_DIR / "performance.json").open("w", encoding="utf-8") as f:
+            json.dump(experiment_payload, f, ensure_ascii=False, indent=2)
+
         print(f"저장 완료: {OUTPUT_DIR / 'etf_equity_curve.csv'}")
         for slip in SLIPPAGE_OPTIONS:
             label = f"slip_{int(slip*10000)}bp"
             print(f"저장 완료: {OUTPUT_DIR / f'etf_trades_{label}.csv'}")
         print(f"저장 완료: {OUTPUT_DIR / 'slippage_comparison.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'performance.json'}")
 
 
 if __name__ == "__main__":

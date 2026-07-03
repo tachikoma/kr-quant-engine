@@ -161,6 +161,7 @@ def get_strategy_config() -> dict:
         "return_basis": os.environ.get("ETF_RETURN_BASIS", "price").strip().lower(),
         "min_listing_days": MIN_LISTING_DAYS,
         "max_premium_discount": MAX_PREMIUM_DISCOUNT,
+        "min_avg_trading_value": MIN_AVG_TRADING_VALUE,
         "max_live_spread_pct": MAX_LIVE_SPREAD_PCT,
         # risk_off 시 전량 매도할지 보유 유지할지 결정
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
