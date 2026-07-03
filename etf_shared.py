@@ -27,6 +27,28 @@ def _parse_int_env(name: str, default: int) -> int:
         print(f"⚠️ 환경변수 {name} 파싱 실패: '{raw}' — 기본값({default}) 사용")
         return int(default)
 
+
+def _parse_threshold_dict_env(name: str, default: dict[str, float]) -> dict[str, float]:
+    """환경변수에서 'key=value,key2=value2' 형태의 딕셔너리를 파싱합니다."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    result = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k or not v:
+            continue
+        try:
+            result[k] = float(v)
+        except ValueError:
+            continue
+    return result or default
+
 # 현재 전략에서 매매차익 과세를 반영할 기타 ETF 후보입니다.
 TAXABLE_ETF_TICKERS = {
     "143850",  # KODEX 미국S&P500선물(H)
@@ -104,6 +126,28 @@ MIN_LISTING_DAYS = _parse_int_env("MIN_LISTING_DAYS", 60)
 MAX_PREMIUM_DISCOUNT = parse_pct_env("MAX_PREMIUM_DISCOUNT", 0.02)
 MAX_LIVE_SPREAD_PCT = parse_pct_env("MAX_LIVE_SPREAD_PCT", 0.005)
 
+# 그룹별 NAV 괴리율 임계값
+# 기본값은 MAX_PREMIUM_DISCOUNT와 동일한 2%로 설정.
+# 해외 ETF/커버드콜의 구조적 괴리를 반영하려면 env var로 완화 가능.
+ETF_DEVIATION_THRESHOLD_BY_GROUP: dict[str, float] = _parse_threshold_dict_env(
+    "ETF_DEVIATION_THRESHOLD_BY_GROUP",
+    {
+        "domestic_equity": 0.02,
+        "foreign_investment": 0.02,
+        "commodity": 0.02,
+    },
+)
+
+# 티커별 NAV 괴리율 override (커버드콜 등 특수 ETF)
+ETF_DEVIATION_THRESHOLD_BY_TICKER: dict[str, float] = _parse_threshold_dict_env(
+    "ETF_DEVIATION_THRESHOLD_BY_TICKER",
+    {
+        "472150": 0.02,  # TIGER 배당커버드콜액티브
+        "486290": 0.02,  # TIGER 미국나스닥100타겟데일리커버드콜
+        "498400": 0.02,  # KODEX 200타겟위클리커버드콜
+    },
+)
+
 # ETF 그룹 분류: 그룹별 시장필터 override에 사용
 # foreign_investment / commodity 그룹은 KOSPI risk_off여도 보유/매수 가능
 ETF_TICKER_GROUPS: dict[str, str] = {
@@ -130,6 +174,24 @@ GROUP_RISK_OVERRIDE: set[str] = {"foreign_investment", "commodity"}
 
 def get_etf_group(ticker: str) -> str:
     return ETF_TICKER_GROUPS.get(ticker, "domestic_equity")
+
+
+def get_deviation_threshold(ticker: str) -> float:
+    """ETF별 NAV 괴리율 임계값을 반환한다.
+
+    우선순위:
+    1. 티커별 override (ETF_DEVIATION_THRESHOLD_BY_TICKER)
+    2. 그룹별 임계값 (ETF_DEVIATION_THRESHOLD_BY_GROUP)
+    3. 전역 기본값 (MAX_PREMIUM_DISCOUNT)
+    """
+    ticker = str(ticker)
+    if ticker in ETF_DEVIATION_THRESHOLD_BY_TICKER:
+        return ETF_DEVIATION_THRESHOLD_BY_TICKER[ticker]
+    group = get_etf_group(ticker)
+    if group in ETF_DEVIATION_THRESHOLD_BY_GROUP:
+        return ETF_DEVIATION_THRESHOLD_BY_GROUP[group]
+    return max(float(MAX_PREMIUM_DISCOUNT), 0.0)
+
 
 def is_ticker_risk_on(ticker: str, kospi_risk_on: bool) -> bool:
     if kospi_risk_on:
@@ -161,6 +223,8 @@ def get_strategy_config() -> dict:
         "return_basis": os.environ.get("ETF_RETURN_BASIS", "price").strip().lower(),
         "min_listing_days": MIN_LISTING_DAYS,
         "max_premium_discount": MAX_PREMIUM_DISCOUNT,
+        "deviation_threshold_by_group": dict(ETF_DEVIATION_THRESHOLD_BY_GROUP),
+        "deviation_threshold_by_ticker": dict(ETF_DEVIATION_THRESHOLD_BY_TICKER),
         "min_avg_trading_value": MIN_AVG_TRADING_VALUE,
         "max_live_spread_pct": MAX_LIVE_SPREAD_PCT,
         # risk_off 시 전량 매도할지 보유 유지할지 결정
@@ -217,8 +281,8 @@ def add_listing_flag(price: pd.DataFrame, listing_dates: dict[str, str] | None =
 
 def add_deviation_flag(price: pd.DataFrame) -> pd.DataFrame:
     price = price.copy()
-    threshold = max(float(MAX_PREMIUM_DISCOUNT), 0.0)
     price["premium_discount"] = np.nan
+    price["deviation_threshold"] = np.nan
     price["deviation_ok"] = True
     if "nav" not in price.columns:
         return price
@@ -229,9 +293,14 @@ def add_deviation_flag(price: pd.DataFrame) -> pd.DataFrame:
     if not valid_nav.any():
         return price
 
+    # 티커별/그룹별 임계값 적용
+    tickers = price["ticker"].astype(str)
+    thresholds = tickers.map(get_deviation_threshold)
+
     deviation = (close - nav) / nav
     price.loc[valid_nav, "premium_discount"] = deviation[valid_nav]
-    price.loc[valid_nav, "deviation_ok"] = deviation[valid_nav].abs() <= threshold
+    price.loc[valid_nav, "deviation_threshold"] = thresholds[valid_nav]
+    price.loc[valid_nav, "deviation_ok"] = deviation[valid_nav].abs() <= thresholds[valid_nav]
     return price
 
 

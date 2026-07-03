@@ -54,7 +54,9 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
 | `ETF_RETURN_BASIS` | `price` | `nav` uses NAV as ranking basis for total-return approximation |
 | `MIN_LISTING_DAYS` | `60` | Exclude ETFs younger than this many trading days when listing date is known |
-| `MAX_PREMIUM_DISCOUNT` | `0.02` | Exclude ETF snapshots with absolute price/NAV deviation above threshold |
+| `MAX_PREMIUM_DISCOUNT` | `0.02` | Default absolute price/NAV deviation threshold (fallback when group/ticker thresholds don't apply) |
+| `ETF_DEVIATION_THRESHOLD_BY_GROUP` | `domestic_equity=0.02,foreign_investment=0.02,commodity=0.02` | Group-specific price/NAV deviation thresholds |
+| `ETF_DEVIATION_THRESHOLD_BY_TICKER` | `472150=0.02,486290=0.02,498400=0.02` | Per-ticker deviation override (e.g. covered-call ETFs) |
 | `MAX_LIVE_SPREAD_PCT` | `0.005` | Skip live BUY orders when bid-ask spread exceeds threshold |
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
@@ -78,7 +80,7 @@ Full list in `README.md` and `.env.sample`.
 - `ETF_TICKER_GROUPS` (16 tickers) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Hardcoded, no env override.
 - `add_liquidity_flag()` adds a `liquidity_ok` boolean column based on trailing 60-day avg trading value vs `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest. Filtering is as-of per rebalance snapshot.
 - `add_listing_flag()` adds `listing_ok` from KRX `LIST_DD` when available; unknown listing dates are allowed.
-- `add_deviation_flag()` adds `premium_discount` and `deviation_ok` from `close` vs `nav`; missing NAV is allowed for price-only compatibility.
+- `add_deviation_flag()` adds `premium_discount`, `deviation_threshold`, and `deviation_ok` from `close` vs `nav`; missing NAV is allowed for price-only compatibility. Threshold resolution order: `ETF_DEVIATION_THRESHOLD_BY_TICKER` > `ETF_DEVIATION_THRESHOLD_BY_GROUP` > `MAX_PREMIUM_DISCOUNT`.
 - `add_price_basis_columns()` sets `close_adj` from `close` by default or from `nav` when `ETF_RETURN_BASIS=nav`. NAV is a total-return approximation, not a full distribution-reinvested return for income ETFs.
 - `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`; `parse_fraction_env()` handles 0-1 caps such as `MAX_ASSET_PCT`.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
