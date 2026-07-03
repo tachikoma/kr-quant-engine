@@ -56,6 +56,9 @@ python live_trading/etf_daily_runner.py --force-live
 - `BROKER_TYPE=KIWOOM|KIS`: 증권사 선택 (기본 KIWOOM)
 - `ETF_LIST`: 티커 쉼표 목록으로 ETF 후보풀 오버라이드 (예: `069500,091160`)
 - `MIN_AVG_TRADING_VALUE`: trailing 60거래일 평균 거래대금 기준 유동성 임계값(원). 기본 `1000000000` (10억). 미달 시 리밸런싱 snapshot에서 제외 (백테스트/라이브 공통)
+- `ETF_RETURN_BASIS=price|nav`: 랭킹 수익률 기준. `nav`는 NAV 기반 총수익률 근사(기본 `price`)
+- `MIN_LISTING_DAYS`: 최소 상장 거래일 필터. 기본 `60`
+- `MAX_PREMIUM_DISCOUNT`: NAV 대비 괴리율 절대값 임계. 기본 `0.02` (2%)
 
 ### 백테스트(run_etf_backtest.py)
 
@@ -97,6 +100,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | 실전 인위적 슬리피지 적용 |
 | `LIVE_SLIPPAGE_PCT` | `0.0005` | 실전 슬리피지 |
 | `LIVE_SPREAD_PCT` | `0.0005` | 실전 호가 스프레드 fallback |
+| `MAX_LIVE_SPREAD_PCT` | `0.005` | 실전 bid-ask 스프레드 초과 시 매수 스킵 |
 
 ### 증권사 API (BROKER_TYPE에 따라)
 
@@ -153,7 +157,7 @@ python live_trading/etf_daily_runner.py --force-live
 
 - `run_etf_backtest.py`: ETF 백테스트 메인 (CLI: `--start`, `--end`, `--mode`)
 - `etf_shared.py`: 공통 전략 상수/로직 (ETF_LIST, ranking, 주문 생성)
-- `config_utils.py`: 환경변수 파싱 유틸 (`parse_pct_env`)
+- `config_utils.py`: 환경변수 파싱 유틸 (`parse_pct_env`, `parse_fraction_env`)
 - `pykrx_utils.py`: pykrx 호출 유틸 (FD 캡처, 캐시)
 - `live_trading/etf_daily_runner.py`: 데일리 주문 계획/실행 러너
 - `live_trading/kiwoom_adapter.py`: 키움 REST API 어댑터
@@ -196,7 +200,7 @@ uv run scripts/monitor_outputs.py                        # 출력 파일 모니�
 
 ## 알려진 한계 (Known Limitations)
 
-- **분배금 미반영**: 현재 백테스트는 가격수익률(price return)만 반영합니다. `etf_shared.py:add_price_basis_columns()` 에서 `close_adj = close`로 고정되어 있어 배당/분배금이 수익률에 포함되지 않습니다. 고배당 ETF, 커버드콜 ETF, 해외형 ETF의 경우 실제 총수익률(total return)과 차이가 있을 수 있습니다. 성과 해석 시 주의하세요.
+- **총수익률 근사 한계**: 기본값(`ETF_RETURN_BASIS=price`)은 가격수익률(price return) 기준입니다. `ETF_RETURN_BASIS=nav`를 설정하면 NAV 기반으로 랭킹을 계산해 비분배형 ETF의 총수익률에 더 가깝게 근사합니다. 다만 고배당/커버드콜 등 분배형 ETF의 실제 분배금 재투자 성과는 완전히 반영되지 않으므로, 완전한 total return 검증에는 별도 분배금 이력 보충이 필요합니다.
 
 ## 주의사항
 

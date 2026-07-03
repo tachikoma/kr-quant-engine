@@ -2,6 +2,23 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-07 — NAV 기반 랭킹 및 ETF 안전 필터 1차 적용
+
+**문제:** 가격수익률만으로 랭킹하면 해외/커버드콜/고배당 ETF의 NAV 변화와 괴리율을 충분히 반영하지 못하고, 신규 상장 ETF가 충분한 이력 없이 후보에 들어올 수 있음.
+
+**변경:**
+- `pykrx_utils.py`: `fetch_etf_ohlcv_with_nav()` 추가. ETF 전용 OHLCV/NAV 조회 실패 시 일반 OHLCV로 폴백
+- `etf_shared.py`: `ETF_RETURN_BASIS=price|nav`, `MIN_LISTING_DAYS`, `MAX_PREMIUM_DISCOUNT`, `MAX_LIVE_SPREAD_PCT` 설정 추가
+- `etf_shared.py`: `add_listing_flag()`, `add_deviation_flag()` 추가 및 `rank_etfs()` 필터 확장
+- `run_etf_backtest.py`, `live_trading/etf_daily_runner.py`: NAV/상장일/괴리율 전처리 파이프라인 공통 적용
+- `live_trading/etf_daily_runner.py`: 실전 bid-ask 스프레드 및 실시간 괴리율 초과 시 BUY 주문 스킵
+
+**잔존 한계:** `ETF_RETURN_BASIS=nav`는 NAV 기반 총수익률 근사입니다. 분배형 ETF의 실제 분배금 재투자 성과는 별도 분배금 이력 보충 전까지 완전히 반영되지 않습니다.
+
+**파일:** `pykrx_utils.py`, `etf_shared.py`, `run_etf_backtest.py`, `live_trading/etf_daily_runner.py`, `README.md`, `.env.sample`, `AGENTS.md`
+
+---
+
 ## 2026-06 — ETF 균등분배 리밸런싱 수정
 
 **문제:** 슬롯 기반 `buy_list`(`targets not in holdings`)가 이미 보유 중인 target 종목을 매수 후보에서 제외하여, 예산이 하나의 신규 종목에 집중되는 현상 발생 (예: 2위 90%, 1위 10%).

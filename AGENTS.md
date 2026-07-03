@@ -52,7 +52,10 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` or `KIS` |
 | `LIQUIDATE_ON_RISK_OFF` | `1` | risk_off 시 전량 매도(1) vs 보유 유지(0) |
 | `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
-
+| `ETF_RETURN_BASIS` | `price` | `nav` uses NAV as ranking basis for total-return approximation |
+| `MIN_LISTING_DAYS` | `60` | Exclude ETFs younger than this many trading days when listing date is known |
+| `MAX_PREMIUM_DISCOUNT` | `0.02` | Exclude ETF snapshots with absolute price/NAV deviation above threshold |
+| `MAX_LIVE_SPREAD_PCT` | `0.005` | Skip live BUY orders when bid-ask spread exceeds threshold |
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
@@ -74,7 +77,10 @@ Full list in `README.md` and `.env.sample`.
 - `etf_shared.py` holds the shared constants and core strategy: ETF_LIST, fees (buy 0.015%, sell 0.015%), `REBALANCE_STEP_DAYS=10`, `MARKET_MA_DAYS=120`, `MARKET_SLOPE_DAYS=20`, `ETF_MAX_POSITIONS=2`, `ETF_SELL_RANK_BUFFER=3`, `TAXABLE_ETF_TICKERS` (8 tickers).
 - `ETF_TICKER_GROUPS` (16 tickers) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Hardcoded, no env override.
 - `add_liquidity_flag()` adds a `liquidity_ok` boolean column based on trailing 60-day avg trading value vs `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest. Filtering is as-of per rebalance snapshot.
-- `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`.
+- `add_listing_flag()` adds `listing_ok` from KRX `LIST_DD` when available; unknown listing dates are allowed.
+- `add_deviation_flag()` adds `premium_discount` and `deviation_ok` from `close` vs `nav`; missing NAV is allowed for price-only compatibility.
+- `add_price_basis_columns()` sets `close_adj` from `close` by default or from `nav` when `ETF_RETURN_BASIS=nav`. NAV is a total-return approximation, not a full distribution-reinvested return for income ETFs.
+- `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`; `parse_fraction_env()` handles 0-1 caps such as `MAX_ASSET_PCT`.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.

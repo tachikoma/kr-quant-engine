@@ -61,7 +61,7 @@ _load_dotenv()
 
 from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
     ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
-    add_liquidity_flag, add_price_basis_columns
+    add_deviation_flag, add_liquidity_flag, add_listing_flag, add_price_basis_columns
 from config_utils import parse_pct_env, parse_fraction_env
 
 try:
@@ -87,7 +87,14 @@ except Exception:
 
 import pandas as pd
 from pykrx import stock
-from pykrx_utils import _call_capture_stderr, _range_has_weekday, check_krx_auth_status, KRX_PASSWORD_CHANGE_URL
+from pykrx_utils import (
+    KRX_PASSWORD_CHANGE_URL,
+    _call_capture_stderr,
+    _range_has_weekday,
+    check_krx_auth_status,
+    fetch_etf_ohlcv_with_nav,
+    get_listing_dates,
+)
 
 
 STATE_DIR = PROJECT_ROOT / "runtime_state"
@@ -132,6 +139,8 @@ class RunnerConfig:
     enable_catchup: bool
     max_asset_pct: float = 0.50
     liquidate_on_risk_off: bool = True
+    max_premium_discount: float = 0.02
+    max_live_spread_pct: float = 0.005
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -336,6 +345,8 @@ def _read_env_config() -> RunnerConfig:
         enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
         max_asset_pct=parse_fraction_env("MAX_ASSET_PCT", 0.50),
         liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
+        max_premium_discount=float(strategy_cfg.get("max_premium_discount", 0.02)),
+        max_live_spread_pct=float(strategy_cfg.get("max_live_spread_pct", 0.005)),
     )
 
 
@@ -387,25 +398,65 @@ def _safe_float(value: Any) -> float:
 
 def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "ticker", "open", "close", "volume", "trading_value"])
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trading_value",
+                "nav",
+                "base_index",
+            ]
+        )
 
     data = df.reset_index().rename(
         columns={
             "날짜": "date",
             "시가": "open",
+            "고가": "high",
+            "저가": "low",
             "종가": "close",
             "거래량": "volume",
             "거래대금": "trading_value",
+            "NAV": "nav",
+            "기초지수": "base_index",
         }
     )
+    if "date" not in data.columns and "index" in data.columns:
+        data = data.rename(columns={"index": "date"})
     data["ticker"] = ticker
 
     if "volume" not in data:
         data["volume"] = 0
     if "trading_value" not in data:
         data["trading_value"] = data["close"] * data["volume"]
+    if "high" not in data:
+        data["high"] = data["close"]
+    if "low" not in data:
+        data["low"] = data["close"]
+    if "nav" not in data:
+        data["nav"] = pd.NA
+    if "base_index" not in data:
+        data["base_index"] = pd.NA
 
-    out = data[["date", "ticker", "open", "close", "volume", "trading_value"]].copy()
+    out = data[
+        [
+            "date",
+            "ticker",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "trading_value",
+            "nav",
+            "base_index",
+        ]
+    ].copy()
     out["date"] = pd.to_datetime(out["date"])
     return out
 
@@ -430,13 +481,13 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
             print(f"스킵(주말만 해당) — 데이터 없음 ({elapsed:.1f}초)")
             continue
         try:
-            raw = _call_capture_stderr(stock.get_market_ohlcv_by_date, start, end, ticker)
+            raw = _call_capture_stderr(fetch_etf_ohlcv_with_nav, start, end, ticker)
         except Exception as e:
             elapsed = (dt.datetime.now() - t1).total_seconds()
             print(f"조회 실패 ({elapsed:.1f}초): {e}")
             continue
         elapsed = (dt.datetime.now() - t1).total_seconds()
-        price = _normalize_ohlcv(raw, ticker)
+        price = raw.copy() if isinstance(raw, pd.DataFrame) else pd.DataFrame()
         if price.empty:
             print(f"데이터 없음 ({elapsed:.1f}초)")
             continue
@@ -451,7 +502,10 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
 
     price_df = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).copy()
     # 백테스트와 동일 전처리: 유동성 플래그 + 기준가 컬럼
+    listing_dates = get_listing_dates(ticker_subset=set(map(str, etf_list)))
     price_df = add_liquidity_flag(price_df)
+    price_df = add_listing_flag(price_df, listing_dates)
+    price_df = add_deviation_flag(price_df)
     price_df = add_price_basis_columns(price_df)
     grouped = price_df.groupby("ticker")
     price_df["ret_60"] = grouped["close_adj"].pct_change(60)
@@ -621,6 +675,79 @@ def _build_catchup_orders(
     return orders
 
 
+def _snapshot_nav_map(snapshot: pd.DataFrame) -> dict[str, float]:
+    if snapshot is None or snapshot.empty or "nav" not in snapshot.columns:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in snapshot.iterrows():
+        ticker = str(row.get("ticker", "")).strip()
+        nav = row.get("nav")
+        if not ticker or nav is None or pd.isna(nav) or float(nav) <= 0:
+            continue
+        out[ticker] = float(nav)
+    return out
+
+
+def _filter_buy_orders_by_live_guards(
+    orders: list[dict[str, Any]],
+    latest_prices: dict[str, float],
+    latest_buy_prices: dict[str, float],
+    latest_sell_prices: dict[str, float],
+    snapshot_nav: dict[str, float],
+    config: RunnerConfig,
+    ticker_names: dict[str, str],
+    guards_enabled: bool,
+) -> list[dict[str, Any]]:
+    if not guards_enabled or not orders:
+        return orders
+
+    filtered: list[dict[str, Any]] = []
+    for order in orders:
+        if order.get("side") != "BUY":
+            filtered.append(order)
+            continue
+
+        ticker = str(order.get("ticker", "")).strip()
+        dn = ticker_names.get(ticker, order.get("display_name", ticker))
+        skip_reasons: list[str] = []
+
+        buy_price = latest_buy_prices.get(ticker)
+        sell_price = latest_sell_prices.get(ticker)
+        if buy_price is not None and sell_price is not None:
+            try:
+                ask = float(buy_price)
+                bid = float(sell_price)
+                mid = (ask + bid) / 2
+                if ask > 0 and bid > 0 and mid > 0:
+                    spread = abs(ask - bid) / mid
+                    if spread > config.max_live_spread_pct:
+                        skip_reasons.append(
+                            f"스프레드 {spread:.2%} > {config.max_live_spread_pct:.2%}"
+                        )
+            except Exception:
+                pass
+
+        nav = snapshot_nav.get(ticker)
+        if nav is not None and nav > 0:
+            ref_price = latest_prices.get(ticker) or order.get("reference_price")
+            try:
+                deviation = (float(ref_price) - float(nav)) / float(nav)
+                if abs(deviation) > config.max_premium_discount:
+                    skip_reasons.append(
+                        f"괴리율 {deviation:+.2%} > {config.max_premium_discount:.2%}"
+                    )
+            except Exception:
+                pass
+
+        if skip_reasons:
+            print(f"[매수가드][스킵] {dn}: {', '.join(skip_reasons)}")
+            continue
+
+        filtered.append(order)
+
+    return filtered
+
+
 def _build_plan(
     config: RunnerConfig,
     api: Any | None,
@@ -679,6 +806,7 @@ def _build_plan(
 
     # 2단계: ETF 가격 스냅샷 로드
     snapshot = _load_snapshot(etf_list, ticker_names=ticker_names)
+    snapshot_nav = _snapshot_nav_map(snapshot)
     ranked = rank_etfs(snapshot)
 
     if not ranked.empty:
@@ -792,6 +920,17 @@ def _build_plan(
             market_order_margin_rate=market_order_margin_rate,
         )
 
+    orders = _filter_buy_orders_by_live_guards(
+        orders,
+        latest_prices=latest_prices,
+        latest_buy_prices=latest_buy_prices,
+        latest_sell_prices=latest_sell_prices,
+        snapshot_nav=snapshot_nav,
+        config=config,
+        ticker_names=ticker_names,
+        guards_enabled=api is not None,
+    )
+
     # KIS: 각 매수 주문별로 개별 종목/가격 기준 nrcvb_buy_qty 조회하여 수량 제한
     if hasattr(api, "get_buyable_info"):
         for o in orders:
@@ -818,6 +957,7 @@ def _build_plan(
         "cash": cash,
         "target": target,
         "ticker_names": ticker_names,
+        "snapshot_nav": snapshot_nav,
         "blocked_external_holdings": external_holdings,
         "ranked_top": ranked.head(10).to_dict(orient="records") if not ranked.empty else [],
         "sell_orders": sell_orders,
@@ -1561,6 +1701,16 @@ def run_daily() -> None:
                     generate_orders=True,
                     ticker_names=plan.get("ticker_names", {}),
                     market_order_margin_rate=_market_order_margin_rate,
+                )
+                new_orders = _filter_buy_orders_by_live_guards(
+                    new_orders,
+                    latest_prices=latest_prices_after,
+                    latest_buy_prices=latest_buy_prices_after,
+                    latest_sell_prices=latest_sell_prices_after,
+                    snapshot_nav=plan.get("snapshot_nav", {}),
+                    config=cfg,
+                    ticker_names=plan.get("ticker_names", {}),
+                    guards_enabled=True,
                 )
                 new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
                 plan["buy_orders"] = new_buy_orders

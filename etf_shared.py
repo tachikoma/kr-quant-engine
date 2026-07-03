@@ -4,10 +4,28 @@ import os
 import numpy as np
 import pandas as pd
 
+from config_utils import parse_pct_env
+
 BUY_FEE_PCT = 0.00015
 SELL_FEE_PCT = 0.00015
 ETF_SELL_TAX_PCT = 0.0
 ETF_TAXABLE_SELL_TAX_PCT = 0.154
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    text = str(raw).strip()
+    if "#" in text:
+        text = text[: text.index("#")].strip()
+    if not text:
+        return int(default)
+    try:
+        return int(text.replace("_", ""))
+    except Exception:
+        print(f"⚠️ 환경변수 {name} 파싱 실패: '{raw}' — 기본값({default}) 사용")
+        return int(default)
 
 # 현재 전략에서 매매차익 과세를 반영할 기타 ETF 후보입니다.
 TAXABLE_ETF_TICKERS = {
@@ -81,7 +99,10 @@ ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
 # ETF 유동성 필터: 최소 평균 일 거래대금 (원). 리밸런싱 snapshot 시점에 liquidity_ok=False면 랭킹에서 제외.
-MIN_AVG_TRADING_VALUE = int(os.environ.get("MIN_AVG_TRADING_VALUE", "1_000_000_000"))
+MIN_AVG_TRADING_VALUE = _parse_int_env("MIN_AVG_TRADING_VALUE", 1_000_000_000)
+MIN_LISTING_DAYS = _parse_int_env("MIN_LISTING_DAYS", 60)
+MAX_PREMIUM_DISCOUNT = parse_pct_env("MAX_PREMIUM_DISCOUNT", 0.02)
+MAX_LIVE_SPREAD_PCT = parse_pct_env("MAX_LIVE_SPREAD_PCT", 0.005)
 
 # ETF 그룹 분류: 그룹별 시장필터 override에 사용
 # foreign_investment / commodity 그룹은 KOSPI risk_off여도 보유/매수 가능
@@ -137,6 +158,10 @@ def get_strategy_config() -> dict:
         # 단위: 비율 (예: 0.0005 == 5bp)
         "default_slippage_pct": 0.0005,
         "spread_pct": 0.0005,
+        "return_basis": os.environ.get("ETF_RETURN_BASIS", "price").strip().lower(),
+        "min_listing_days": MIN_LISTING_DAYS,
+        "max_premium_discount": MAX_PREMIUM_DISCOUNT,
+        "max_live_spread_pct": MAX_LIVE_SPREAD_PCT,
         # risk_off 시 전량 매도할지 보유 유지할지 결정
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
         "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
@@ -144,19 +169,83 @@ def get_strategy_config() -> dict:
 
 
 def add_liquidity_flag(price: pd.DataFrame) -> pd.DataFrame:
-    price = price.sort_values(["ticker", "date"])
+    price = price.sort_values(["ticker", "date"]).copy()
     # look-ahead bias 방지: 각 날짜 기준 trailing 60일 평균(최소 20일)으로 유동성 판단
     trailing_avg_tv = price.groupby("ticker")["trading_value"].transform(
         lambda x: x.rolling(60, min_periods=20).mean()
     )
     # trailing 평균이 MIN_AVG_TRADING_VALUE 이상이면 liquidity_ok=True
-    # 초기 20일 미만 데이터는 fillna로 True 처리 (데이터 부족 시 허용)
-    price["liquidity_ok"] = trailing_avg_tv.fillna(MIN_AVG_TRADING_VALUE) >= MIN_AVG_TRADING_VALUE
+    # 초기 20일 미만 데이터는 평균 산출 전이므로 제외한다.
+    price["liquidity_ok"] = trailing_avg_tv.notna() & (trailing_avg_tv >= MIN_AVG_TRADING_VALUE)
+    price["avg_trading_value_60"] = trailing_avg_tv
+    return price
+
+
+def add_listing_flag(price: pd.DataFrame, listing_dates: dict[str, str] | None = None) -> pd.DataFrame:
+    price = price.sort_values(["ticker", "date"]).copy()
+    min_days = max(int(MIN_LISTING_DAYS), 0)
+    if min_days <= 0:
+        price["listing_ok"] = True
+        price["listing_days"] = pd.NA
+        return price
+
+    listing_dates = listing_dates or {}
+    if not listing_dates:
+        price["listing_ok"] = True
+        price["listing_days"] = pd.NA
+        return price
+
+    market_dates = pd.Index(sorted(pd.to_datetime(price["date"].dropna().unique())))
+    market_values = market_dates.values.astype("datetime64[ns]")
+    date_values = pd.to_datetime(price["date"], errors="coerce").values.astype("datetime64[ns]")
+    date_pos = np.searchsorted(market_values, date_values, side="left")
+
+    raw_listing = price["ticker"].astype(str).map(listing_dates)
+    listing_ts = pd.to_datetime(raw_listing, format="%Y%m%d", errors="coerce")
+    listing_values = listing_ts.values.astype("datetime64[ns]")
+    listing_pos = np.searchsorted(market_values, listing_values, side="left")
+    trading_age = date_pos - listing_pos + 1
+
+    known_listing = listing_ts.notna()
+    price["listing_days"] = pd.NA
+    price.loc[known_listing, "listing_days"] = trading_age[known_listing]
+    price["listing_ok"] = True
+    price.loc[known_listing, "listing_ok"] = trading_age[known_listing] >= min_days
+    return price
+
+
+def add_deviation_flag(price: pd.DataFrame) -> pd.DataFrame:
+    price = price.copy()
+    threshold = max(float(MAX_PREMIUM_DISCOUNT), 0.0)
+    price["premium_discount"] = np.nan
+    price["deviation_ok"] = True
+    if "nav" not in price.columns:
+        return price
+
+    close = pd.to_numeric(price.get("close"), errors="coerce")
+    nav = pd.to_numeric(price.get("nav"), errors="coerce")
+    valid_nav = nav.notna() & (nav > 0) & close.notna()
+    if not valid_nav.any():
+        return price
+
+    deviation = (close - nav) / nav
+    price.loc[valid_nav, "premium_discount"] = deviation[valid_nav]
+    price.loc[valid_nav, "deviation_ok"] = deviation[valid_nav].abs() <= threshold
     return price
 
 
 def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
     price = price.copy()
+    basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
+    if basis == "nav" and "nav" in price.columns:
+        nav = pd.to_numeric(price["nav"], errors="coerce")
+        if nav.notna().any():
+            close = pd.to_numeric(price["close"], errors="coerce")
+            price["close_adj"] = nav.where(nav.notna() & (nav > 0), close)
+            print("[etf_shared] return basis = NAV (총수익률 근사, 분배형 ETF는 한계 있음)")
+            return price
+        print("[etf_shared] ETF_RETURN_BASIS=nav 이나 NAV 데이터 없음 → price 폴백")
+
     price["close_adj"] = price["close"]
     return price
 
@@ -177,6 +266,10 @@ def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
     df = snapshot.copy()
     if "liquidity_ok" in df.columns:
         df = df[df["liquidity_ok"]].copy()
+    if "listing_ok" in df.columns:
+        df = df[df["listing_ok"]].copy()
+    if "deviation_ok" in df.columns:
+        df = df[df["deviation_ok"]].copy()
     df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
     if df.empty:
         return df

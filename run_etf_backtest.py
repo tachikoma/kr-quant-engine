@@ -47,7 +47,13 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 load_dotenv()
 
 
-from pykrx_utils import _call_capture_stderr, _range_has_weekday, get_ticker_name
+from pykrx_utils import (
+    _call_capture_stderr,
+    _range_has_weekday,
+    fetch_etf_ohlcv_with_nav,
+    get_listing_dates,
+    get_ticker_name,
+)
 from etf_shared import (
     ETF_LIST,
     ETF_MAX_POSITIONS,
@@ -60,7 +66,9 @@ from etf_shared import (
     rank_etfs,
     apply_buy_cost,
     build_rebalance_orders,
+    add_deviation_flag,
     add_liquidity_flag,
+    add_listing_flag,
     add_price_basis_columns,
     get_strategy_config,
     is_ticker_risk_on,
@@ -145,7 +153,20 @@ def _parse_cli_args() -> argparse.Namespace:
 
 def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "ticker", "open", "close", "volume", "trading_value"])
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trading_value",
+                "nav",
+                "base_index",
+            ]
+        )
 
     df = df.reset_index()
     df["ticker"] = ticker
@@ -153,11 +174,17 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         columns={
             "날짜": "date",
             "시가": "open",
+            "고가": "high",
+            "저가": "low",
             "종가": "close",
             "거래량": "volume",
             "거래대금": "trading_value",
+            "NAV": "nav",
+            "기초지수": "base_index",
         }
     )
+    if "date" not in df.columns and "index" in df.columns:
+        df = df.rename(columns={"index": "date"})
 
     required_columns = ["date", "ticker", "open", "close"]
     missing_columns = [col for col in required_columns if col not in df.columns]
@@ -168,10 +195,51 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         df["volume"] = 0
     if "trading_value" not in df.columns:
         df["trading_value"] = df["close"] * df["volume"]
+    if "high" not in df.columns:
+        df["high"] = df["close"]
+    if "low" not in df.columns:
+        df["low"] = df["close"]
+    if "nav" not in df.columns:
+        df["nav"] = pd.NA
+    if "base_index" not in df.columns:
+        df["base_index"] = pd.NA
 
-    out = df[["date", "ticker", "open", "close", "volume", "trading_value"]].copy()
+    out = df[
+        [
+            "date",
+            "ticker",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "trading_value",
+            "nav",
+            "base_index",
+        ]
+    ].copy()
     out["date"] = pd.to_datetime(out["date"])
     return out
+
+
+class _RefreshPriceCacheRequired(Exception):
+    pass
+
+
+def _return_basis_requires_nav() -> bool:
+    return os.environ.get("ETF_RETURN_BASIS", "price").strip().lower() == "nav"
+
+
+def _ensure_price_cache_schema(df: pd.DataFrame, ticker: str) -> None:
+    if not _return_basis_requires_nav():
+        return
+    if "nav" not in df.columns:
+        raise _RefreshPriceCacheRequired(f"{ticker} 캐시에 nav 컬럼이 없어 NAV 모드 재조회 필요")
+    nav_ratio = float(df["nav"].notna().mean())
+    if nav_ratio < 0.5:
+        raise _RefreshPriceCacheRequired(
+            f"{ticker} 캐시 nav non-null 비율 {nav_ratio:.0%} < 50% — NAV 모드 재조회 필요"
+        )
 
 
 def normalize_index_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,6 +339,7 @@ def get_price(ticker: str) -> pd.DataFrame:
             df_cached = pd.read_parquet(cache_parquet)
             if "date" in df_cached.columns:
                 df_cached["date"] = pd.to_datetime(df_cached["date"])
+            _ensure_price_cache_schema(df_cached, ticker)
 
             start_req = pd.to_datetime(START)
             end_req = pd.to_datetime(END)
@@ -297,18 +366,14 @@ def get_price(ticker: str) -> pd.DataFrame:
                     print(f"[캐시] {ticker} left 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
                 else:
                     try:
-                        raw_left = _call_capture_stderr(stock.get_market_ohlcv_by_date, fetch_start, fetch_end, ticker)
+                        raw_left = _call_capture_stderr(
+                            fetch_etf_ohlcv_with_nav, fetch_start, fetch_end, ticker
+                        )
                     except Exception as e:
                         print(f"[캐시] {ticker} left 호출 실패: {e}")
                     else:
                         try:
-                            if hasattr(raw_left, "columns"):
-                                print(f"[캐시][debug] {ticker} raw_left type={type(raw_left)}, columns={list(raw_left.columns)}")
-                                try:
-                                    print(raw_left.head().to_string())
-                                except Exception:
-                                    pass
-                            df_left = normalize_ohlcv(raw_left, ticker)
+                            df_left = raw_left.copy() if isinstance(raw_left, pd.DataFrame) else pd.DataFrame()
                             if isinstance(df_left, pd.DataFrame) and not df_left.empty:
                                 to_concat.insert(0, df_left)
                                 fetched = True
@@ -316,7 +381,7 @@ def get_price(ticker: str) -> pd.DataFrame:
                             else:
                                 print(f"[캐시] {ticker} left 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
-                            print(f"[캐시] {ticker} left 정규화 실패: {e}")
+                            print(f"[캐시] {ticker} left 증분 처리 실패: {e}")
 
             # 오른쪽(최신) 구간이 필요하면 조회
             if end_req > cached_max:
@@ -328,18 +393,14 @@ def get_price(ticker: str) -> pd.DataFrame:
                     print(f"[캐시] {ticker} right 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
                 else:
                     try:
-                        raw_right = _call_capture_stderr(stock.get_market_ohlcv_by_date, fetch_start, fetch_end, ticker)
+                        raw_right = _call_capture_stderr(
+                            fetch_etf_ohlcv_with_nav, fetch_start, fetch_end, ticker
+                        )
                     except Exception as e:
                         print(f"[캐시] {ticker} right 호출 실패: {e}")
                     else:
                         try:
-                            if hasattr(raw_right, "columns"):
-                                print(f"[캐시][debug] {ticker} raw_right type={type(raw_right)}, columns={list(raw_right.columns)}")
-                                try:
-                                    print(raw_right.head().to_string())
-                                except Exception:
-                                    pass
-                            df_right = normalize_ohlcv(raw_right, ticker)
+                            df_right = raw_right.copy() if isinstance(raw_right, pd.DataFrame) else pd.DataFrame()
                             if isinstance(df_right, pd.DataFrame) and not df_right.empty:
                                 to_concat.append(df_right)
                                 fetched = True
@@ -347,7 +408,7 @@ def get_price(ticker: str) -> pd.DataFrame:
                             else:
                                 print(f"[캐시] {ticker} right 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
-                            print(f"[캐시] {ticker} right 정규화 실패: {e}")
+                            print(f"[캐시] {ticker} right 증분 처리 실패: {e}")
 
             if fetched:
                 parts = [p for p in to_concat if isinstance(p, pd.DataFrame) and not p.empty]
@@ -378,13 +439,14 @@ def get_price(ticker: str) -> pd.DataFrame:
                 if not subset.empty:
                     print(f"[캐시] {ticker} 부분 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
                     return subset
+        except _RefreshPriceCacheRequired as e:
+            print(f"[캐시] {e} — 전체 재조회로 대체")
         except Exception as e:
             print(f"[캐시] {ticker} 캐시 읽기 실패: {e} — 전체 재조회로 대체")
 
     # 캐시가 없거나 강제 갱신인 경우 전체 조회 후 저장
     try:
-        raw = _call_capture_stderr(stock.get_market_ohlcv_by_date, START, END, ticker)
-        df = normalize_ohlcv(raw, ticker)
+        df = _call_capture_stderr(fetch_etf_ohlcv_with_nav, START, END, ticker)
         if use_cache:
             try:
                 tmp = cache_parquet.with_suffix(".parquet.tmp")
@@ -637,7 +699,10 @@ def load_etf_price() -> pd.DataFrame:
         except Exception:
             price["ticker"] = price["ticker"].apply(lambda x: str(x))
 
+    listing_dates = get_listing_dates(ticker_subset=set(map(str, ETF_LIST)))
     price = add_liquidity_flag(price)
+    price = add_listing_flag(price, listing_dates)
+    price = add_deviation_flag(price)
     price = add_price_basis_columns(price)
 
     grouped = price.groupby("ticker")

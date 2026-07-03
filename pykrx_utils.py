@@ -218,6 +218,120 @@ def check_krx_auth_status() -> str:
 TAX_CACHE_PATH = "data_cache/etf_tax_classification.parquet"
 
 
+def _empty_etf_ohlcv_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "date",
+            "ticker",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "trading_value",
+            "nav",
+            "base_index",
+        ]
+    )
+
+
+def normalize_etf_ohlcv_with_nav(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """ETF OHLCV/NAV 데이터를 공통 스키마로 정규화한다.
+
+    pykrx의 ETF 전용 OHLCV는 NAV/기초지수를 포함할 수 있고, 일반 market OHLCV는
+    가격/거래량만 포함한다. 이 함수는 두 반환 포맷을 같은 컬럼으로 맞춘다.
+    """
+    if df is None or df.empty:
+        return _empty_etf_ohlcv_frame()
+
+    data = df.reset_index().rename(
+        columns={
+            "날짜": "date",
+            "시가": "open",
+            "고가": "high",
+            "저가": "low",
+            "종가": "close",
+            "거래량": "volume",
+            "거래대금": "trading_value",
+            "NAV": "nav",
+            "기초지수": "base_index",
+        }
+    )
+    data["ticker"] = str(ticker)
+
+    if "date" not in data.columns and "index" in data.columns:
+        data = data.rename(columns={"index": "date"})
+
+    required_columns = ["date", "ticker", "open", "close"]
+    missing_columns = [col for col in required_columns if col not in data.columns]
+    if missing_columns:
+        raise ValueError(
+            f"{ticker}: missing columns {missing_columns}; actual columns={list(data.columns)}"
+        )
+
+    if "high" not in data.columns:
+        data["high"] = data["close"]
+    if "low" not in data.columns:
+        data["low"] = data["close"]
+    if "volume" not in data.columns:
+        data["volume"] = 0
+    if "trading_value" not in data.columns:
+        data["trading_value"] = data["close"] * data["volume"]
+    if "nav" not in data.columns:
+        data["nav"] = pd.NA
+    if "base_index" not in data.columns:
+        data["base_index"] = pd.NA
+
+    out = data[
+        [
+            "date",
+            "ticker",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "trading_value",
+            "nav",
+            "base_index",
+        ]
+    ].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", "trading_value", "nav", "base_index"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+
+def fetch_etf_ohlcv_with_nav(start: str, end: str, ticker: str) -> pd.DataFrame:
+    """ETF OHLCV를 NAV 포함 스키마로 조회한다.
+
+    ETF 전용 API가 실패하면 일반 OHLCV API로 폴백하고 `nav`는 결측으로 둔다.
+    따라서 NAV 기반 랭킹을 켜지 않은 기존 실행은 계속 price-only로 동작한다.
+    """
+    from pykrx import stock as _stock
+
+    fallback_reason = ""
+    try:
+        raw = _stock.get_etf_ohlcv_by_date(start, end, ticker)
+        normalized = normalize_etf_ohlcv_with_nav(raw, ticker)
+        if not normalized.empty:
+            return normalized
+        fallback_reason = "ETF OHLCV가 비어있음"
+    except Exception as exc:
+        fallback_reason = str(exc)
+
+    try:
+        raw = _stock.get_market_ohlcv_by_date(start, end, ticker)
+        normalized = normalize_etf_ohlcv_with_nav(raw, ticker)
+        if fallback_reason:
+            print(f"[pykrx_utils] {ticker} ETF OHLCV/NAV 조회 실패 → market OHLCV 폴백: {fallback_reason}")
+        return normalized
+    except Exception as exc:
+        raise RuntimeError(
+            f"{ticker}: ETF/market OHLCV 조회 모두 실패. ETF 오류={fallback_reason}; market 오류={exc}"
+        ) from exc
+
+
 def _fetch_krx_etf_classification() -> pd.DataFrame:
     """pykrx 내부 API를 통해 KRX 전종목 ETF 분류 데이터를 조회한다.
     KRX 로그인(KRX_ID/KRX_PW)이 필요하다.
@@ -250,6 +364,37 @@ def load_tax_classification(cache_path: str = TAX_CACHE_PATH) -> pd.DataFrame | 
         except Exception:
             return None
     return None
+
+
+def get_listing_dates(
+    ticker_subset: set[str] | None = None,
+    cache_path: str = TAX_CACHE_PATH,
+) -> dict[str, str]:
+    """KRX ETF 분류 캐시의 LIST_DD 컬럼으로 상장일 맵을 반환한다.
+
+    캐시가 없으면 KRX 분류 데이터를 조회해 캐시를 만든다. 실패 시 빈 dict를 반환하며,
+    호출자는 상장일 미상 종목을 lenient하게 허용할 수 있다.
+    """
+    df = load_tax_classification(cache_path)
+    if df is None or df.empty:
+        try:
+            df = fetch_and_cache_tax_classification(cache_path)
+        except Exception:
+            return {}
+
+    if df is None or df.empty or "ISU_SRT_CD" not in df.columns or "LIST_DD" not in df.columns:
+        return {}
+
+    data = df[["ISU_SRT_CD", "LIST_DD"]].copy()
+    data["ISU_SRT_CD"] = data["ISU_SRT_CD"].astype(str).str.strip()
+    data["LIST_DD"] = data["LIST_DD"].astype(str).str.replace(r"\D", "", regex=True)
+    data = data[(data["ISU_SRT_CD"] != "") & (data["LIST_DD"] != "")]
+
+    if ticker_subset:
+        ticker_subset = {str(t).strip() for t in ticker_subset}
+        data = data[data["ISU_SRT_CD"].isin(ticker_subset)]
+
+    return dict(zip(data["ISU_SRT_CD"], data["LIST_DD"], strict=False))
 
 
 def get_taxable_tickers(
