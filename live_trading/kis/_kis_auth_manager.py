@@ -11,6 +11,7 @@ ENV_MODE 공통 환경변수 사용:
 
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -64,6 +65,10 @@ class KisAuthManager:
         }
         self._session = requests.Session()
         self._auth_timeout = float(os.environ.get("KIS_AUTH_TIMEOUT", "10"))
+        self._token_max_retries = int(os.environ.get("KIS_TOKEN_MAX_RETRIES", "3"))
+        _env_mode = os.environ.get("ENV_MODE", "real").lower()
+        _default_retry = "1.0" if _env_mode == "demo" else "0.05"
+        self._token_retry_delay = float(os.environ.get("KIS_RETRY_DELAY", _default_retry))
 
     # ------------------------------------------------------------------
     # 로깅 헬퍼
@@ -134,7 +139,8 @@ class KisAuthManager:
 
     def _setup_token_file(self) -> None:
         """오늘 날짜 기반 토큰 파일 경로를 설정하고, 디렉터리가 없으면 생성합니다."""
-        token_filename = f"KIS{datetime.today().strftime('%Y%m%d')}.json"
+        env_mode = os.environ.get("ENV_MODE", "real").lower()
+        token_filename = f"KIS_{env_mode}_{datetime.today().strftime('%Y%m%d')}.json"
         self._token_file = os.path.join(self._token_dir, token_filename)
         os.makedirs(self._token_dir, exist_ok=True)
 
@@ -183,6 +189,18 @@ class KisAuthManager:
             return
         self.issue_token()
 
+    @staticmethod
+    def _is_rate_limit_response(res) -> bool:
+        """HTTP 429 또는 rate-limit msg_cd 감지."""
+        if res.status_code == 429:
+            return True
+        try:
+            body = res.json()
+            msg_cd = body.get("msg_cd", "")
+            return msg_cd in {"EGW00201", "EGW00215"}
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return False
+
     def issue_token(self) -> None:
         """KIS OAuth2 액세스 토큰을 새로 발급하고 캐시에 저장합니다."""
         url = f"{self.base_url}/oauth2/tokenP"
@@ -194,28 +212,113 @@ class KisAuthManager:
         headers = self._base_headers.copy()
         headers.pop("authorization", None)
 
-        try:
-            res = self._session.post(url, data=json.dumps(payload), headers=headers, timeout=self._auth_timeout)
-        except requests.RequestException as e:
-            raise RuntimeError(
-                f"KIS 토큰 발급 요청 실패 — KIS 서버({self.base_url}) 연결 불가: {e}"
-            ) from e
+        token_rate_limited = False
+        for attempt in range(self._token_max_retries + 1):
+            try:
+                res = self._session.post(
+                    url, data=json.dumps(payload), headers=headers, timeout=self._auth_timeout
+                )
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < self._token_max_retries:
+                    backoff = self._token_retry_delay * (2**attempt)
+                    self._log_warning(
+                        f"KIS 토큰 발급 네트워크 오류 (시도 {attempt + 1}"
+                        f"/{self._token_max_retries + 1}), "
+                        f"{backoff:.1f}초 후 재시도"
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(
+                    f"KIS 토큰 발급 요청 실패 — KIS 서버({self.base_url}) 연결 불가: {e}"
+                ) from e
 
-        if res.status_code != 200:
-            raise RuntimeError(f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}")
+            # Rate-limit (429 or msg_cd)
+            if res.status_code == 429 or self._is_rate_limit_response(res):
+                if attempt < self._token_max_retries:
+                    self._log_warning(
+                        f"KIS 토큰 발급 요청 제한 (시도 {attempt + 1}"
+                        f"/{self._token_max_retries + 1}), "
+                        f"{self._token_retry_delay:.1f}초 후 재시도"
+                    )
+                    time.sleep(self._token_retry_delay)
+                    continue
+                raise RuntimeError(
+                    f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}"
+                )
 
-        body = res.json()
-        token = body.get("access_token")
-        expired_str = body.get("access_token_token_expired")
-        if not token:
-            raise RuntimeError(f"KIS 토큰 발급 응답에 access_token 없음: {body}")
+            # Server error — retry with backoff
+            if res.status_code in (500, 502, 503):
+                if attempt < self._token_max_retries:
+                    backoff = self._token_retry_delay * (2**attempt)
+                    self._log_warning(
+                        f"KIS 토큰 발급 서버 오류 (시도 {attempt + 1}"
+                        f"/{self._token_max_retries + 1}), "
+                        f"{backoff:.1f}초 후 재시도"
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(
+                    f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}"
+                )
 
-        if self._token_file and expired_str:
-            self._save_token(token, expired_str)
+            # Bad credentials — no retry
+            if res.status_code in (400, 401):
+                msg_cd = ""
+                msg1 = ""
+                try:
+                    body = res.json()
+                    msg_cd = str(body.get("msg_cd", ""))
+                    msg1 = str(body.get("msg1", ""))
+                except (ValueError, AttributeError):
+                    pass
+                if msg_cd in ("EGW00103", "EGW00105"):
+                    env_mode = os.environ.get("ENV_MODE", "real")
+                    raise RuntimeError(
+                        f"KIS 앱키/시크릿이 ENV_MODE({env_mode}) 환경과 일치하지 않습니다 "
+                        f"(msg_cd={msg_cd}: {msg1}). "
+                        "ENV_MODE(real/demo)와 KIS_APP_KEY/KIS_APP_SECRET의 발급 환경을 확인하세요."
+                    )
+                raise RuntimeError(
+                    f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}"
+                )
 
-        self._access_token = token
-        self._base_headers["authorization"] = f"Bearer {token}"
-        self._log_info("KIS 액세스 토큰 발급 완료")
+            # Any other non-200 — no retry
+            if res.status_code != 200:
+                raise RuntimeError(
+                    f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}"
+                )
+
+            # HTTP 200 — success path (or EGW00133 rate-limit)
+            body = res.json()
+
+            # 토큰 발급 rate-limit (1분당 1회) — 60초 대기 후 1회 retry
+            if body.get("msg_cd") == "EGW00133" and not token_rate_limited:
+                token_rate_limited = True
+                self._log_warning(
+                    "KIS 토큰 발급 rate-limit (EGW00133: 1분당 1회), 60초 대기 후 재시도"
+                )
+                time.sleep(60)
+                continue
+
+            token = body.get("access_token")
+            expired_str = body.get("access_token_token_expired")
+            if not token:
+                msg_cd = body.get("msg_cd", "")
+                if msg_cd == "EGW00133":
+                    raise RuntimeError(
+                        f"KIS 토큰 발급 실패: 60초 대기 후에도 rate-limit(EGW00133) 지속 — {body}"
+                    )
+                raise RuntimeError(
+                    f"KIS 토큰 발급 응답에 access_token 없음: {body}"
+                )
+
+            if self._token_file and expired_str:
+                self._save_token(token, expired_str)
+
+            self._access_token = token
+            self._base_headers["authorization"] = f"Bearer {token}"
+            self._log_info("KIS 액세스 토큰 발급 완료")
+            return
 
     # ------------------------------------------------------------------
     # 외부 접근자

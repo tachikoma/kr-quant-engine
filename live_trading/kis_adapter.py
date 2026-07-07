@@ -34,7 +34,7 @@ class KisAdapter:
         self._cano: str = ""
         self._acnt_prdt_cd: str = "01"
         self._parse_account()
-        self._check_env_mismatch()
+        self._verify_api_access()
 
         # place_order 시 저장해두는 메타정보 (cancel_order에서 사용)
         self._order_meta: dict[str, dict[str, str]] = {}
@@ -48,16 +48,15 @@ class KisAdapter:
         else:
             self._acnt_prdt_cd = self._auth.product_code or "01"
 
-    def _check_env_mismatch(self) -> None:
-        """ENV_MODE와 KIS 앱키 환경이 일치하는지 시세조회로 사전 확인."""
+    def _verify_api_access(self) -> None:
+        """초기화 후 실제 API 호출로 인증 체인(IP 허용/토큰/계좌) end-to-end 검증."""
         try:
             self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd)
         except KisApiError as e:
-            if "EGW02007" in str(e):
-                env_mode = os.environ.get("ENV_MODE", "real")
+            if e.msg_cd == "EGW00207":
                 raise RuntimeError(
-                    f"KIS 앱키가 ENV_MODE({env_mode})와 일치하지 않습니다. "
-                    "ENV_MODE를 확인하거나 올바른 앱키로 변경하세요."
+                    "KIS API 호출 IP가 허용 목록에 없습니다. "
+                    "KIS 개발자 포털에서 사용 중인 IP를 허용 IP로 등록하세요."
                 ) from e
 
     # ------------------------------------------------------------------

@@ -63,6 +63,8 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
 | `LIVE_SLIPPAGE_PCT` | `0.0005` | Live slippage fraction |
 | `LIVE_SPREAD_PCT` | `0.0005` | Live spread fallback |
+| `KIS_TOKEN_MAX_RETRIES` | `3` | KIS token issuance retry count (network/rate-limit/5xx) |
+| `KIWOOM_TOKEN_CACHE_DIR` | `.kiwoom_token_cache/` | Kiwoom token cache directory |
 
 Full list in `README.md` and `.env.sample`.
 
@@ -86,3 +88,7 @@ Full list in `README.md` and `.env.sample`.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.
+- Token issuance retry: both KIS (`KisAuthManager.issue_token()`) and Kiwoom (`KiwoomAdapter._issue_token()`) retry on network errors (exponential backoff), rate-limit (429 / msg_cd), and 5xx server errors. HTTP 400/401 fail immediately (bad credentials). KIS retries up to `KIS_TOKEN_MAX_RETRIES` (default 3); Kiwoom reuses `KIWOOM_HTTP_MAX_RETRIES` (default 4). Both use the shared API retry delay (`KIS_RETRY_DELAY` / `KIWOOM_HTTP_RETRY_DELAY`) — no separate token-specific delay env var. Token-issuance rate-limit (KIS `EGW00133` "1분당 1회", Kiwoom `return_code=="5"` or "허용된 요청 개수를 초과") is handled separately: 60s wait + 1 retry, then fail.
+- Token caching: both adapters cache tokens to disk (KIS: `KIS_{env_mode}_{YYYYMMDD}.json` in `KIS_CONFIG_PATH`; Kiwoom: `KIWOOM{YYYYMMDD}.json` in `KIWOOM_TOKEN_CACHE_DIR`). Lazy re-issuance via `_issue_token_if_needed()` checks cache validity before issuing. KIS cache filename includes `ENV_MODE` to prevent stale tokens on env switch.
+- Auth-failure recovery: both `KisApiClient._get()`/`_post()` and `KiwoomAdapter._post()` detect 401 (KIS also checks token-expiry `msg_cd` in `{EGW00121, EGW00122, EGW00123}`), call `invalidate_token()` + re-issue once, then retry. `auth_retried` flag prevents infinite re-auth loops. `EGW00207` (IP whitelist) and `EGW00103/105` (bad appkey/secret) are NOT retried — they require portal configuration, not token re-issuance.
+- Env-mismatch detection at token issuance: `KisAuthManager.issue_token()` parses the 400/401 response body and, when `msg_cd` is `EGW00103`/`EGW00105` (invalid AppKey/AppSecret), raises a clear "앱키/시크릿이 ENV_MODE 환경과 일치하지 않습니다" error instead of a raw HTTP message. This is where wrong-env appkey failures actually manifest (before `_check_env_mismatch()` runs).

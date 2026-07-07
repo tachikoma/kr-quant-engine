@@ -51,10 +51,11 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 import time
 import threading
-from typing import Any
+from typing import Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -102,20 +103,22 @@ class KiwoomAdapter:
         # 스레드 간 호출 간격 예약/동기화를 위한 락과 마지막 예약 타임스탬프
         self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
+        self._token_file: str | None = None
 
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
-        self.access_token = self._issue_token()
+        self._setup_token_file()
+        self._issue_token_if_needed()
 
     def _resolve_url(self, endpoint: str) -> str:
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
             return endpoint
         return f"{self.base_url}/{endpoint.lstrip('/')}"
 
-    def _issue_token(self) -> str:
+    def _issue_token(self) -> tuple[str, int]:
         token_endpoint = "/oauth2/token"
         token_api_id = "au10001"
         if not self.app_key or not self.secret_key:
@@ -133,18 +136,146 @@ class KiwoomAdapter:
         if token_api_id:
             headers["api-id"] = token_api_id
 
-        # 토큰 발급도 전체 호출 간 딜레이 규칙을 따르도록 한다.
-        self._throttle_request()
-        response = self._session.post(token_url, headers=headers, json=payload, timeout=self.timeout)
-        with self._throttle_lock:
-            self._last_request_ts = time.monotonic()
-        response.raise_for_status()
-        data = response.json()
+        token_rate_limited = False
+        response: requests.Response | None = None
+        for attempt in range(self.http_max_retries + 1):
+            # 토큰 발급도 전체 호출 간 딜레이 규칙을 따르도록 한다.
+            self._throttle_request()
+            try:
+                response = self._session.post(token_url, headers=headers, json=payload, timeout=self.timeout)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < self.http_max_retries:
+                    delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
+                    if self.http_debug_response:
+                        print(
+                            f"[HTTP][재시도] 네트워크 오류 ({type(e).__name__}) "
+                            f"-> {delay:.1f}초 대기 후 재시도 (attempt {attempt+1}/{self.http_max_retries})"
+                        )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"HTTP request failed (network error): {token_url}") from e
+            with self._throttle_lock:
+                self._last_request_ts = time.monotonic()
 
-        token = data.get("access_token") or data.get("token") or data.get("accessToken")
-        if not token:
-            raise RuntimeError(f"Cannot find access token in response: {data}")
-        return str(token)
+            if self.http_debug_response:
+                print(
+                    f"[HTTP] POST {token_endpoint} api-id={token_api_id} status={response.status_code}"
+                )
+                if self.http_debug_body:
+                    body_text = response.text[: max(self.http_debug_body_limit, 0)]
+                    print(f"[HTTP] response(body): {body_text}")
+
+            if response.status_code == 429 and attempt < self.http_max_retries:
+                time.sleep(self._retry_delay(response))
+                continue
+
+            if response.status_code in (500, 502, 503) and attempt < self.http_max_retries:
+                delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
+                time.sleep(delay)
+                continue
+
+            if response.status_code in (401, 400, 403):
+                raise RuntimeError(
+                    f"Token issuance failed (HTTP {response.status_code}): {response.text[:500]}"
+                )
+
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON response from {token_url}: {response.text[:500]}") from exc
+
+            # 토큰 발급 rate-limit 감지 (body-level) — 60초 대기 후 1회 retry
+            if self._is_api_rate_limited(data) and not token_rate_limited:
+                token_rate_limited = True
+                if self.http_debug_response:
+                    print("[HTTP][재시도] 토큰 발급 rate-limit 감지, 60초 대기 후 재시도...")
+                time.sleep(60)
+                continue
+
+            token = data.get("access_token") or data.get("token") or data.get("accessToken")
+            if not token:
+                if self._is_api_rate_limited(data):
+                    raise RuntimeError(
+                        f"Kiwoom 토큰 발급 실패: 60초 대기 후에도 rate-limit 지속 — {data}"
+                    )
+                raise RuntimeError(f"Cannot find access token in response: {data}")
+
+            expires_in = data.get("expires_in")
+            if expires_in is None:
+                expires_in = 86400
+                print(f"[WARN] expires_in not found in token response, defaulting to {expires_in}")
+            else:
+                expires_in = int(expires_in)
+
+            return str(token), expires_in
+
+        if response is not None:
+            response.raise_for_status()
+        raise RuntimeError(f"Token issuance failed without response: {token_url}")
+
+    # ------------------------------------------------------------------
+    # 토큰 캐시 관리
+    # ------------------------------------------------------------------
+
+    def _setup_token_file(self) -> None:
+        """오늘 날짜 기반 토큰 파일 경로를 설정하고, 디렉터리가 없으면 생성합니다."""
+        cache_dir = os.environ.get("KIWOOM_TOKEN_CACHE_DIR", "").strip()
+        if not cache_dir:
+            cache_dir = str(PROJECT_ROOT / ".kiwoom_token_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        self._token_file = os.path.join(cache_dir, f"KIWOOM{datetime.today().strftime('%Y%m%d')}.json")
+
+    def _read_cached_token(self) -> Optional[str]:
+        """로컬 캐시에서 유효한 액세스 토큰을 읽습니다. 없거나 만료 시 None 반환."""
+        if not self._token_file:
+            return None
+        try:
+            with open(self._token_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            valid_date = data.get("valid_date", "")
+            if not valid_date:
+                return None
+            now_str = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+            if valid_date > now_str:
+                return data["token"]
+            return None
+        except Exception:
+            return None
+
+    def _save_token(self, token: str, expires_in: int) -> None:
+        """토큰을 로컬 파일에 JSON 형식으로 저장합니다."""
+        valid_date = (datetime.now() + timedelta(seconds=expires_in)).strftime("%Y-%m-%d %H:%M:%S")
+        with open(self._token_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "token": token,
+                "valid_date": valid_date,
+                "issued_at": datetime.now().isoformat(),
+            }, f)
+
+    def _issue_token_if_needed(self) -> None:
+        """캐시된 토큰이 유효하면 사용하고, 없으면 새로 발급합니다."""
+        saved = self._read_cached_token()
+        if saved:
+            self.access_token = saved
+            return
+        token, expires_in = self._issue_token()
+        self._save_token(token, expires_in)
+        self.access_token = token
+
+    def _ensure_token_valid(self) -> None:
+        """액세스 토큰이 없으면 재발급합니다 (mid-run 안전망)."""
+        if not self.access_token:
+            self._issue_token_if_needed()
+
+    def invalidate_token(self) -> None:
+        """메모리 및 파일 캐시의 토큰을 무효화합니다."""
+        self.access_token = ""
+        if self._token_file and os.path.exists(self._token_file):
+            try:
+                os.remove(self._token_file)
+            except Exception:
+                pass
 
     def _headers(self, api_id: str | None = None) -> dict[str, str]:
         headers = {
@@ -188,6 +319,7 @@ class KiwoomAdapter:
         url = self._resolve_url(endpoint)
 
         response: requests.Response | None = None
+        auth_retried = False
         for attempt in range(self.http_max_retries + 1):
             self._throttle_request()
             try:
@@ -220,6 +352,15 @@ class KiwoomAdapter:
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
                 # retry delay counts toward throttle interval (no separate timestamp update)
+                continue
+
+            # 401 auth-failure — invalidate + re-issue + retry once
+            if response.status_code == 401 and not auth_retried:
+                auth_retried = True
+                if self.http_debug_response:
+                    print("[HTTP][재시도] 인증 실패 (401), 토큰 재발급 후 재시도...")
+                self.invalidate_token()
+                self._ensure_token_valid()
                 continue
 
             response.raise_for_status()

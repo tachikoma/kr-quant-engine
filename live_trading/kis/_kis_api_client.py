@@ -100,6 +100,7 @@ class KisApiClient:
     def _get(self, path: str, tr_id: str, params: dict, tr_cont: str = "") -> dict:
         """GET 요청 수행 (재시도 + 스로틀 포함). 응답 dict 반환."""
         url = f"{self._auth.base_url}{path}"
+        auth_retried = False
         for attempt in range(self._max_retries + 1):
             self._throttle()
             headers = self._build_headers(tr_id, tr_cont)
@@ -107,6 +108,18 @@ class KisApiClient:
                 res = self._session.get(url, headers=headers, params=params, timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
+                # 토큰 만료/무효 — 토큰 무효화 후 1회 재발급 (EGW00121/22/23)
+                if not auth_retried and (
+                    e.http_status == 401 or e.msg_cd in {"EGW00121", "EGW00122", "EGW00123"}
+                ):
+                    auth_retried = True
+                    print(
+                        f"[KIS] 인증 실패 감지 (msg_cd={e.msg_cd}, http_status={e.http_status}), "
+                        f"토큰 재발급 후 재시도..."
+                    )
+                    self._auth.invalidate_token()
+                    self._auth.get_access_token()
+                    continue
                 if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
                     print(
                         f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
@@ -127,6 +140,7 @@ class KisApiClient:
     def _post(self, path: str, tr_id: str, payload: dict) -> dict:
         """POST 요청 수행 (재시도 + 스로틀 포함). 응답 dict 반환."""
         url = f"{self._auth.base_url}{path}"
+        auth_retried = False
         for attempt in range(self._max_retries + 1):
             self._throttle()
             headers = self._build_headers(tr_id, "")
@@ -134,6 +148,18 @@ class KisApiClient:
                 res = self._session.post(url, headers=headers, data=json.dumps(payload), timeout=self._api_timeout)
                 return self._handle_response(res)
             except KisApiError as e:
+                # 토큰 만료/무효 — 토큰 무효화 후 1회 재발급 (EGW00121/22/23)
+                if not auth_retried and (
+                    e.http_status == 401 or e.msg_cd in {"EGW00121", "EGW00122", "EGW00123"}
+                ):
+                    auth_retried = True
+                    print(
+                        f"[KIS] 인증 실패 감지 (msg_cd={e.msg_cd}, http_status={e.http_status}), "
+                        f"토큰 재발급 후 재시도..."
+                    )
+                    self._auth.invalidate_token()
+                    self._auth.get_access_token()
+                    continue
                 if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
                     print(
                         f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "

@@ -8,3 +8,4 @@ outputs_*/
 .DS_Store
 .env
 .kis_token_cache/
+.kiwoom_token_cache/
