@@ -1034,6 +1034,29 @@ def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dic
         rf_daily = risk_free / 252
         sharpe = (returns.mean() - rf_daily) * 252 / volatility
 
+    # Sortino는 하방 변동성만 사용한다. 목표수익률은 Sharpe와 동일하게 무위험수익률로 둔다.
+    rf_daily = risk_free / 252
+    downside_returns = np.minimum(returns - rf_daily, 0.0)
+    downside_deviation = (
+        np.sqrt(np.mean(np.square(downside_returns))) * np.sqrt(252)
+        if not returns.empty
+        else 0.0
+    )
+    sortino = (
+        (returns.mean() - rf_daily) * 252 / downside_deviation
+        if downside_deviation > 0
+        else np.nan
+    )
+
+    # CVaR(95%): 일간 수익률 하위 5% 구간의 평균 손실.
+    var_95 = returns.quantile(0.05) if not returns.empty else np.nan
+    cvar_95 = returns[returns <= var_95].mean() if not returns.empty else np.nan
+    ulcer_index = float(np.sqrt(np.mean(np.square(drawdown)))) if not drawdown.empty else 0.0
+    tail_loss = returns.quantile(0.05) if not returns.empty else np.nan
+    tail_gain = returns.quantile(0.95) if not returns.empty else np.nan
+    tail_ratio = tail_gain / abs(tail_loss) if pd.notna(tail_loss) and tail_loss != 0 else np.nan
+    max_drawdown_abs = abs(mdd)
+
     return {
         "initial": temp[equity_col].iloc[0],
         "final": temp[equity_col].iloc[-1],
@@ -1042,7 +1065,102 @@ def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dic
         "mdd": mdd,
         "volatility": volatility,
         "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": cagr / max_drawdown_abs if max_drawdown_abs > 0 else np.nan,
+        "cvar_95_daily": cvar_95,
+        "ulcer_index": ulcer_index,
+        "tail_ratio": tail_ratio,
+        # Recovery factor는 누적수익률을 최대낙폭 절대값으로 나눈 값이다.
+        "recovery_factor": total_return / max_drawdown_abs if max_drawdown_abs > 0 else np.nan,
     }
+
+
+def calc_trading_stats(trades: pd.DataFrame, equity: pd.Series, dates: pd.Series) -> dict:
+    """거래내역에서 회전율·보유기간·리밸런싱 빈도를 계산한다.
+
+    turnover는 매수와 매도의 총 체결대금을 평균 운용자산으로 나눈 값이다. 따라서
+    100%는 평균 자산과 동일한 금액이 한 번 거래된 것을 뜻하며, 매수/매도 모두 포함한다.
+    """
+    period_days = max((pd.to_datetime(dates).max() - pd.to_datetime(dates).min()).days, 1)
+    years = period_days / 365.25
+    if trades.empty:
+        return {
+            "trade_count": 0,
+            "rebalance_count": 0,
+            "rebalances_per_year": 0.0,
+            "turnover": 0.0,
+            "annual_turnover": 0.0,
+            "avg_holding_days": np.nan,
+        }
+
+    data = trades.copy()
+    data["date"] = pd.to_datetime(data["date"])
+    data["qty"] = pd.to_numeric(data["qty"], errors="coerce").fillna(0).astype(int)
+    data["net_value"] = pd.to_numeric(data["net_value"], errors="coerce").fillna(0.0).abs()
+    total_traded_value = float(data["net_value"].sum())
+    average_equity = float(pd.to_numeric(equity, errors="coerce").mean())
+    turnover = total_traded_value / average_equity if average_equity > 0 else np.nan
+
+    # FIFO로 매수 수량과 매도 수량을 대응시켜, 부분매도가 있어도 수량 가중 보유기간을 계산한다.
+    open_lots: dict[str, list[list[object]]] = {}
+    holding_day_weight = 0.0
+    closed_qty = 0
+    for row in data.sort_values("date").itertuples(index=False):
+        ticker = str(row.ticker)
+        qty = int(row.qty)
+        if qty <= 0:
+            continue
+        if str(row.side).upper() == "BUY":
+            open_lots.setdefault(ticker, []).append([row.date, qty])
+            continue
+        if str(row.side).upper() != "SELL":
+            continue
+        remaining = qty
+        for lot in open_lots.get(ticker, []):
+            if remaining <= 0:
+                break
+            matched = min(remaining, int(lot[1]))
+            holding_day_weight += matched * max((row.date - lot[0]).days, 0)
+            closed_qty += matched
+            lot[1] = int(lot[1]) - matched
+            remaining -= matched
+        open_lots[ticker] = [lot for lot in open_lots.get(ticker, []) if int(lot[1]) > 0]
+
+    rebalance_count = int(data["date"].dt.normalize().nunique())
+    return {
+        "trade_count": int(len(data)),
+        "rebalance_count": rebalance_count,
+        "rebalances_per_year": rebalance_count / years if years > 0 else float(rebalance_count),
+        "turnover": turnover,
+        "annual_turnover": turnover / years if years > 0 else np.nan,
+        "avg_holding_days": holding_day_weight / closed_qty if closed_qty > 0 else np.nan,
+    }
+
+
+def build_return_reports(df: pd.DataFrame, equity_col: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """월간/연간 수익률과 1년 롤링 위험지표를 반환한다."""
+    temp = df[["date", equity_col]].dropna().copy().sort_values("date")
+    temp["date"] = pd.to_datetime(temp["date"])
+    temp = temp.set_index("date")
+    daily_returns = temp[equity_col].pct_change()
+    monthly = temp[equity_col].resample("ME").last().pct_change().dropna().rename("return").reset_index()
+    annual = temp[equity_col].resample("YE").last().pct_change().dropna().rename("return").reset_index()
+
+    window = 252
+    rolling = pd.DataFrame({"date": temp.index, "equity": temp[equity_col].to_numpy()})
+    rolling["rolling_1y_cagr"] = temp[equity_col].pct_change(window)
+    rolling["rolling_1y_mdd"] = temp[equity_col].rolling(window, min_periods=window).apply(
+        lambda values: (values / np.maximum.accumulate(values) - 1).min(), raw=True
+    )
+    rolling["rolling_1y_sortino"] = daily_returns.rolling(window, min_periods=window).apply(
+        lambda values: (
+            values.mean() * 252 / (np.sqrt(np.mean(np.square(np.minimum(values, 0.0)))) * np.sqrt(252))
+            if np.any(values < 0)
+            else np.nan
+        ),
+        raw=True,
+    ).to_numpy()
+    return monthly, annual, rolling
 
 
 def get_backtest_period(df: pd.DataFrame, equity_col: str) -> dict:
@@ -1261,6 +1379,8 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     strategy_stats = calc_stats(df, "equity")
     period = get_backtest_period(df, "equity")
     invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).mean()
+    trading_stats = calc_trading_stats(trades, df["equity"], df["date"])
+    strategy_stats.update({"avg_invested_ratio": invested_ratio, **trading_stats})
 
     print("\n=== 일반 백테스트 결과 ===")
     print("모드: single")
@@ -1274,7 +1394,16 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     print(f"MDD: {strategy_stats['mdd']:.2%}")
     print(f"변동성(연환산): {strategy_stats['volatility']:.2%}")
     print(f"샤프: {strategy_stats['sharpe']:.4f}")
-    print(f"거래 수: {len(trades)}")
+    print(f"Sortino: {strategy_stats['sortino']:.4f}")
+    print(f"Calmar: {strategy_stats['calmar']:.4f}")
+    print(f"CVaR(95%, 일간): {strategy_stats['cvar_95_daily']:.2%}")
+    print(f"Ulcer Index: {strategy_stats['ulcer_index']:.4f}")
+    print(f"Tail Ratio: {strategy_stats['tail_ratio']:.4f}")
+    print(f"Recovery Factor: {strategy_stats['recovery_factor']:.4f}")
+    print(f"거래 수: {trading_stats['trade_count']}")
+    print(f"회전율(전체/연환산): {trading_stats['turnover']:.2%} / {trading_stats['annual_turnover']:.2%}")
+    print(f"평균 보유기간(청산분): {trading_stats['avg_holding_days']:.1f}일")
+    print(f"연간 리밸런싱 횟수: {trading_stats['rebalances_per_year']:.2f}")
     print(f"평균 투자 비중: {invested_ratio:.4f}")
 
     benchmark_stats = None
@@ -1286,6 +1415,9 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
         print(f"CAGR: {benchmark_stats['cagr']:.2%}")
         print(f"MDD: {benchmark_stats['mdd']:.2%}")
         print(f"샤프: {benchmark_stats['sharpe']:.4f}")
+        print(f"Sortino: {benchmark_stats['sortino']:.4f}")
+        print(f"Calmar: {benchmark_stats['calmar']:.4f}")
+        print(f"CVaR(95%, 일간): {benchmark_stats['cvar_95_daily']:.2%}")
         print("\n=== 벤치마크 대비 ===")
         print(
             "요약: "
@@ -1295,6 +1427,24 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
         )
 
     return strategy_stats, benchmark_stats, period
+
+
+def save_single_analytics(
+    df: pd.DataFrame,
+    strategy_stats: dict,
+    benchmark_stats: dict | None,
+) -> None:
+    """단일 백테스트용 비교표와 시계열 성과 리포트를 저장한다."""
+    comparison_rows = [{"strategy": "ETF_Strategy", **strategy_stats}]
+    if benchmark_stats is not None:
+        comparison_rows.append({"strategy": "KODEX200_BuyHold", **benchmark_stats})
+    comparison = pd.DataFrame(comparison_rows)
+    comparison.to_csv(OUTPUT_DIR / "performance_comparison.csv", index=False, encoding="utf-8-sig")
+
+    monthly, annual, rolling = build_return_reports(df, "equity")
+    monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", index=False, encoding="utf-8-sig")
+    annual.to_csv(OUTPUT_DIR / "annual_returns.csv", index=False, encoding="utf-8-sig")
+    rolling.to_csv(OUTPUT_DIR / "rolling_metrics.csv", index=False, encoding="utf-8-sig")
 
 
 def summarize_experiment(df: pd.DataFrame, trades_dict: dict) -> tuple[dict, list[dict], list[dict]]:
@@ -1315,7 +1465,10 @@ def summarize_experiment(df: pd.DataFrame, trades_dict: dict) -> tuple[dict, lis
 
     print(f"\n백테스트 기간: {period['start']} ~ {period['end']} ({period['trading_days']} 거래일, {period['years']:.2f}년)")
     print("\n=== 슬리피지 민감도 테스트 ===")
-    display_cols = ["strategy", "final", "total_return", "cagr", "mdd", "volatility", "sharpe"]
+    display_cols = [
+        "strategy", "final", "total_return", "cagr", "mdd", "calmar",
+        "sortino", "cvar_95_daily", "volatility", "sharpe",
+    ]
     print(comparison[display_cols].to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
 
     details = []
@@ -1551,6 +1704,7 @@ def main():
         trades.to_csv(OUTPUT_DIR / "etf_trades.csv", index=False, encoding="utf-8-sig")
 
         strategy_stats, benchmark_stats, period = summarize_single(result, trades)
+        save_single_analytics(result, strategy_stats, benchmark_stats)
         payload = {
             "mode": "single",
             "slippage": BASE_SLIPPAGE,
@@ -1565,6 +1719,10 @@ def main():
         print(f"저장 완료: {OUTPUT_DIR / 'etf_equity_curve.csv'}")
         print(f"저장 완료: {OUTPUT_DIR / 'etf_trades.csv'}")
         print(f"저장 완료: {OUTPUT_DIR / 'performance.json'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'performance_comparison.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'monthly_returns.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'annual_returns.csv'}")
+        print(f"저장 완료: {OUTPUT_DIR / 'rolling_metrics.csv'}")
     else:
         result.to_csv(OUTPUT_DIR / "etf_equity_curve.csv", index=False, encoding="utf-8-sig")
         # 필요 시 슬리피지별 체결 내역 저장

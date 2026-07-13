@@ -138,7 +138,10 @@ python live_trading/etf_daily_runner.py --force-live
 
 - `etf_equity_curve.csv` — 일별 포트폴리오 가치 (strategy + benchmark)
 - `etf_trades.csv` — 체결 내역
-- `performance.json` — 성과 지표 (CAGR, MDD, Sharpe 등)
+- `performance.json` — 성과 지표 (CAGR, MDD, Sharpe, Sortino, Calmar, CVaR95, Ulcer Index, Tail Ratio, Recovery Factor, 회전율 등)
+- `performance_comparison.csv` — 전략과 KODEX200 Buy&Hold의 수익·위험·위험조정 성과 비교
+- `monthly_returns.csv` / `annual_returns.csv` — 월별·연도별 수익률
+- `rolling_metrics.csv` — 1년 롤링 CAGR, MDD, Sortino (차트 생성용 시계열)
 
 **experiment 모드(`ETF_BACKTEST_MODE=experiment`):**
 
