@@ -352,21 +352,38 @@ def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
 
     if "liquidity_ok" in df.columns:
         n_before = len(df)
+        dropped = sorted(df.loc[~df["liquidity_ok"], "ticker"].tolist())
         df = df[df["liquidity_ok"]].copy()
+        logger.debug(f"  [필터] liquidity: {n_before}\u2192{len(df)}")
+        if dropped:
+            logger.debug(f"    탈락: {dropped}")
         steps.append(f"liquidity: {n_before}\u2192{len(df)}")
 
     if "listing_ok" in df.columns:
         n_before = len(df)
+        dropped = sorted(df.loc[~df["listing_ok"], "ticker"].tolist())
         df = df[df["listing_ok"]].copy()
+        logger.debug(f"  [필터] listing: {n_before}\u2192{len(df)}")
+        if dropped:
+            logger.debug(f"    탈락: {dropped}")
         steps.append(f"listing: {n_before}\u2192{len(df)}")
 
     if "deviation_ok" in df.columns:
         n_before = len(df)
+        dropped = sorted(df.loc[~df["deviation_ok"], "ticker"].tolist())
         df = df[df["deviation_ok"]].copy()
+        logger.debug(f"  [필터] deviation: {n_before}\u2192{len(df)}")
+        if dropped:
+            logger.debug(f"    탈락: {dropped}")
         steps.append(f"deviation: {n_before}\u2192{len(df)}")
 
     n_before = len(df)
-    df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
+    mask = df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]
+    dropped = sorted(df.loc[~mask, "ticker"].tolist())
+    df = df[mask].copy()
+    logger.debug(f"  [필터] trend/return: {n_before}\u2192{len(df)}")
+    if dropped:
+        logger.debug(f"    탈락: {dropped}")
     steps.append(f"trend/return: {n_before}\u2192{len(df)}")
 
     logger.info(f"[필터] {n}개 \u2192 {' | '.join(steps)}")

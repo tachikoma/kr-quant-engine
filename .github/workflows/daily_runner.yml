@@ -96,6 +96,7 @@ jobs:
         env:
            FORCE_REBALANCE: ${{ steps.flags.outputs.force_rebalance || '0' }}
            DAILY_RUN_FORCE: ${{ steps.flags.outputs.force_run || '0' }}
+           LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
 
       - name: Save runtime state
         uses: actions/cache/save@v4
