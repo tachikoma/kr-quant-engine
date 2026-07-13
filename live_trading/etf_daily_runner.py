@@ -519,18 +519,27 @@ def _load_snapshot(
     logger.info(f"[데이터] ETF 가격 로드 시작: {len(etf_list)}개 티커, 기간={start}~{end}")
     t0 = dt.datetime.now()
 
+    listing_dates = get_listing_dates(ticker_subset=set(map(str, etf_list)))
+
     frames: list[pd.DataFrame] = []
     _tn = ticker_names or {}
     for i, ticker in enumerate(etf_list, 1):
         dn = _tn.get(ticker, ticker)
         logger.info(f"  ({i}/{len(etf_list)}) {dn} 조회 중...")
         t1 = dt.datetime.now()
-        if not _range_has_weekday(start, end):
+        effective_start = start
+        ld = listing_dates.get(str(ticker).strip())
+        if ld:
+            ld_ts = pd.to_datetime(ld)
+            s_ts = pd.to_datetime(start, format="%Y%m%d")
+            if s_ts < ld_ts:
+                effective_start = ld_ts.strftime("%Y%m%d")
+        if not _range_has_weekday(effective_start, end):
             elapsed = (dt.datetime.now() - t1).total_seconds()
             logger.info(f"스킵(주말만 해당) — 데이터 없음 ({elapsed:.1f}초)")
             continue
         try:
-            raw = _call_capture_stderr(fetch_etf_ohlcv_with_nav, start, end, ticker)
+            raw = _call_capture_stderr(fetch_etf_ohlcv_with_nav, effective_start, end, ticker)
         except Exception as e:
             elapsed = (dt.datetime.now() - t1).total_seconds()
             logger.info(f"조회 실패 ({elapsed:.1f}초): {e}")
@@ -554,7 +563,6 @@ def _load_snapshot(
     return_basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
     distributions = load_distributions(required=return_basis == "total_return")
     price_df = add_distributions(price_df, distributions)
-    listing_dates = get_listing_dates(ticker_subset=set(map(str, etf_list)))
     price_df = add_liquidity_flag(price_df)
     price_df = add_listing_flag(price_df, listing_dates)
     price_df = add_deviation_flag(price_df)

@@ -316,13 +316,25 @@ def normalize_index_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def get_price(ticker: str) -> pd.DataFrame:
+def get_price(
+    ticker: str, listing_dates: dict[str, str] | None = None
+) -> pd.DataFrame:
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     use_cache = os.environ.get("ETF_USE_CACHE", "1") != "0"
     force_refresh = os.environ.get("ETF_REFRESH_CACHE", "0") == "1"
     cache_parquet = cache_dir / f"{ticker}.parquet"
     cache_csv_pattern = list(cache_dir.glob(f"{ticker}_*.csv"))
+
+    # 상장일 기반으로 조회 시작일 클램핑 — 상장 전 기간 요청을 방지
+    effective_start = START
+    if listing_dates:
+        ld = listing_dates.get(str(ticker).strip())
+        if ld:
+            ld_ts = pd.to_datetime(ld)
+            s_ts = pd.to_datetime(START)
+            if s_ts < ld_ts:
+                effective_start = ld_ts.strftime("%Y%m%d")
 
     # 기존 CSV 캐시(구형 포맷)가 있으면 병합하여 Parquet 마스터로 마이그레이션 시도
     if use_cache and not force_refresh and not cache_parquet.exists() and cache_csv_pattern:
@@ -357,7 +369,7 @@ def get_price(ticker: str) -> pd.DataFrame:
                 df_cached["date"] = pd.to_datetime(df_cached["date"])
             _ensure_price_cache_schema(df_cached, ticker)
 
-            start_req = pd.to_datetime(START)
+            start_req = pd.to_datetime(effective_start)
             end_req = pd.to_datetime(END)
 
             cached_min = df_cached["date"].min()
@@ -462,7 +474,7 @@ def get_price(ticker: str) -> pd.DataFrame:
 
     # 캐시가 없거나 강제 갱신인 경우 전체 조회 후 저장
     try:
-        df = _call_capture_stderr(fetch_etf_ohlcv_with_nav, START, END, ticker)
+        df = _call_capture_stderr(fetch_etf_ohlcv_with_nav, effective_start, END, ticker)
         if use_cache:
             try:
                 tmp = cache_parquet.with_suffix(".parquet.tmp")
@@ -689,11 +701,13 @@ def load_etf_price() -> pd.DataFrame:
     failed = []
     empty = []
 
+    listing_dates = get_listing_dates(ticker_subset=set(map(str, ETF_LIST)))
+
     total = len(ETF_LIST)
     for idx, ticker in enumerate(ETF_LIST, start=1):
         print(f"[데이터] {idx}/{total} 조회: {ticker}")
         try:
-            df = get_price(ticker)
+            df = get_price(ticker, listing_dates=listing_dates)
             if df is None or df.empty:
                 empty.append(ticker)
                 print(f"[데이터] {ticker} 비어있음")
@@ -722,7 +736,6 @@ def load_etf_price() -> pd.DataFrame:
 
     distributions = load_distributions(required=_return_basis_requires_distributions())
     price = add_distributions(price, distributions)
-    listing_dates = get_listing_dates(ticker_subset=set(map(str, ETF_LIST)))
     price = add_liquidity_flag(price)
     price = add_listing_flag(price, listing_dates)
     price = add_deviation_flag(price)
@@ -934,7 +947,7 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
     ``ETF_RETURN_BASIS=total_return``이면 분배금을 현금으로 수령해 자산에 반영한다
     (실전에서는 증권사 예수금에 자동 반영되므로 러너와 동일한 랭킹만 공유).
     """
-    price = get_price(BENCHMARK_TICKER)
+    price = get_price(BENCHMARK_TICKER, listing_dates=get_listing_dates({BENCHMARK_TICKER}))
     if price.empty:
         raise RuntimeError(f"No benchmark data for {BENCHMARK_TICKER}")
 
