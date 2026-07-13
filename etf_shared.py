@@ -319,6 +319,12 @@ def add_deviation_flag(price: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
+    """``close_adj`` 컬럼을 ``ETF_RETURN_BASIS``에 따라 설정한다.
+
+    - ``price``: 원래 종가 그대로 사용.
+    - ``nav``: NAV가 있으면 NAV, 없으면 종가로 폴백.
+    - ``total_return``: 분배금 즉시 재투자 total-return 지수를 사용.
+    """
     price = price.copy()
     basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
     if basis == "total_return":

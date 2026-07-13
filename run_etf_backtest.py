@@ -236,14 +236,17 @@ class _RefreshPriceCacheRequired(Exception):
 
 
 def _return_basis_requires_nav() -> bool:
+    """NAV 기반 수익률이 필요한지 확인한다 (``ETF_RETURN_BASIS=nav``)."""
     return os.environ.get("ETF_RETURN_BASIS", "price").strip().lower() == "nav"
 
 
 def _return_basis_requires_distributions() -> bool:
+    """분배금 파일이 필요한지 확인한다 (``ETF_RETURN_BASIS=total_return``)."""
     return os.environ.get("ETF_RETURN_BASIS", "price").strip().lower() == "total_return"
 
 
 def _ensure_price_cache_schema(df: pd.DataFrame, ticker: str) -> None:
+    """NAV 모드일 때 캐시에 nav 컬럼이 충분히 있는지 점검한다. price/total_return 모드는 건너뛴다."""
     if not _return_basis_requires_nav():
         return
     if "nav" not in df.columns:
@@ -677,6 +680,11 @@ def safe_get(series: pd.Series, key: str):
 
 
 def load_etf_price() -> pd.DataFrame:
+    """ETF_LIST 전 종목의 가격 데이터를 로드하고 전처리한다.
+
+    분배금 파일이 있으면 분배금 컬럼을 병합하고, ``ETF_RETURN_BASIS``에 따라
+    ``close_adj``(랭킹 기준 수익률용), ``ret_60``, ``ret_120`` 등을 계산한다.
+    """
     frames = []
     failed = []
     empty = []
@@ -737,9 +745,16 @@ def run_etf_strategy(
     use_market_filter: bool = True,
     max_positions: int = ETF_MAX_POSITIONS,
     slippage: float = SLIPPAGE_PCT,
+    # noqa: PLR0913 — 전략 파라미터가 많음
     risk_off_liquidate: bool = True,
     price_data: pd.DataFrame | None = None,
 ):
+    """ETF 로테이션 전략을 백테스트한다.
+
+    리밸런싱 시점에서 랭킹 상위 종목을 매수하고, 분배락일에는 보유 수량에 한하여
+    현금분배금을 계산해 자산에 반영한다. 같은 날 신규 매수분에는 분배금이 귀속되지
+    않는다.
+    """
     price = price_data.copy() if price_data is not None else load_etf_price()
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
 
@@ -903,6 +918,11 @@ def run_etf_strategy(
 
 
 def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timestamp]) -> pd.DataFrame:
+    """KODEX200 벤치마크 바이앤홀드 전략을 백테스트한다.
+
+    ``ETF_RETURN_BASIS=total_return``이면 분배금을 현금으로 수령해 자산에 반영한다
+    (실전에서는 증권사 예수금에 자동 반영되므로 러너와 동일한 랭킹만 공유).
+    """
     price = get_price(BENCHMARK_TICKER)
     if price.empty:
         raise RuntimeError(f"No benchmark data for {BENCHMARK_TICKER}")

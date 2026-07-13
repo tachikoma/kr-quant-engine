@@ -59,7 +59,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `ETF_RETURN_BASIS=price|nav|total_return`: 랭킹 수익률 기준. `total_return`은 검증된
   현금분배금을 분배락일에 재투자합니다(기본 `price`).
 - `ETF_DISTRIBUTIONS_FILE`: 정규화 분배금 CSV 경로(기본 `data/etf_distributions.csv`)
-- `ETF_DISTRIBUTION_TAX_PCT`: 분배금 현금 귀속 시 적용할 세율(기본 `0`, gross return)
+- `ETF_DISTRIBUTION_TAX_PCT`: 분배금 현금 귀속 시 적용할 세율(기본 `0`, gross return). 백테스트 전용(라이브는 증권사 예수금에 자동 반영)
 - `MIN_LISTING_DAYS`: 최소 상장 거래일 필터. 기본 `60`
 - `MAX_PREMIUM_DISCOUNT`: NAV 대비 괴리율 절대값 임계. 기본 `0.02` (2%)
 

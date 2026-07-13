@@ -506,6 +506,11 @@ def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 def _load_snapshot(
     etf_list: list[str], lookback_days: int = 220, ticker_names: dict[str, str] | None = None
 ) -> pd.DataFrame:
+    """지정 기간의 ETF 가격 스냅샷을 로드하고 전처리한다.
+
+    분배금 병합 → 유동성/상장일/괴리율 플래그 → 수익률 기준 컬럼(price/nav/total_return)
+    순서로 처리하여 랭킹에 사용할 수 있는 DataFrame을 반환한다.
+    """
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=lookback_days)
     start = _date_to_krx(start_day)
@@ -545,7 +550,7 @@ def _load_snapshot(
         raise RuntimeError("ETF 가격 데이터가 비어 있습니다.")
 
     price_df = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).copy()
-    # 백테스트와 동일 전처리: 유동성 플래그 + 기준가 컬럼
+    # 백테스트와 동일 전처리: 분배금 병합 + 유동성/상장일/괴리율 플래그 + 수익률 기준 컬럼
     return_basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
     distributions = load_distributions(required=return_basis == "total_return")
     price_df = add_distributions(price_df, distributions)
