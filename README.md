@@ -194,6 +194,8 @@ uv run scripts/monitor_outputs.py                        # 출력 파일 모니�
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증
 uv run scripts/validate_etf_distributions.py             # 분배금 파일 범위·해시 점검
+uv run scripts/parameter_stability.py                     # 현재 설정 주변값 안정성 검증
+uv run scripts/trade_performance_attribution.py           # 비용 포함 거래별·종목별 성과 분해
 ```
 
 ## 표본외 검증 기준
@@ -220,6 +222,24 @@ uv run scripts/validate_etf_distributions.py             # 분배금 파일 범�
 - `WF_STEP_YEARS=1`
 - `WF_ANCHORED=0`: `0`은 rolling window, `1`은 expanding window
 - `WF_BOUNDARY_COST_PCT=0.0015`: 각 테스트 폴드 시작 시 전량 교체를 가정한 비용
+
+### 파라미터 주변값 안정성
+
+`uv run scripts/parameter_stability.py`는 현재 설정을 중심으로 기본 27개 조합을 실행합니다.
+
+- 리밸런싱: 현재값 ±5거래일
+- 최대 보유 종목: 현재값 ±1
+- 종목별 비중 한도: 현재값 ±15%p
+
+`STABILITY_REBALANCE_DAYS`, `STABILITY_MAX_POSITIONS`, `STABILITY_MAX_ASSET_PCT`로 격자를
+재정의할 수 있으며 결과는 `outputs_stability/`에 저장됩니다.
+
+### 거래별 성과 분해
+
+`uv run scripts/trade_performance_attribution.py`는 `outputs_etf_only/etf_trades.csv`의 비용 포함
+`net_value`를 FIFO로 매칭해 완결 거래별 순손익·보유기간과 종목별 기여도를 계산합니다. 결과는
+`outputs_trade_analysis/`에 저장됩니다. 예전 거래 파일처럼 `net_value`가 없으면 가격×수량으로
+근사하며 요약의 `cost_aware`가 `false`로 표시됩니다.
 
 ## Python/uv 운영
 

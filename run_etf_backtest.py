@@ -748,6 +748,7 @@ def run_etf_strategy(
     # noqa: PLR0913 — 전략 파라미터가 많음
     risk_off_liquidate: bool = True,
     price_data: pd.DataFrame | None = None,
+    max_asset_pct: float | None = None,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
@@ -824,7 +825,11 @@ def run_etf_strategy(
                     latest_sell_prices[t] = op * (1 - SPREAD_PCT / 2)
 
             # 실전 주문 생성 로직 재사용
-            max_asset_pct = parse_fraction_env("MAX_ASSET_PCT", 0.50)
+            effective_max_asset_pct = (
+                max_asset_pct
+                if max_asset_pct is not None
+                else parse_fraction_env("MAX_ASSET_PCT", 0.50)
+            )
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,
@@ -841,7 +846,7 @@ def run_etf_strategy(
                 taxable_tickers=TAXABLE_ETF_TICKERS,
                 allow_empty_target_sell=not kospi_risk_on if risk_off_liquidate else False,
                 generate_orders=True,
-                max_asset_pct=max_asset_pct,
+                max_asset_pct=effective_max_asset_pct,
                 ticker_names=ticker_names,
             )
 
@@ -866,6 +871,9 @@ def run_etf_strategy(
                             "reason": o.get("reason", "ETF_REBALANCE"),
                             "qty": qty,
                             "price": ref_price,
+                            "net_value": float(o.get("estimated_value", 0.0)),
+                            "cash_flow": float(o.get("estimated_value", 0.0)),
+                            "estimated_tax": float(o.get("estimated_tax", 0.0)),
                             "cash_after": cash,
                         }
                     )
@@ -891,6 +899,9 @@ def run_etf_strategy(
                             "reason": o.get("reason", "ETF_REBALANCE"),
                             "qty": qty,
                             "price": ref_price,
+                            "net_value": cost,
+                            "cash_flow": -cost,
+                            "estimated_tax": 0.0,
                             "cash_after": cash,
                         }
                     )
