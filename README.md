@@ -189,6 +189,7 @@ uv run scripts/extract_top_losses.py                     # 최대 손실 거래 
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
+uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증
 ```
 
 ## 표본외 검증 기준
@@ -199,6 +200,22 @@ uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 
 - 후보군 또는 파라미터를 변경하면 기존 표본외 트랙과 섞지 말고 새 동결 버전을 만듭니다.
 - `uv run scripts/check_strategy_freeze.py`는 현재 `.env` 포함 유효 설정의 변경 여부를 확인하고,
   `outputs_etf_only/etf_equity_curve.csv`에 표본외 관측치가 2개 이상이면 해당 성과를 출력합니다.
+
+### Walk-forward 검증
+
+`uv run scripts/walk_forward_validation.py`는 기본적으로 직전 3년 학습 구간에서
+`리밸런싱 주기(10/20/30일) × 최대 보유 종목 수(1/2/3)` 중 Sharpe가 가장 높은 조합을 선택하고,
+바로 다음 1년을 표본외로 평가합니다. 학습창은 1년씩 이동하며 결과는
+`outputs_walk_forward/`에 저장됩니다. 이 분석은 전략 연구용이며 `strategy_freeze.json`의 공식
+표본외 트랙을 대체하지 않습니다.
+
+- `WF_REBALANCE_DAYS=10,20,30`
+- `WF_MAX_POSITIONS=1,2,3`
+- `WF_TRAIN_YEARS=3`
+- `WF_TEST_YEARS=1`
+- `WF_STEP_YEARS=1`
+- `WF_ANCHORED=0`: `0`은 rolling window, `1`은 expanding window
+- `WF_BOUNDARY_COST_PCT=0.0015`: 각 테스트 폴드 시작 시 전량 교체를 가정한 비용
 
 ## Python/uv 운영
 

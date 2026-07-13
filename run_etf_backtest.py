@@ -717,8 +717,17 @@ def load_etf_price() -> pd.DataFrame:
 
 
 
-def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], index_df: pd.DataFrame, use_market_filter: bool = True, max_positions: int = ETF_MAX_POSITIONS, slippage: float = SLIPPAGE_PCT, risk_off_liquidate: bool = True):
-    price = load_etf_price()
+def run_etf_strategy(
+    initial_cash: float,
+    common_dates: list[pd.Timestamp],
+    index_df: pd.DataFrame,
+    use_market_filter: bool = True,
+    max_positions: int = ETF_MAX_POSITIONS,
+    slippage: float = SLIPPAGE_PCT,
+    risk_off_liquidate: bool = True,
+    price_data: pd.DataFrame | None = None,
+):
+    price = price_data.copy() if price_data is not None else load_etf_price()
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
 
     cash = float(initial_cash)
