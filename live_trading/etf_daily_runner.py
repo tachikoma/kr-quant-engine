@@ -75,6 +75,7 @@ from etf_shared import (
     add_price_basis_columns,
 )
 from config_utils import parse_pct_env, parse_fraction_env
+from etf_distributions import add_distributions, load_distributions
 
 try:
     from pykrx_utils import format_ticker as _format_ticker
@@ -545,6 +546,9 @@ def _load_snapshot(
 
     price_df = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).copy()
     # 백테스트와 동일 전처리: 유동성 플래그 + 기준가 컬럼
+    return_basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
+    distributions = load_distributions(required=return_basis == "total_return")
+    price_df = add_distributions(price_df, distributions)
     listing_dates = get_listing_dates(ticker_subset=set(map(str, etf_list)))
     price_df = add_liquidity_flag(price_df)
     price_df = add_listing_flag(price_df, listing_dates)

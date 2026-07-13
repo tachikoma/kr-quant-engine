@@ -33,6 +33,7 @@ def load_dotenv() -> None:
 load_dotenv()
 
 from config_utils import parse_fraction_env, parse_pct_env
+from etf_distributions import distributions_file_sha256, distributions_path
 from etf_shared import (
     ETF_DEVIATION_THRESHOLD_BY_GROUP,
     ETF_DEVIATION_THRESHOLD_BY_TICKER,
@@ -55,6 +56,9 @@ def current_strategy_payload() -> dict:
         "universe": list(ETF_LIST),
         "parameters": {
             "return_basis": cfg.get("return_basis", "price"),
+            "distributions_file": str(distributions_path()),
+            "distributions_sha256": distributions_file_sha256(),
+            "distribution_tax_pct": parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
             "min_listing_days": cfg.get("min_listing_days", 60),
             "max_premium_discount": cfg.get("max_premium_discount", 0.02),
             "deviation_threshold_by_group": dict(ETF_DEVIATION_THRESHOLD_BY_GROUP),

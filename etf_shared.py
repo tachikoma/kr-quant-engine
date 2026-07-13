@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from config_utils import parse_pct_env
+from etf_distributions import add_total_return_price
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,11 @@ def add_deviation_flag(price: pd.DataFrame) -> pd.DataFrame:
 def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
     price = price.copy()
     basis = os.environ.get("ETF_RETURN_BASIS", "price").strip().lower()
+    if basis == "total_return":
+        price = add_total_return_price(price)
+        price["close_adj"] = price["close_total_return"]
+        logger.info("[etf_shared] return basis = total_return (현금분배금 즉시 재투자)")
+        return price
     if basis == "nav" and "nav" in price.columns:
         nav = pd.to_numeric(price["nav"], errors="coerce")
         if nav.notna().any():
@@ -328,7 +334,11 @@ def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
             logger.info("[etf_shared] return basis = NAV (총수익률 근사, 분배형 ETF는 한계 있음)")
             return price
         logger.info("[etf_shared] ETF_RETURN_BASIS=nav 이나 NAV 데이터 없음 \u2192 price 폴백")
+        price["close_adj"] = price["close"]
+        return price
 
+    if basis != "price":
+        raise ValueError(f"지원하지 않는 ETF_RETURN_BASIS={basis!r}; price|nav|total_return 사용")
     price["close_adj"] = price["close"]
     return price
 

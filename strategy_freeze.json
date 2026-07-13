@@ -22,6 +22,9 @@
   ],
   "parameters": {
     "return_basis": "price",
+    "distributions_file": "data/etf_distributions.csv",
+    "distributions_sha256": "bba9bc4075612a2aa6d40244fed5ff4d32953fcbf5560e0ddbe5392a40c0405f",
+    "distribution_tax_pct": 0.0,
     "min_listing_days": 60,
     "max_premium_discount": 0.02,
     "deviation_threshold_by_group": {
@@ -75,5 +78,5 @@
     "486290",
     "498400"
   ],
-  "sha256": "d31f22e20548c83e92188f3a21f42398423ec661595e6a7670a808afa715a7c5"
+  "sha256": "5d5a038549c94a267921f5f5c9a4a7f14b736361e75edcefc7b36d81cc53d68e"
 }

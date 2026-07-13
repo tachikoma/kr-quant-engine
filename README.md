@@ -56,7 +56,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `BROKER_TYPE=KIWOOM|KIS`: 증권사 선택 (기본 KIWOOM)
 - `ETF_LIST`: 티커 쉼표 목록으로 ETF 후보풀 오버라이드 (예: `069500,091160`)
 - `MIN_AVG_TRADING_VALUE`: trailing 60거래일 평균 거래대금 기준 유동성 임계값(원). 기본 `1000000000` (10억). 미달 시 리밸런싱 snapshot에서 제외 (백테스트/라이브 공통)
-- `ETF_RETURN_BASIS=price|nav`: 랭킹 수익률 기준. `nav`는 NAV 기반 총수익률 근사(기본 `price`)
+- `ETF_RETURN_BASIS=price|nav|total_return`: 랭킹 수익률 기준. `total_return`은 검증된
+  현금분배금을 분배락일에 재투자합니다(기본 `price`).
+- `ETF_DISTRIBUTIONS_FILE`: 정규화 분배금 CSV 경로(기본 `data/etf_distributions.csv`)
+- `ETF_DISTRIBUTION_TAX_PCT`: 분배금 현금 귀속 시 적용할 세율(기본 `0`, gross return)
 - `MIN_LISTING_DAYS`: 최소 상장 거래일 필터. 기본 `60`
 - `MAX_PREMIUM_DISCOUNT`: NAV 대비 괴리율 절대값 임계. 기본 `0.02` (2%)
 
@@ -190,6 +193,7 @@ uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증
+uv run scripts/validate_etf_distributions.py             # 분배금 파일 범위·해시 점검
 ```
 
 ## 표본외 검증 기준
@@ -225,9 +229,37 @@ uv run scripts/walk_forward_validation.py                # 롤링 walk-forward �
 - **패키지 제거**: `uv remove package-name`
 - **락파일 갱신**: `uv lock`
 
+## 분배금 포함 수익률
+
+`data/etf_distributions.csv`에 KRX KIND 또는 운용사 공시로 확인한 이벤트를 다음 스키마로
+입력합니다.
+
+```csv
+ticker,ex_date,amount_per_share,payment_date,source
+000000,2024-04-29,100,2024-05-03,공시 URL
+```
+
+- `ex_date`는 지급기준일이나 지급일이 아니라 실제 분배락 거래일이어야 합니다.
+- `amount_per_share`는 ETF 1좌당 현금분배금(원)입니다.
+- 동일 종목·분배락일의 중복 행은 합산됩니다.
+- 가격 데이터에 없는 분배락일은 오류로 처리합니다.
+- `ETF_RETURN_BASIS=total_return`일 때 파일이 비어 있으면 실행을 중단합니다.
+- 랭킹은 분배금을 즉시 재투자한 지수를 사용하고, 포트폴리오는 분배락 직전 보유수량에
+  분배금을 귀속해 당일 종가 자산에 반영합니다. 같은 날 신규 매수분에는 귀속하지 않습니다.
+- 데일리 러너도 같은 total-return 랭킹을 사용하며, 실제 분배금 현금은 증권사 예수금에
+  반영되므로 러너가 별도로 현금을 가산하지 않습니다.
+- 현재 저장소의 CSV는 스키마 템플릿입니다. 장기 공시 이력을 채우기 전에는
+  `total_return` 모드를 사용하면 안 됩니다.
+
+분배금 파일이 바뀌면 SHA-256도 바뀌므로 `check_strategy_freeze.py`가 공식 표본외 설정 변경으로
+감지합니다.
+
 ## 알려진 한계 (Known Limitations)
 
-- **총수익률 근사 한계**: 기본값(`ETF_RETURN_BASIS=price`)은 가격수익률(price return) 기준입니다. `ETF_RETURN_BASIS=nav`를 설정하면 NAV 기반으로 랭킹을 계산해 비분배형 ETF의 총수익률에 더 가깝게 근사합니다. 다만 고배당/커버드콜 등 분배형 ETF의 실제 분배금 재투자 성과는 완전히 반영되지 않으므로, 완전한 total return 검증에는 별도 분배금 이력 보충이 필요합니다.
+- `nav`는 분배형 ETF의 total return을 완전히 반영하지 않습니다. 정확한 검증에는 검증된
+  전체 분배금 이력과 `total_return` 모드를 사용해야 합니다.
+- `ETF_DISTRIBUTION_TAX_PCT`는 모든 분배금에 동일 세율을 적용하는 단순 모델입니다. 실제
+  과표기준가별 과세액을 재현하려면 이벤트별 과세표준 데이터가 추가로 필요합니다.
 
 ## 주의사항
 

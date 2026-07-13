@@ -11,6 +11,13 @@ import pandas as pd
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
 from config_utils import parse_pct_env, parse_fraction_env
+from etf_distributions import (
+    add_distributions,
+    distribution_cash_for_holdings,
+    distributions_file_sha256,
+    distributions_path,
+    load_distributions,
+)
 
 
 def load_dotenv(dotenv_path: str | Path | None = None) -> None:
@@ -230,6 +237,10 @@ class _RefreshPriceCacheRequired(Exception):
 
 def _return_basis_requires_nav() -> bool:
     return os.environ.get("ETF_RETURN_BASIS", "price").strip().lower() == "nav"
+
+
+def _return_basis_requires_distributions() -> bool:
+    return os.environ.get("ETF_RETURN_BASIS", "price").strip().lower() == "total_return"
 
 
 def _ensure_price_cache_schema(df: pd.DataFrame, ticker: str) -> None:
@@ -701,6 +712,8 @@ def load_etf_price() -> pd.DataFrame:
         except Exception:
             price["ticker"] = price["ticker"].apply(lambda x: str(x))
 
+    distributions = load_distributions(required=_return_basis_requires_distributions())
+    price = add_distributions(price, distributions)
     listing_dates = get_listing_dates(ticker_subset=set(map(str, ETF_LIST)))
     price = add_liquidity_flag(price)
     price = add_listing_flag(price, listing_dates)
@@ -752,6 +765,12 @@ def run_etf_strategy(
 
         next_open = next_day["open"]
         next_close = next_day["close"]
+        entitled_holdings = dict(holdings)
+        distribution_cash = distribution_cash_for_holdings(
+            entitled_holdings,
+            next_day.get("distribution"),
+            parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
+        )
         update_last_valid_prices(last_valid_closes, today.get("close"))
         should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
 
@@ -861,6 +880,7 @@ def run_etf_strategy(
                         }
                     )
 
+        cash += distribution_cash
         update_last_valid_prices(last_valid_closes, next_close)
         market_value = 0.0
         for ticker, qty in holdings.items():
@@ -875,6 +895,7 @@ def run_etf_strategy(
                 "cash": cash,
                 "market_value": market_value,
                 "holdings": ",".join(sorted(map(str, holdings.keys()))),
+                "distribution_cash": distribution_cash,
             }
         )
 
@@ -886,6 +907,8 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
     if price.empty:
         raise RuntimeError(f"No benchmark data for {BENCHMARK_TICKER}")
 
+    distributions = load_distributions(required=_return_basis_requires_distributions())
+    price = add_distributions(price, distributions)
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
     cash = float(initial_cash)
     qty = 0
@@ -905,6 +928,7 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
 
         next_open = next_day["open"]
         next_close = next_day["close"]
+        entitled_qty = qty
 
         if not bought:
             open_price = safe_get(next_open, BENCHMARK_TICKER)
@@ -918,6 +942,12 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
                 cash -= qty * unit_cost
                 bought = True
 
+        distribution_cash = distribution_cash_for_holdings(
+            {BENCHMARK_TICKER: entitled_qty},
+            next_day.get("distribution"),
+            parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
+        )
+        cash += distribution_cash
         close_price = get_valuation_price(BENCHMARK_TICKER, next_close, last_valid_closes)
         market_value = qty * close_price if close_price is not None else 0.0
         equity_rows.append(
@@ -926,6 +956,7 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
                 "equity_kodex200_bh": cash + market_value,
                 "cash_kodex200_bh": cash,
                 "market_value_kodex200_bh": market_value,
+                "distribution_cash_kodex200_bh": distribution_cash,
             }
         )
 
@@ -1278,6 +1309,9 @@ def _build_performance_config() -> dict:
     return {
         "run_mode": RUN_MODE,
         "return_basis": strategy_cfg.get("return_basis", "price"),
+        "distributions_file": str(distributions_path()),
+        "distributions_sha256": distributions_file_sha256(),
+        "distribution_tax_pct": parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
         "min_listing_days": strategy_cfg.get("min_listing_days", 60),
         "max_premium_discount": strategy_cfg.get("max_premium_discount", 0.02),
         "min_avg_trading_value": strategy_cfg.get("min_avg_trading_value", 1_000_000_000),
@@ -1459,7 +1493,14 @@ def main():
     if RUN_MODE == "single":
         curve_to_save = result.copy()
         curve_to_save = curve_to_save.rename(columns={"equity": "equity_strategy", "equity_kodex200_bh": "equity_benchmark"})
-        save_cols = ["date", "equity_strategy", "cash", "market_value", "holdings"]
+        save_cols = [
+            "date",
+            "equity_strategy",
+            "cash",
+            "market_value",
+            "holdings",
+            "distribution_cash",
+        ]
         if "equity_benchmark" in curve_to_save.columns:
             save_cols.append("equity_benchmark")
         curve_to_save[save_cols].to_csv(OUTPUT_DIR / "etf_equity_curve.csv", index=False, encoding="utf-8-sig")
