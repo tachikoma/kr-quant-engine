@@ -188,7 +188,17 @@ uv run scripts/compare_filtered_vs_baseline.py           # 필터 vs 베이스�
 uv run scripts/extract_top_losses.py                     # 최대 손실 거래 추출
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
+uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 ```
+
+## 표본외 검증 기준
+
+- `strategy_freeze.json`은 2026-07-13 종료 시점의 후보군과 실전 파라미터를 동결합니다.
+- 2026-07-13까지의 데이터와 실험 결과는 모두 in-sample로 취급합니다.
+- 표본외(out-of-sample) 시작일은 다음 거래일인 2026-07-14입니다.
+- 후보군 또는 파라미터를 변경하면 기존 표본외 트랙과 섞지 말고 새 동결 버전을 만듭니다.
+- `uv run scripts/check_strategy_freeze.py`는 현재 `.env` 포함 유효 설정의 변경 여부를 확인하고,
+  `outputs_etf_only/etf_equity_curve.csv`에 표본외 관측치가 2개 이상이면 해당 성과를 출력합니다.
 
 ## Python/uv 운영
 

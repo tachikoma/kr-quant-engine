@@ -70,8 +70,10 @@ from etf_shared import (
     add_liquidity_flag,
     add_listing_flag,
     add_price_basis_columns,
+    get_valuation_price,
     get_strategy_config,
     is_ticker_risk_on,
+    update_last_valid_prices,
 )
 
 strategy_cfg = get_strategy_config()
@@ -722,6 +724,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
     cash = float(initial_cash)
     holdings = {}
     holding_cost_basis = {}
+    last_valid_closes: dict[str, float] = {}
     trades = []
     equity_rows = []
 
@@ -740,6 +743,7 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
 
         next_open = next_day["open"]
         next_close = next_day["close"]
+        update_last_valid_prices(last_valid_closes, today.get("close"))
         should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
 
         if should_rebalance:
@@ -848,9 +852,10 @@ def run_etf_strategy(initial_cash: float, common_dates: list[pd.Timestamp], inde
                         }
                     )
 
+        update_last_valid_prices(last_valid_closes, next_close)
         market_value = 0.0
         for ticker, qty in holdings.items():
-            close_price = safe_get(next_close, ticker)
+            close_price = get_valuation_price(ticker, next_close, last_valid_closes)
             if close_price is not None:
                 market_value += qty * close_price
 
@@ -876,13 +881,18 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
     cash = float(initial_cash)
     qty = 0
     bought = False
+    last_valid_closes: dict[str, float] = {}
     equity_rows = []
 
-    for i, _dt in enumerate(common_dates[:-1]):
+    for i, current_dt in enumerate(common_dates[:-1]):
         next_dt = common_dates[i + 1]
+        current_day = price_by_date.get(current_dt, pd.DataFrame())
         next_day = price_by_date.get(next_dt, pd.DataFrame())
         if next_day.empty:
             continue
+
+        if not current_day.empty:
+            update_last_valid_prices(last_valid_closes, current_day.get("close"))
 
         next_open = next_day["open"]
         next_close = next_day["close"]
@@ -899,7 +909,7 @@ def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timesta
                 cash -= qty * unit_cost
                 bought = True
 
-        close_price = safe_get(next_close, BENCHMARK_TICKER)
+        close_price = get_valuation_price(BENCHMARK_TICKER, next_close, last_valid_closes)
         market_value = qty * close_price if close_price is not None else 0.0
         equity_rows.append(
             {

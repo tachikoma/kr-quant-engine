@@ -333,6 +333,42 @@ def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
     return price
 
 
+def update_last_valid_prices(
+    last_valid_prices: dict[str, float], prices: pd.Series | dict | None
+) -> None:
+    """양수인 최신 가격만 직전 유효가격 저장소에 반영한다."""
+    if prices is None:
+        return
+    items = prices.items() if hasattr(prices, "items") else []
+    for ticker, raw_price in items:
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(price) and price > 0:
+            last_valid_prices[str(ticker)] = price
+
+
+def get_valuation_price(
+    ticker: str, current_prices: pd.Series | dict | None, last_valid_prices: dict[str, float]
+) -> float | None:
+    """현재 가격을 우선 사용하고, 결측이면 직전 유효가격을 반환한다."""
+    raw_price = None
+    if current_prices is not None:
+        try:
+            raw_price = current_prices.get(ticker)
+        except AttributeError:
+            raw_price = None
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        price = None
+    if price is not None and pd.notna(price) and price > 0:
+        last_valid_prices[str(ticker)] = price
+        return price
+    return last_valid_prices.get(str(ticker))
+
+
 def zscore(series: pd.Series) -> pd.Series:
     # replace에서의 암묵적 다운캐스팅 경고를 피하기 위해 infer_objects를 적용합니다.
     series = series.replace([np.inf, -np.inf], np.nan).infer_objects(copy=False)
