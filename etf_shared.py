@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import numpy as np
 import pandas as pd
 
 from config_utils import parse_pct_env
+
+logger = logging.getLogger(__name__)
 
 BUY_FEE_PCT = 0.00015
 SELL_FEE_PCT = 0.00015
@@ -49,6 +52,7 @@ def _parse_threshold_dict_env(name: str, default: dict[str, float]) -> dict[str,
             continue
     return result or default
 
+
 # 현재 전략에서 매매차익 과세를 반영할 기타 ETF 후보입니다.
 TAXABLE_ETF_TICKERS = {
     "143850",  # KODEX 미국S&P500선물(H)
@@ -57,7 +61,7 @@ TAXABLE_ETF_TICKERS = {
     "133690",  # TIGER 미국나스닥100
     "472150",  # TIGER 배당커버드콜액티브
     "486290",  # TIGER 미국나스닥100타겟데일리커버드콜
-    "498400",  # KODEX 200타겟위클리커버드콜  
+    "498400",  # KODEX 200타겟위클리커버드콜
     "411060",  # ACE KRX금현물
 }
 
@@ -83,7 +87,7 @@ ETF_LIST = [
     "091170",  # KODEX 은행
     "472150",  # TIGER 배당커버드콜액티브
     "486290",  # TIGER 미국나스닥100타겟데일리커버드콜
-    "498400",  # KODEX 200타겟위클리커버드콜    
+    "498400",  # KODEX 200타겟위클리커버드콜
     "411060",  # ACE KRX금현물
     "367760",  # RISE 네트워크인프라
 ]
@@ -102,11 +106,15 @@ if env_list:
             taxable = get_taxable_tickers(ticker_subset=set(ETF_LIST))
             if taxable is not None:
                 TAXABLE_ETF_TICKERS = taxable
-                print(f"[etf_shared] TAXABLE_ETF_TICKERS auto-computed from KRX data: {len(TAXABLE_ETF_TICKERS)} tickers")
+                print(
+                    f"[etf_shared] TAXABLE_ETF_TICKERS auto-computed from KRX data: {len(TAXABLE_ETF_TICKERS)} tickers"
+                )
             else:
                 # KRX API 실패 → hardcoded set에서 ETF_LIST에 있는 것만 유지
                 TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
-                print(f"[etf_shared] TAXABLE_ETF_TICKERS fallback (filtered hardcoded): {len(TAXABLE_ETF_TICKERS)} tickers")
+                print(
+                    f"[etf_shared] TAXABLE_ETF_TICKERS fallback (filtered hardcoded): {len(TAXABLE_ETF_TICKERS)} tickers"
+                )
         except Exception:
             TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
 
@@ -116,7 +124,9 @@ if env_taxable:
     parsed_taxable = {t.strip() for t in env_taxable.split(",") if t.strip()}
     if parsed_taxable:
         TAXABLE_ETF_TICKERS = parsed_taxable
-        print(f"[etf_shared] TAXABLE_ETF_TICKERS overridden from env: {len(TAXABLE_ETF_TICKERS)} tickers")
+        print(
+            f"[etf_shared] TAXABLE_ETF_TICKERS overridden from env: {len(TAXABLE_ETF_TICKERS)} tickers"
+        )
 ETF_MAX_POSITIONS = 2
 ETF_SELL_RANK_BUFFER = 3
 
@@ -151,26 +161,27 @@ ETF_DEVIATION_THRESHOLD_BY_TICKER: dict[str, float] = _parse_threshold_dict_env(
 # ETF 그룹 분류: 그룹별 시장필터 override에 사용
 # foreign_investment / commodity 그룹은 KOSPI risk_off여도 보유/매수 가능
 ETF_TICKER_GROUPS: dict[str, str] = {
-    "069500": "domestic_equity",   # KODEX 200
-    "091160": "domestic_equity",   # KODEX 반도체
-    "102110": "domestic_equity",   # TIGER 200
-    "0101N0": "domestic_equity",   # RISE AI전력인프라
-    "463250": "domestic_equity",   # TIGER K방산&우주
-    "161510": "domestic_equity",   # PLUS 고배당주
-    "091170": "domestic_equity",   # KODEX 은행
-    "367760": "domestic_equity",   # RISE 네트워크인프라
-    "143850": "foreign_investment",   # TIGER 미국S&P500선물(H)
-    "360200": "foreign_investment",   # ACE 미국S&P500
-    "360750": "foreign_investment",   # TIGER 미국S&P500
-    "133690": "foreign_investment",   # TIGER 미국나스닥100
-    "472150": "foreign_investment",   # TIGER 배당커버드콜액티브
-    "486290": "foreign_investment",   # TIGER 미국나스닥100타겟데일리커버드콜
-    "498400": "foreign_investment",   # KODEX 200타겟위클리커버드콜
-    "411060": "commodity",            # ACE KRX금현물
+    "069500": "domestic_equity",  # KODEX 200
+    "091160": "domestic_equity",  # KODEX 반도체
+    "102110": "domestic_equity",  # TIGER 200
+    "0101N0": "domestic_equity",  # RISE AI전력인프라
+    "463250": "domestic_equity",  # TIGER K방산&우주
+    "161510": "domestic_equity",  # PLUS 고배당주
+    "091170": "domestic_equity",  # KODEX 은행
+    "367760": "domestic_equity",  # RISE 네트워크인프라
+    "143850": "foreign_investment",  # TIGER 미국S&P500선물(H)
+    "360200": "foreign_investment",  # ACE 미국S&P500
+    "360750": "foreign_investment",  # TIGER 미국S&P500
+    "133690": "foreign_investment",  # TIGER 미국나스닥100
+    "472150": "foreign_investment",  # TIGER 배당커버드콜액티브
+    "486290": "foreign_investment",  # TIGER 미국나스닥100타겟데일리커버드콜
+    "498400": "foreign_investment",  # KODEX 200타겟위클리커버드콜
+    "411060": "commodity",  # ACE KRX금현물
 }
 
 # KOSPI risk_off여도 거래를 허용할 그룹 (외국 투자, 원자재는 방어자산 역할)
 GROUP_RISK_OVERRIDE: set[str] = {"foreign_investment", "commodity"}
+
 
 def get_etf_group(ticker: str) -> str:
     return ETF_TICKER_GROUPS.get(ticker, "domestic_equity")
@@ -246,7 +257,9 @@ def add_liquidity_flag(price: pd.DataFrame) -> pd.DataFrame:
     return price
 
 
-def add_listing_flag(price: pd.DataFrame, listing_dates: dict[str, str] | None = None) -> pd.DataFrame:
+def add_listing_flag(
+    price: pd.DataFrame, listing_dates: dict[str, str] | None = None
+) -> pd.DataFrame:
     price = price.sort_values(["ticker", "date"]).copy()
     min_days = max(int(MIN_LISTING_DAYS), 0)
     if min_days <= 0:
@@ -312,9 +325,9 @@ def add_price_basis_columns(price: pd.DataFrame) -> pd.DataFrame:
         if nav.notna().any():
             close = pd.to_numeric(price["close"], errors="coerce")
             price["close_adj"] = nav.where(nav.notna() & (nav > 0), close)
-            print("[etf_shared] return basis = NAV (총수익률 근사, 분배형 ETF는 한계 있음)")
+            logger.info("[etf_shared] return basis = NAV (총수익률 근사, 분배형 ETF는 한계 있음)")
             return price
-        print("[etf_shared] ETF_RETURN_BASIS=nav 이나 NAV 데이터 없음 → price 폴백")
+        logger.info("[etf_shared] ETF_RETURN_BASIS=nav 이나 NAV 데이터 없음 \u2192 price 폴백")
 
     price["close_adj"] = price["close"]
     return price
@@ -334,13 +347,30 @@ def zscore(series: pd.Series) -> pd.Series:
 
 def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
     df = snapshot.copy()
+    n = len(df)
+    steps: list[str] = []
+
     if "liquidity_ok" in df.columns:
+        n_before = len(df)
         df = df[df["liquidity_ok"]].copy()
+        steps.append(f"liquidity: {n_before}\u2192{len(df)}")
+
     if "listing_ok" in df.columns:
+        n_before = len(df)
         df = df[df["listing_ok"]].copy()
+        steps.append(f"listing: {n_before}\u2192{len(df)}")
+
     if "deviation_ok" in df.columns:
+        n_before = len(df)
         df = df[df["deviation_ok"]].copy()
+        steps.append(f"deviation: {n_before}\u2192{len(df)}")
+
+    n_before = len(df)
     df = df[df["ret_60"].notna() & df["ret_120"].notna() & df["trend_ok"]].copy()
+    steps.append(f"trend/return: {n_before}\u2192{len(df)}")
+
+    logger.info(f"[필터] {n}개 \u2192 {' | '.join(steps)}")
+
     if df.empty:
         return df
 
@@ -437,9 +467,15 @@ def build_rebalance_orders(
         if src is None:
             return {}
         if isinstance(src, pd.Series):
-            return {str(k): (float(v) if (v is not None and not pd.isna(v)) else None) for k, v in src.to_dict().items()}
+            return {
+                str(k): (float(v) if (v is not None and not pd.isna(v)) else None)
+                for k, v in src.to_dict().items()
+            }
         try:
-            return {str(k): (float(v) if (v is not None and not pd.isna(v)) else None) for k, v in dict(src).items()}
+            return {
+                str(k): (float(v) if (v is not None and not pd.isna(v)) else None)
+                for k, v in dict(src).items()
+            }
         except Exception:
             return {}
 
@@ -459,7 +495,9 @@ def build_rebalance_orders(
 
     base_prices = _to_price_dict(latest_prices)
     buy_prices = _to_price_dict(latest_buy_prices) if latest_buy_prices is not None else base_prices
-    sell_prices = _to_price_dict(latest_sell_prices) if latest_sell_prices is not None else base_prices
+    sell_prices = (
+        _to_price_dict(latest_sell_prices) if latest_sell_prices is not None else base_prices
+    )
     cost_basis_map = _to_float_dict(current_cost_basis)
 
     # 대상 티커 목록을 문자열 리스트로 정리
@@ -468,15 +506,19 @@ def build_rebalance_orders(
 
     # generate_orders=False이면 주문 생성 건너뜀
     if not generate_orders:
-        print("[주문계산] generate_orders=False — 리밸런싱 미실행으로 주문 생성 생략")
+        logger.info("[주문계산] generate_orders=False \u2014 리밸런싱 미실행으로 주문 생성 생략")
         return []
 
     # 빈 타겟 보호 로직
     if not targets and not allow_empty_target_sell:
-        print("[주문계산] target이 비어있고 빈 target에서 매도 허용이 아니므로 주문 생성 생략")
+        logger.info(
+            "[주문계산] target이 비어있고 빈 target에서 매도 허용이 아니므로 주문 생성 생략"
+        )
         return []
 
-    print(f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(targets)}개, max_positions={max_positions}, 예수금={cash:,.0f}")
+    logger.info(
+        f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(targets)}개, max_positions={max_positions}, 예수금={cash:,.0f}"
+    )
 
     # --- 매도 로직 ---
     for ticker, qty in list(holdings.items()):
@@ -493,12 +535,16 @@ def build_rebalance_orders(
         rank = target_rank.get(ticker)
         keep_by_rank = rank is not None and rank <= sell_rank_buffer
         if keep_by_rank:
-            print(f"[주문계산][매도스킵] {_dn(ticker)} 보유유지 (랭크={rank}, 버퍼={sell_rank_buffer})")
+            logger.info(
+                f"[주문계산][매도스킵] {_dn(ticker)} 보유유지 (랭크={rank}, 버퍼={sell_rank_buffer})"
+            )
             continue
 
         price = sell_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[주문계산][매도스킵] {_dn(ticker)} 매도가격 없음/비정상 (sell_price={price})")
+            logger.info(
+                f"[주문계산][매도스킵] {_dn(ticker)} 매도가격 없음/비정상 (sell_price={price})"
+            )
             continue
 
         try:
@@ -525,7 +571,7 @@ def build_rebalance_orders(
                 taxable_gain = max(0.0, gross_proceeds_adj - qty_i * cost_basis_per_share)
             estimated_tax = taxable_gain * max(tax_rate, 0.0)
         except Exception as e:
-            print(f"[주문계산][매도오류] {_dn(ticker)} estimated_value 계산 실패: {e}")
+            logger.info(f"[주문계산][매도오류] {_dn(ticker)} estimated_value 계산 실패: {e}")
             continue
 
         cash += float(estimated_value)
@@ -566,12 +612,14 @@ def build_rebalance_orders(
     buy_list = targets[:max_positions]
     buy_count = len(buy_list)
     budget = cash / buy_count if buy_count > 0 else 0
-    print(f"[주문계산] 매수 종목={[_dn(t) for t in buy_list]} (균등분배, 종목당 약 {budget:,.0f})")
+    logger.info(
+        f"[주문계산] 매수 종목={[_dn(t) for t in buy_list]} (균등분배, 종목당 약 {budget:,.0f})"
+    )
     if not buy_list or cash <= 0:
         if not buy_list:
-            print("[주문계산] 매수 대상 없음 → 주문 생성 종료")
+            logger.info("[주문계산] 매수 대상 없음 \u2192 주문 생성 종료")
         if cash <= 0:
-            print(f"[주문계산] 예수금 부족(cash={cash:,.0f}) → 주문 생성 종료")
+            logger.info(f"[주문계산] 예수금 부족(cash={cash:,.0f}) \u2192 주문 생성 종료")
         return orders
 
     # 기존 보유 종목의 평가액을 미리 계산 (cap이 total exposure를 제한하도록)
@@ -590,22 +638,24 @@ def build_rebalance_orders(
     for ticker in buy_list:
         price = buy_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[주문계산][매수스킵] {_dn(ticker)} 매수가격 없음/비정상 (buy_price={price})")
+            logger.info(
+                f"[주문계산][매수스킵] {_dn(ticker)} 매수가격 없음/비정상 (buy_price={price})"
+            )
             continue
 
         try:
             unit_cost = apply_buy_cost(float(price), slippage) * (1 + market_order_margin_rate)
         except Exception as e:
-            print(f"[주문계산][매수오류] {_dn(ticker)} unit_cost 계산 실패: {e}")
+            logger.info(f"[주문계산][매수오류] {_dn(ticker)} unit_cost 계산 실패: {e}")
             continue
 
         if unit_cost <= 0:
-            print(f"[주문계산][매수스킵] {_dn(ticker)} 단가 비정상 (unit_cost={unit_cost})")
+            logger.info(f"[주문계산][매수스킵] {_dn(ticker)} 단가 비정상 (unit_cost={unit_cost})")
             continue
 
         qty = int(budget // unit_cost)
         if qty <= 0:
-            print(
+            logger.info(
                 f"[주문계산][매수스킵] {_dn(ticker)} 수량 0 "
                 f"(budget={budget:,.0f}, unit_cost={unit_cost:,.0f})"
             )
@@ -617,10 +667,14 @@ def build_rebalance_orders(
             remaining_allowed = max_allowed_per_asset - existing_value
             allowed_qty = max(0, int(remaining_allowed // unit_cost))
             if allowed_qty <= 0:
-                print(f"[주문계산][cap] {_dn(ticker)} cap 초과 (기존 {existing_value:,.0f} + 신규 불가, max={max_allowed_per_asset:,.0f})")
+                logger.info(
+                    f"[주문계산][cap] {_dn(ticker)} cap 초과 (기존 {existing_value:,.0f} + 신규 불가, max={max_allowed_per_asset:,.0f})"
+                )
                 continue
             if qty > allowed_qty:
-                print(f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty} (기존 {existing_value:,.0f} + 신규 {allowed_qty * unit_cost:,.0f} <= {max_allowed_per_asset:,.0f})")
+                logger.info(
+                    f"[주문계산][cap] {_dn(ticker)} cap enforced: qty {qty} -> {allowed_qty} (기존 {existing_value:,.0f} + 신규 {allowed_qty * unit_cost:,.0f} <= {max_allowed_per_asset:,.0f})"
+                )
                 qty = allowed_qty
 
         cost = qty * unit_cost
@@ -628,7 +682,7 @@ def build_rebalance_orders(
             qty = int(cash // unit_cost)
             cost = qty * unit_cost
         if qty <= 0:
-            print(
+            logger.info(
                 f"[주문계산][매수스킵] {_dn(ticker)} 잔여예수금 부족 "
                 f"(cash={cash:,.0f}, unit_cost={unit_cost:,.0f})"
             )
@@ -647,7 +701,7 @@ def build_rebalance_orders(
             }
         )
 
-    print(
+    logger.info(
         f"[주문계산] 완료 | 매도={sum(1 for o in orders if o.get('side') == 'SELL')}건, "
         f"매수={sum(1 for o in orders if o.get('side') == 'BUY')}건"
     )

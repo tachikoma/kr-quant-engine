@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import sys
 import time
 import uuid
 from dataclasses import dataclass
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +48,9 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip()
-            if not (value.startswith('"') and value.endswith('"')) \
-               and not (value.startswith("'") and value.endswith("'")):
+            if not (value.startswith('"') and value.endswith('"')) and not (
+                value.startswith("'") and value.endswith("'")
+            ):
                 comment_idx = value.find(" #")
                 if comment_idx > 0:
                     value = value[:comment_idx].strip()
@@ -59,16 +62,27 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
 _load_dotenv()
 
 
-from etf_shared import build_rebalance_orders, get_strategy_config, rank_etfs, \
-    ETF_TAXABLE_SELL_TAX_PCT, TAXABLE_ETF_TICKERS, is_ticker_risk_on, \
-    add_deviation_flag, add_liquidity_flag, add_listing_flag, add_price_basis_columns
+from etf_shared import (
+    build_rebalance_orders,
+    get_strategy_config,
+    rank_etfs,
+    ETF_TAXABLE_SELL_TAX_PCT,
+    TAXABLE_ETF_TICKERS,
+    is_ticker_risk_on,
+    add_deviation_flag,
+    add_liquidity_flag,
+    add_listing_flag,
+    add_price_basis_columns,
+)
 from config_utils import parse_pct_env, parse_fraction_env
 
 try:
     from pykrx_utils import format_ticker as _format_ticker
 except Exception:
+
     def _format_ticker(ticker: str) -> str:  # type: ignore[misc]
         return ticker
+
 
 try:
     from live_trading.kiwoom_adapter import KiwoomAdapter
@@ -100,6 +114,8 @@ from pykrx_utils import (
 STATE_DIR = PROJECT_ROOT / "runtime_state"
 STATE_PATH = STATE_DIR / "etf_daily_state.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs_etf_only"
+
+logger = logging.getLogger(__name__)
 
 # 기본 실행 시각: 한국 시장 개장 직전
 DEFAULT_PLAN_TIME = "08:50"
@@ -141,6 +157,8 @@ class RunnerConfig:
     liquidate_on_risk_off: bool = True
     max_premium_discount: float = 0.02
     max_live_spread_pct: float = 0.005
+    log_level: str = "INFO"
+    log_file: str = ""
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -275,7 +293,9 @@ def _append_execution_log(executed_orders: list[dict], run_id: str, trading_date
         error = r.get("error", "") or ""
         status_summary = ""
         try:
-            status_summary = json.dumps(r.get("last_status") or r.get("response") or {}, ensure_ascii=False)
+            status_summary = json.dumps(
+                r.get("last_status") or r.get("response") or {}, ensure_ascii=False
+            )
         except Exception:
             status_summary = str(r.get("last_status") or r.get("response") or "")
 
@@ -309,8 +329,25 @@ def _append_execution_log(executed_orders: list[dict], run_id: str, trading_date
             for row in rows:
                 writer.writerow(row)
     except Exception as e:
-        print(f"⚠️ 실행로그 저장 실패: {e}")
+        logger.info(f"⚠️ 실행로그 저장 실패: {e}")
 
+
+def setup_logging(level: str = "INFO", log_file: str = "") -> None:
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    if log_file:
+        fh = TimedRotatingFileHandler(log_file, when="midnight", backupCount=30, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
 
 
 def _read_env_config() -> RunnerConfig:
@@ -340,13 +377,17 @@ def _read_env_config() -> RunnerConfig:
         protect_external_holdings=_parse_bool("PROTECT_EXTERNAL_HOLDINGS", True),
         block_live_after_cutoff=_parse_bool("BLOCK_LIVE_AFTER_CUTOFF", True),
         apply_slippage_in_live=_parse_bool("APPLY_SLIPPAGE_IN_LIVE", False),
-        live_slippage_pct=parse_pct_env("LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)),
+        live_slippage_pct=parse_pct_env(
+            "LIVE_SLIPPAGE_PCT", strategy_cfg.get("default_slippage_pct", 0.0005)
+        ),
         spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
         enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
         max_asset_pct=parse_fraction_env("MAX_ASSET_PCT", 0.50),
         liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
         max_premium_discount=float(strategy_cfg.get("max_premium_discount", 0.02)),
         max_live_spread_pct=float(strategy_cfg.get("max_live_spread_pct", 0.005)),
+        log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        log_file=os.environ.get("LOG_FILE", ""),
     )
 
 
@@ -376,7 +417,7 @@ def _wait_until(target_time_hhmm: str) -> None:
         return
 
     seconds = int((target_dt - now).total_seconds())
-    print(f"[대기] 장 시작 전까지 {seconds}초 대기합니다. 목표 시각={target_time_hhmm}")
+    logger.info(f"[대기] 장 시작 전까지 {seconds}초 대기합니다. 목표 시각={target_time_hhmm}")
 
     while True:
         now = _now_kst()
@@ -461,41 +502,43 @@ def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return out
 
 
-def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: dict[str, str] | None = None) -> pd.DataFrame:
+def _load_snapshot(
+    etf_list: list[str], lookback_days: int = 220, ticker_names: dict[str, str] | None = None
+) -> pd.DataFrame:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=lookback_days)
     start = _date_to_krx(start_day)
     end = _date_to_krx(end_day)
 
-    print(f"[데이터] ETF 가격 로드 시작: {len(etf_list)}개 티커, 기간={start}~{end}")
+    logger.info(f"[데이터] ETF 가격 로드 시작: {len(etf_list)}개 티커, 기간={start}~{end}")
     t0 = dt.datetime.now()
 
     frames: list[pd.DataFrame] = []
     _tn = ticker_names or {}
     for i, ticker in enumerate(etf_list, 1):
         dn = _tn.get(ticker, ticker)
-        print(f"  ({i}/{len(etf_list)}) {dn} 조회 중...", end=" ", flush=True)
+        logger.info(f"  ({i}/{len(etf_list)}) {dn} 조회 중...")
         t1 = dt.datetime.now()
         if not _range_has_weekday(start, end):
             elapsed = (dt.datetime.now() - t1).total_seconds()
-            print(f"스킵(주말만 해당) — 데이터 없음 ({elapsed:.1f}초)")
+            logger.info(f"스킵(주말만 해당) — 데이터 없음 ({elapsed:.1f}초)")
             continue
         try:
             raw = _call_capture_stderr(fetch_etf_ohlcv_with_nav, start, end, ticker)
         except Exception as e:
             elapsed = (dt.datetime.now() - t1).total_seconds()
-            print(f"조회 실패 ({elapsed:.1f}초): {e}")
+            logger.info(f"조회 실패 ({elapsed:.1f}초): {e}")
             continue
         elapsed = (dt.datetime.now() - t1).total_seconds()
         price = raw.copy() if isinstance(raw, pd.DataFrame) else pd.DataFrame()
         if price.empty:
-            print(f"데이터 없음 ({elapsed:.1f}초)")
+            logger.info(f"데이터 없음 ({elapsed:.1f}초)")
             continue
-        print(f"완료 (행수={len(price)}, {elapsed:.1f}초)")
+        logger.info(f"완료 (행수={len(price)}, {elapsed:.1f}초)")
         frames.append(price)
 
     total_elapsed = (dt.datetime.now() - t0).total_seconds()
-    print(f"[데이터] ETF 가격 로드 완료 ({total_elapsed:.1f}초 소요)")
+    logger.info(f"[데이터] ETF 가격 로드 완료 ({total_elapsed:.1f}초 소요)")
 
     if not frames:
         raise RuntimeError("ETF 가격 데이터가 비어 있습니다.")
@@ -512,7 +555,9 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
     price_df["ret_120"] = grouped["close_adj"].pct_change(120)
     price_df["ma20"] = grouped["close_adj"].transform(lambda x: x.rolling(20).mean())
     price_df["ma60"] = grouped["close_adj"].transform(lambda x: x.rolling(60).mean())
-    price_df["trend_ok"] = (price_df["close_adj"] > price_df["ma20"]) & (price_df["ma20"] > price_df["ma60"])
+    price_df["trend_ok"] = (price_df["close_adj"] > price_df["ma20"]) & (
+        price_df["ma20"] > price_df["ma60"]
+    )
 
     snapshot = price_df.groupby("ticker").tail(1).reset_index(drop=True)
     return snapshot
@@ -521,24 +566,24 @@ def _load_snapshot(etf_list: list[str], lookback_days: int = 220, ticker_names: 
 def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) -> bool:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=260)
-    print(f"[시장필터] KOSPI 지수({market_index_code}) 조회 중... ", end="", flush=True)
+    logger.info(f"[시장필터] KOSPI 지수({market_index_code}) 조회 중... ")
     t0 = dt.datetime.now()
     start_s = _date_to_krx(start_day)
     end_s = _date_to_krx(end_day)
     if not _range_has_weekday(start_s, end_s):
         elapsed = (dt.datetime.now() - t0).total_seconds()
-        print(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초) → risk_on=True (기본값)")
+        logger.info(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초) → risk_on=True (기본값)")
         return True
     try:
         idx = _call_capture_stderr(stock.get_index_ohlcv_by_date, start_s, end_s, market_index_code)
     except Exception as e:
         elapsed = (dt.datetime.now() - t0).total_seconds()
-        print(f"조회 실패 ({elapsed:.1f}초): {e}")
-        print("  → risk_on=True (기본값)")
+        logger.info(f"조회 실패 ({elapsed:.1f}초): {e}")
+        logger.info("  → risk_on=True (기본값)")
         return True
     elapsed = (dt.datetime.now() - t0).total_seconds()
     if idx is None or idx.empty:
-        print(f"데이터 없음 ({elapsed:.1f}초) → risk_on=True (기본값)")
+        logger.info(f"데이터 없음 ({elapsed:.1f}초) → risk_on=True (기본값)")
         return True
 
     idx = idx.reset_index().rename(columns={"날짜": "date", "종가": "close"})
@@ -549,14 +594,14 @@ def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) 
     idx["market_ma_slope"] = idx["market_ma"] - idx["market_ma"].shift(slope_days)
     last = idx.iloc[-1]
     if pd.isna(last["market_ma"]) or pd.isna(last["market_ma_slope"]):
-        print(f"MA 계산 불가 ({elapsed:.1f}초) → risk_on=True (기본값)")
+        logger.info(f"MA 계산 불가 ({elapsed:.1f}초) → risk_on=True (기본값)")
         return True
 
     risk_on = bool((last["close"] >= last["market_ma"]) and (last["market_ma_slope"] >= 0))
     close_val = last["close"]
     ma_val = last["market_ma"]
     slope_val = last["market_ma_slope"]
-    print(
+    logger.info(
         f"완료 ({elapsed:.1f}초) | "
         f"종가={close_val:,.0f}, MA{ma_days}={ma_val:,.0f}, "
         f"기울기({slope_days}일)={slope_val:+.1f} → risk_on={risk_on}"
@@ -567,40 +612,42 @@ def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) 
 def _load_recent_trading_dates(reference_ticker: str, lookback_days: int = 120) -> list[str]:
     end_day = _today_kst()
     start_day = end_day - dt.timedelta(days=lookback_days)
-    print(f"[리밸런싱] 거래일 캘린더 조회 중({reference_ticker})... ", end="", flush=True)
+    logger.info(f"[리밸런싱] 거래일 캘린더 조회 중({reference_ticker})... ")
     t0 = dt.datetime.now()
     start_s = _date_to_krx(start_day)
     end_s = _date_to_krx(end_day)
     if not _range_has_weekday(start_s, end_s):
         elapsed = (dt.datetime.now() - t0).total_seconds()
-        print(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초)")
+        logger.info(f"데이터 없음 (주말 범위 스킵) ({elapsed:.1f}초)")
         return []
     try:
         df = _call_capture_stderr(stock.get_market_ohlcv_by_date, start_s, end_s, reference_ticker)
     except Exception as e:
         elapsed = (dt.datetime.now() - t0).total_seconds()
-        print(f"조회 실패 ({elapsed:.1f}초): {e} → 빈 리스트 반환")
+        logger.info(f"조회 실패 ({elapsed:.1f}초): {e} → 빈 리스트 반환")
         return []
     elapsed = (dt.datetime.now() - t0).total_seconds()
     data = _normalize_ohlcv(df, reference_ticker)
     if data.empty:
-        print(f"데이터 없음 ({elapsed:.1f}초)")
+        logger.info(f"데이터 없음 ({elapsed:.1f}초)")
         return []
     dates = [d.date().isoformat() for d in sorted(data["date"].unique())]
-    print(f"완료 ({elapsed:.1f}초, 거래일 {len(dates)}개)")
+    logger.info(f"완료 ({elapsed:.1f}초, 거래일 {len(dates)}개)")
     return dates
 
 
-def _should_rebalance(today: str, state: dict[str, Any], step_days: int, reference_ticker: str) -> bool:
+def _should_rebalance(
+    today: str, state: dict[str, Any], step_days: int, reference_ticker: str
+) -> bool:
     last = state.get("last_rebalance_date")
     if not last:
-        print("[리밸런싱] 마지막 리밸런싱 기록 없음 → 즉시 실행")
+        logger.info("[리밸런싱] 마지막 리밸런싱 기록 없음 → 즉시 실행")
         return True
 
     trading_dates = _load_recent_trading_dates(reference_ticker=reference_ticker, lookback_days=220)
     if not trading_dates or last not in trading_dates:
         # last_rebalance_date가 캘린더에 없으면 판단 불가
-        print(f"[리밸런싱] last={last}가 거래일 캘린더에 없음 → 스킵")
+        logger.info(f"[리밸런싱] last={last}가 거래일 캘린더에 없음 → 스킵")
         return False
 
     last_idx = trading_dates.index(last)
@@ -609,7 +656,7 @@ def _should_rebalance(today: str, state: dict[str, Any], step_days: int, referen
     today_idx = trading_dates.index(today) if today in trading_dates else len(trading_dates)
     elapsed_days = today_idx - last_idx
     due = elapsed_days >= step_days
-    print(
+    logger.info(
         f"[리밸런싱] 마지막={last}, 경과={elapsed_days}거래일, 주기={step_days}일 → "
         f"{'실행 예정' if due else '아직 아님'}"
     )
@@ -636,10 +683,11 @@ def _build_catchup_orders(
     orders: list[dict[str, Any]] = []
     prev_orders = state.get("orders", [])
     if not prev_orders:
-        print("[캐치업] 상태 파일에 이전 주문 정보 없음 → 주문 생성 생략")
+        logger.info("[캐치업] 상태 파일에 이전 주문 정보 없음 → 주문 생성 생략")
         return orders
 
     from collections import defaultdict
+
     ticker_remaining: dict[str, int] = defaultdict(int)
     for o in prev_orders:
         if o.get("side") != "BUY":
@@ -655,23 +703,27 @@ def _build_catchup_orders(
         if price is None or pd.isna(price) or price <= 0:
             price = latest_prices.get(ticker)
         if price is None or pd.isna(price) or price <= 0:
-            print(f"[캐치업][스킵] {ticker_names.get(ticker, ticker)}: 매수 가격 없음")
+            logger.info(f"[캐치업][스킵] {ticker_names.get(ticker, ticker)}: 매수 가격 없음")
             continue
 
         cost = remaining * float(price)
-        orders.append({
-            "side": "BUY",
-            "ticker": ticker,
-            "display_name": ticker_names.get(ticker, ticker),
-            "qty": remaining,
-            "reference_price": float(price),
-            "estimated_value": float(cost),
-            "reason": "CATCHUP",
-        })
-        print(f"[캐치업] {ticker_names.get(ticker, ticker)} {remaining}주 매수 (참고가={float(price):,.0f})")
+        orders.append(
+            {
+                "side": "BUY",
+                "ticker": ticker,
+                "display_name": ticker_names.get(ticker, ticker),
+                "qty": remaining,
+                "reference_price": float(price),
+                "estimated_value": float(cost),
+                "reason": "CATCHUP",
+            }
+        )
+        logger.info(
+            f"[캐치업] {ticker_names.get(ticker, ticker)} {remaining}주 매수 (참고가={float(price):,.0f})"
+        )
 
     if not orders:
-        print("[캐치업] 채울 미체결 주문이 없습니다.")
+        logger.info("[캐치업] 채울 미체결 주문이 없습니다.")
     return orders
 
 
@@ -740,7 +792,7 @@ def _filter_buy_orders_by_live_guards(
                 pass
 
         if skip_reasons:
-            print(f"[매수가드][스킵] {dn}: {', '.join(skip_reasons)}")
+            logger.info(f"[매수가드][스킵] {dn}: {', '.join(skip_reasons)}")
             continue
 
         filtered.append(order)
@@ -759,7 +811,7 @@ def _build_plan(
 
     # 1단계: 잔고/예수금 조회
     if api is None:
-        print("[계획수립] API 없음 — 모의 데이터로 판단만 수행")
+        logger.info("[계획수립] API 없음 — 모의 데이터로 판단만 수행")
         holdings = {"069500": 10}
         cash = 1_000_000.0
         latest_prices = {ticker: 100000.0 for ticker in etf_list}
@@ -767,7 +819,7 @@ def _build_plan(
         latest_sell_prices = dict(latest_prices)
         holdings_for_rebalance = dict(holdings)
     else:
-        print("[계획수립] 잔고/예수금/현재가 조회 중...", end=" ", flush=True)
+        logger.info("[계획수립] 잔고/예수금/현재가 조회 중...")
         t0 = dt.datetime.now()
         holdings = api.get_holdings()
         _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
@@ -775,10 +827,16 @@ def _build_plan(
 
         if config.protect_external_holdings:
             etf_set = set(etf_list)
-            external_holdings = {ticker: qty for ticker, qty in holdings.items() if ticker not in etf_set}
-            holdings_for_rebalance = {ticker: qty for ticker, qty in holdings.items() if ticker in etf_set}
+            external_holdings = {
+                ticker: qty for ticker, qty in holdings.items() if ticker not in etf_set
+            }
+            holdings_for_rebalance = {
+                ticker: qty for ticker, qty in holdings.items() if ticker in etf_set
+            }
             if external_holdings:
-                print(f"\n[보호] 전략 유니버스 외 보유종목 {len(external_holdings)}개는 매도 대상에서 제외합니다.")
+                logger.info(
+                    f"\n[보호] 전략 유니버스 외 보유종목 {len(external_holdings)}개는 매도 대상에서 제외합니다."
+                )
         else:
             holdings_for_rebalance = dict(holdings)
 
@@ -798,10 +856,12 @@ def _build_plan(
                 if sell_price is not None:
                     latest_sell_prices[ticker] = float(sell_price)
         elapsed = (dt.datetime.now() - t0).total_seconds()
-        print(f"완료 ({elapsed:.1f}초) | 보유종목={len(holdings)}개, 예수금={cash:,.0f}")
+        logger.info(f"완료 ({elapsed:.1f}초) | 보유종목={len(holdings)}개, 예수금={cash:,.0f}")
 
     # 로그/알림용 종목명 매핑 구성 (모든 후보 + 보유 종목 + 유니버스 외 보유)
-    _all_tickers = list(set(etf_list) | set(holdings_for_rebalance.keys()) | set(external_holdings.keys()))
+    _all_tickers = list(
+        set(etf_list) | set(holdings_for_rebalance.keys()) | set(external_holdings.keys())
+    )
     ticker_names: dict[str, str] = {t: _format_ticker(t) for t in _all_tickers}
 
     # 2단계: ETF 가격 스냅샷 로드
@@ -810,10 +870,10 @@ def _build_plan(
     ranked = rank_etfs(snapshot)
 
     if not ranked.empty:
-        print("[랭킹] ETF 순위:")
+        logger.info("[랭킹] ETF 순위:")
         for _, row in ranked.iterrows():
             trend_mark = "✓" if row.get("trend_ok") else "✗"
-            print(
+            logger.info(
                 f"  {ticker_names.get(row['ticker'], row['ticker'])}  ret_60={row.get('ret_60', float('nan')):.2%}  "
                 f"ret_120={row.get('ret_120', float('nan')):.2%}  trend={trend_mark}"
             )
@@ -827,7 +887,7 @@ def _build_plan(
             slope_days=config.market_slope_days,
         )
     else:
-        print("[시장필터] USE_MARKET_FILTER=0 — 시장 필터 비활성화")
+        logger.info("[시장필터] USE_MARKET_FILTER=0 — 시장 필터 비활성화")
 
     # 4단계: 리밸런싱 주기 판단
     state = _load_state()
@@ -839,11 +899,11 @@ def _build_plan(
         reference_ticker=etf_list[0],
     )
     if config.force_rebalance:
-        print("[강제] FORCE_REBALANCE=1 — 리밸런싱 주기를 무시하고 강제 실행합니다.")
+        logger.info("[강제] FORCE_REBALANCE=1 — 리밸런싱 주기를 무시하고 강제 실행합니다.")
 
     needs_catchup = _needs_catchup(state, risk_on, config.enable_catchup)
     if needs_catchup:
-        print("[캐치업] 전일 미체결 주문 감지 → 오늘 리밸런싱을 실행하여 포지션을 채웁니다.")
+        logger.info("[캐치업] 전일 미체결 주문 감지 → 오늘 리밸런싱을 실행하여 포지션을 채웁니다.")
 
     # 5단계: 목표 티커 결정
     if not risk_on:
@@ -852,26 +912,38 @@ def _build_plan(
             if not ranked.empty:
                 ticker_list = [str(t) for t in ranked["ticker"]]
                 target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
-                target = target[:config.max_positions + config.sell_rank_buffer]
+                target = target[: config.max_positions + config.sell_rank_buffer]
             else:
                 target = []
             if target:
-                print(f"[계획수립] risk_on=False → foreign/commodity만 목표: {[ticker_names.get(t, t) for t in target]}")
+                logger.info(
+                    f"[계획수립] risk_on=False → foreign/commodity만 목표: {[ticker_names.get(t, t) for t in target]}"
+                )
             else:
-                print("[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)")
+                logger.info(
+                    "[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)"
+                )
         else:
             # LIQUIDATE_ON_RISK_OFF=0: 기존 보유 유지, 신규 매수 없음
-            print("[계획수립] risk_on=False + liquidate_on_risk_off=False → 기존 보유 유지 (신규 매수 없음)")
+            logger.info(
+                "[계획수립] risk_on=False + liquidate_on_risk_off=False → 기존 보유 유지 (신규 매수 없음)"
+            )
             target = []
     elif not rebalance_due and not needs_catchup:
         # 리밸런싱 미도달일에는 실제 주문을 생성하지 않지만, 플랜 상에는
         # 현재 보유를 목표로 표시하여 '유지' 의도를 명확히 합니다.
-        print("[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)")
+        logger.info(
+            "[계획수립] rebalance_due=False → 리밸런싱 불필요 (유지: 목표를 현재 보유로 표시)"
+        )
         target = list(holdings_for_rebalance.keys())
     else:
-        target = ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist() if not ranked.empty else []
+        target = (
+            ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist()
+            if not ranked.empty
+            else []
+        )
         label = "캐치업 목표" if needs_catchup else "목표"
-        print(f"[계획수립] {label} 티커 확정: {[ticker_names.get(t, t) for t in target]}")
+        logger.info(f"[계획수립] {label} 티커 확정: {[ticker_names.get(t, t) for t in target]}")
 
     # rebalance_due=False 이고 시장이 위험상태(risk_on=True)인 경우
     # 리밸런싱이 필요 없으므로 주문 생성을 건너뛰고 즉시 빈 주문 계획을 반환한다.
@@ -879,7 +951,7 @@ def _build_plan(
     # (방어) 빌드 함수에서 빈 target인 경우 매도를 허용할지 여부를 제어합니다.
 
     if target:
-        print("[계획수립] 목표 티커 가격 조회 결과:")
+        logger.info("[계획수립] 목표 티커 가격 조회 결과:")
         for ticker in target:
             buy_price = latest_buy_prices.get(ticker)
             sell_price = latest_sell_prices.get(ticker)
@@ -887,14 +959,13 @@ def _build_plan(
             sell_bad = sell_price is None or pd.isna(sell_price) or sell_price <= 0
             dn = ticker_names.get(ticker, ticker)
             if buy_bad and sell_bad:
-                print(
-                    f"  {dn}: 매수/매도 가격 미조회/비정상 "
-                    f"(buy={buy_price}, sell={sell_price})"
+                logger.info(
+                    f"  {dn}: 매수/매도 가격 미조회/비정상 (buy={buy_price}, sell={sell_price})"
                 )
             else:
                 buy_text = "N/A" if buy_bad else f"{float(buy_price):,.0f}"
                 sell_text = "N/A" if sell_bad else f"{float(sell_price):,.0f}"
-                print(f"  {dn}: buy={buy_text}, sell={sell_text}")
+                logger.info(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
     if needs_catchup and not rebalance_due:
         orders = _build_catchup_orders(state, latest_buy_prices, latest_prices, ticker_names)
@@ -912,7 +983,21 @@ def _build_plan(
             allow_empty_target_sell=not risk_on if config.liquidate_on_risk_off else False,
             # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
             # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
-            slippage=(0.0 if (api is not None and config.enable_live_order and not config.apply_slippage_in_live) else float(getattr(config, 'live_slippage_pct', strategy_cfg.get('default_slippage_pct', 0.0005)))),
+            slippage=(
+                0.0
+                if (
+                    api is not None
+                    and config.enable_live_order
+                    and not config.apply_slippage_in_live
+                )
+                else float(
+                    getattr(
+                        config,
+                        "live_slippage_pct",
+                        strategy_cfg.get("default_slippage_pct", 0.0005),
+                    )
+                )
+            ),
             sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
             taxable_tickers=TAXABLE_ETF_TICKERS,
             generate_orders=(rebalance_due or needs_catchup),
@@ -941,7 +1026,9 @@ def _build_plan(
                     _info = api.get_buyable_info(_t, _p)
                     _nrcvb_qty = int(_info.get("nrcvb_buy_qty", "0"))
                     if _nrcvb_qty > 0 and o["qty"] > _nrcvb_qty:
-                        print(f"[KIS제한] {o.get('display_name', o.get('ticker', ''))} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)")
+                        logger.info(
+                            f"[KIS제한] {o.get('display_name', o.get('ticker', ''))} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)"
+                        )
                         o["qty"] = _nrcvb_qty
                         o["estimated_value"] = _nrcvb_qty * float(o.get("reference_price", 0))
 
@@ -1139,7 +1226,9 @@ def _poll_and_finalize_orders(
                 row["cancel_submitted"] = True
                 row["cancel_response"] = cancel_resp
                 if notifier is not None:
-                    notifier.notify_order_cancelled(row.get("side", ""), row.get("display_name", ticker), remaining_qty)
+                    notifier.notify_order_cancelled(
+                        row.get("side", ""), row.get("display_name", ticker), remaining_qty
+                    )
             except Exception as exc:
                 row["cancel_submitted"] = False
                 row["cancel_error"] = str(exc)
@@ -1149,7 +1238,9 @@ def _poll_and_finalize_orders(
             if notifier is not None:
                 filled = row.get("filled_qty", 0)
                 total = row.get("requested_qty", row.get("qty", 0))
-                notifier.notify_order_timeout(row.get("side", ""), row.get("display_name", ticker), filled, total)
+                notifier.notify_order_timeout(
+                    row.get("side", ""), row.get("display_name", ticker), filled, total
+                )
 
         row["is_filled"] = bool(row.get("remaining_qty", 0) == 0)
         row["timed_out"] = True
@@ -1179,16 +1270,13 @@ def _wait_for_cancellations(
     재주문 전에 호출하여, 원주문 취소가 완료되기 전에 재주문이 나가
     중복 체결되는 것을 방지합니다. (BUG-2)
     """
-    cancel_rows = [
-        r for r in results
-        if r.get("cancel_submitted") and r.get("order_id")
-    ]
+    cancel_rows = [r for r in results if r.get("cancel_submitted") and r.get("order_id")]
     if not cancel_rows:
         return
 
     today_krx = _date_to_krx(_now_kst().date())
     deadline = _now_kst() + dt.timedelta(seconds=max(timeout_sec, 0))
-    print(f"[취소확인] {len(cancel_rows)}건 취소 완료 대기 중 (최대 {timeout_sec}초)...")
+    logger.info(f"[취소확인] {len(cancel_rows)}건 취소 완료 대기 중 (최대 {timeout_sec}초)...")
     pending = {str(r["order_id"]): r for r in cancel_rows}
 
     while pending and _now_kst() < deadline:
@@ -1196,18 +1284,18 @@ def _wait_for_cancellations(
             try:
                 status = api.get_order_status(order_id, today=today_krx)
             except Exception as exc:
-                print(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
+                logger.info(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
                 continue
             remaining = int(status.get("remaining_qty", 1))
             if remaining == 0 or not status.get("is_found", True):
                 row = pending.pop(order_id)
                 row["cancel_confirmed"] = True
-                print(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
+                logger.info(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
         if pending:
             time.sleep(max(poll_interval_sec, 1))
 
     for order_id in pending:
-        print(f"[취소확인] {order_id} → 미확인 (타임아웃, 계속 진행)")
+        logger.info(f"[취소확인] {order_id} → 미확인 (타임아웃, 계속 진행)")
 
 
 def _refresh_order_statuses(
@@ -1227,7 +1315,7 @@ def _refresh_order_statuses(
         try:
             status = api.get_order_status(order_id, today=today_krx)
         except Exception as exc:
-            print(f"[상태재조회] {order_id} 조회 실패: {exc}")
+            logger.info(f"[상태재조회] {order_id} 조회 실패: {exc}")
             continue
         filled_qty = int(status.get("filled_qty", 0))
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
@@ -1237,7 +1325,7 @@ def _refresh_order_statuses(
         if order_qty > 0:
             row["requested_qty"] = order_qty
         row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
-        print(
+        logger.info(
             f"[상태재조회] {row.get('display_name', row.get('ticker', order_id))} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"
         )
@@ -1257,7 +1345,7 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not ticker:
             continue
         if remaining_qty == 0 and (req_qty - filled_qty) > 0:
-            print(
+            logger.info(
                 f"[재시도-스킵] {ticker}: API 잔량=0, 자체계산={req_qty - filled_qty} — 재시도 생략"
             )
         if remaining_qty <= 0:
@@ -1310,7 +1398,9 @@ def _build_failed_retry_orders(
         if max_qty <= 0 or max_qty >= orig_qty:
             continue
         dn = row.get("display_name", ticker)
-        print(f"[KIS재시도] {dn} 수량 {orig_qty}→{max_qty}주 (nrcvb_buy_qty, 오류코드={row.get('error_code', '')})")
+        logger.info(
+            f"[KIS재시도] {dn} 수량 {orig_qty}→{max_qty}주 (nrcvb_buy_qty, 오류코드={row.get('error_code', '')})"
+        )
         retry.append(
             {
                 "ticker": ticker,
@@ -1340,68 +1430,77 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
 
 def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
     tn = plan.get("ticker_names") or {}
-    print("=== ETF 하루 1회 실행 계획 ===")
-    print(f"기준일: {plan['today']}")
-    print(f"risk_on: {plan['risk_on']}")
-    print(f"rebalance_due: {plan['rebalance_due']}")
-    print(f"catchup: {plan.get('needs_catchup', False)}")
-    print(f"실주문 모드: {'ON' if cfg.enable_live_order else 'OFF'}")
-    print(f"매도 컷오프: {cfg.sell_cutoff_time}, 매수 컷오프: {cfg.buy_cutoff_time}")
-    print(f"미체결 재주문: {'ON' if cfg.retry_unfilled_orders else 'OFF'} ({cfg.retry_order_type})")
-    print(f"유니버스 외 보유 매도 차단: {'ON' if cfg.protect_external_holdings else 'OFF'}")
-    print(f"컷오프 이후 실주문 차단: {'ON' if cfg.block_live_after_cutoff else 'OFF'}")
+    logger.info("=== ETF 하루 1회 실행 계획 ===")
+    logger.info(f"기준일: {plan['today']}")
+    logger.info(f"risk_on: {plan['risk_on']}")
+    logger.info(f"rebalance_due: {plan['rebalance_due']}")
+    logger.info(f"catchup: {plan.get('needs_catchup', False)}")
+    logger.info(f"실주문 모드: {'ON' if cfg.enable_live_order else 'OFF'}")
+    logger.info(f"매도 컷오프: {cfg.sell_cutoff_time}, 매수 컷오프: {cfg.buy_cutoff_time}")
+    logger.info(
+        f"미체결 재주문: {'ON' if cfg.retry_unfilled_orders else 'OFF'} ({cfg.retry_order_type})"
+    )
+    logger.info(f"유니버스 외 보유 매도 차단: {'ON' if cfg.protect_external_holdings else 'OFF'}")
+    logger.info(f"컷오프 이후 실주문 차단: {'ON' if cfg.block_live_after_cutoff else 'OFF'}")
     _margin_rate = plan.get("market_order_margin_rate", 0.0)
     if _margin_rate > 0:
-        print(f"시장가 증거금 할증률: {_margin_rate:.0%}")
-    print(f"보유종목수: {len(plan['holdings'])}, 예수금: {plan['cash']:,.0f}")
-    if plan['holdings']:
-        print("  현재 보유:")
-        for ticker, qty in plan['holdings'].items():
-            print(f"    {tn.get(ticker, ticker)}: {qty}주")
+        logger.info(f"시장가 증거금 할증률: {_margin_rate:.0%}")
+    logger.info(f"보유종목수: {len(plan['holdings'])}, 예수금: {plan['cash']:,.0f}")
+    if plan["holdings"]:
+        logger.info("  현재 보유:")
+        for ticker, qty in plan["holdings"].items():
+            logger.info(f"    {tn.get(ticker, ticker)}: {qty}주")
     blocked_external = plan.get("blocked_external_holdings") or {}
     if blocked_external:
-        print("  매도 제외(유니버스 외 보유):")
+        logger.info("  매도 제외(유니버스 외 보유):")
         for ticker, qty in blocked_external.items():
-            print(f"    {tn.get(ticker, ticker)}: {qty}주")
-    print(f"목표 티커: {[tn.get(t, t) for t in plan['target']]}")
-    print(f"매도 주문 수: {len(plan['sell_orders'])}, 매수 주문 수: {len(plan['buy_orders'])}")
-    if plan['sell_orders']:
-        print("  매도 주문 상세:")
-        for o in plan['sell_orders']:
-            print(
+            logger.info(f"    {tn.get(ticker, ticker)}: {qty}주")
+    logger.info(f"목표 티커: {[tn.get(t, t) for t in plan['target']]}")
+    logger.info(
+        f"매도 주문 수: {len(plan['sell_orders'])}, 매수 주문 수: {len(plan['buy_orders'])}"
+    )
+    if plan["sell_orders"]:
+        logger.info("  매도 주문 상세:")
+        for o in plan["sell_orders"]:
+            logger.info(
                 f"    SELL {o.get('display_name', o['ticker'])} {o['qty']}주 "
                 f"(참고가={o.get('reference_price', 0):,.0f}, "
                 f"예상금액={o.get('estimated_value', 0):,.0f})"
             )
-    if plan['buy_orders']:
-        print("  매수 주문 상세:")
-        for o in plan['buy_orders']:
-            print(
+    if plan["buy_orders"]:
+        logger.info("  매수 주문 상세:")
+        for o in plan["buy_orders"]:
+            logger.info(
                 f"    BUY  {o.get('display_name', o['ticker'])} {o['qty']}주 "
                 f"(참고가={o.get('reference_price', 0):,.0f}, "
                 f"예상금액={o.get('estimated_value', 0):,.0f})"
             )
-    if not plan['sell_orders'] and not plan['buy_orders']:
+    if not plan["sell_orders"] and not plan["buy_orders"]:
         reason = []
-        if not plan['risk_on']:
+        if not plan["risk_on"]:
             reason.append("시장 필터 OFF (risk_on=False)")
-        if not plan['rebalance_due'] and not plan.get('needs_catchup'):
+        if not plan["rebalance_due"] and not plan.get("needs_catchup"):
             reason.append("리밸런싱 주기 미도달")
         if reason:
-            print(f"  주문 없음 사유: {', '.join(reason)}")
+            logger.info(f"  주문 없음 사유: {', '.join(reason)}")
 
 
 def run_daily() -> None:
     cfg = _read_env_config()
+    setup_logging(cfg.log_level, cfg.log_file)
     state = _load_state()
     today = _date_to_iso(_today_kst())
 
-    print(f"[시작] ETF 데일리 러너 — {today} {_now_kst().strftime('%H:%M:%S')} (KST)")
-    print(f"  LIVE_ORDER_ENABLED={cfg.enable_live_order}  FORCE={cfg.force}  FORCE_REBALANCE={cfg.force_rebalance}")
-    print(f"  max_positions={cfg.max_positions}  rebalance_step_days={cfg.rebalance_step_days}")
+    logger.info(f"[시작] ETF 데일리 러너 — {today} {_now_kst().strftime('%H:%M:%S')} (KST)")
+    logger.info(
+        f"  LIVE_ORDER_ENABLED={cfg.enable_live_order}  FORCE={cfg.force}  FORCE_REBALANCE={cfg.force_rebalance}"
+    )
+    logger.info(
+        f"  max_positions={cfg.max_positions}  rebalance_step_days={cfg.rebalance_step_days}"
+    )
 
     if not _is_weekday(_today_kst()):
-        print("[종료] 주말이므로 실행하지 않습니다.")
+        logger.info("[종료] 주말이므로 실행하지 않습니다.")
         return
 
     if (
@@ -1409,7 +1508,7 @@ def run_daily() -> None:
         and state.get("trading_date") == today
         and state.get("status") in {"DONE", "NO_ACTION"}
     ):
-        print(
+        logger.info(
             f"[종료] 오늘은 이미 실행 완료 상태입니다 (status={state.get('status')}). "
             "DAILY_RUN_FORCE=1로 강제 실행할 수 있습니다."
         )
@@ -1417,13 +1516,11 @@ def run_daily() -> None:
 
     krx_status = check_krx_auth_status()
     if krx_status == "password_change_needed":
-        print()
-        print("=" * 60)
-        print("KRX 비밀번호 변경이 필요합니다.")
-        print(f"{KRX_PASSWORD_CHANGE_URL} 에서 비밀번호를 변경한 후")
-        print(".env 파일의 KRX_PW를 업데이트하고 재실행하세요.")
-        print("=" * 60)
-        print()
+        logger.error("=" * 60)
+        logger.error("KRX 비밀번호 변경이 필요합니다.")
+        logger.error(f"{KRX_PASSWORD_CHANGE_URL} 에서 비밀번호를 변경한 후")
+        logger.error(".env 파일의 KRX_PW를 업데이트하고 재실행하세요.")
+        logger.error("=" * 60)
         if TelegramNotifier is not None:
             try:
                 notifier = TelegramNotifier()
@@ -1435,19 +1532,21 @@ def run_daily() -> None:
                 pass
         sys.exit(1)
     elif krx_status == "no_credentials":
-        print("[경고] KRX_ID/KRX_PW 미설정 — 인증이 필요한 데이터 조회는 실패할 수 있습니다.")
+        logger.info("[경고] KRX_ID/KRX_PW 미설정 — 인증이 필요한 데이터 조회는 실패할 수 있습니다.")
 
     if cfg.enable_live_order and cfg.block_live_after_cutoff:
         now_dt = _now_kst()
         live_cutoff_hhmm = _earlier_hhmm(cfg.sell_cutoff_time, cfg.buy_cutoff_time)
-        live_cutoff_dt = dt.datetime.combine(now_dt.date(), _parse_hhmm(live_cutoff_hhmm), tzinfo=now_dt.tzinfo)
+        live_cutoff_dt = dt.datetime.combine(
+            now_dt.date(), _parse_hhmm(live_cutoff_hhmm), tzinfo=now_dt.tzinfo
+        )
         if now_dt >= live_cutoff_dt:
-            print(
+            logger.info(
                 f"[안전차단] 현재 시각({_now_kst().strftime('%H:%M:%S')})이 "
                 f"실주문 컷오프({live_cutoff_hhmm}) 이후입니다. "
                 "실주문 실행을 중단합니다."
             )
-            print("[안내] 테스트가 목적이라면 LIVE_ORDER_ENABLED=0(드라이런)으로 실행하세요.")
+            logger.info("[안내] 테스트가 목적이라면 LIVE_ORDER_ENABLED=0(드라이런)으로 실행하세요.")
             return
 
     # --force-live 등으로 컷오프 차단이 꺼진 상태에서 이미 컷오프를 지났으면
@@ -1461,9 +1560,13 @@ def run_daily() -> None:
         )
         if _now_for_extend >= _live_cutoff_dt:
             _extend_min = int(os.environ.get("FORCE_LIVE_CUTOFF_EXTEND_MIN", "10"))
-            cfg.buy_cutoff_time = (_now_for_extend + dt.timedelta(minutes=_extend_min)).strftime("%H:%M")
-            cfg.sell_cutoff_time = (_now_for_extend + dt.timedelta(minutes=max(_extend_min // 2, 1))).strftime("%H:%M")
-            print(
+            cfg.buy_cutoff_time = (_now_for_extend + dt.timedelta(minutes=_extend_min)).strftime(
+                "%H:%M"
+            )
+            cfg.sell_cutoff_time = (
+                _now_for_extend + dt.timedelta(minutes=max(_extend_min // 2, 1))
+            ).strftime("%H:%M")
+            logger.info(
                 f"[컷오프 연장] 현재 시각({_now_for_extend.strftime('%H:%M:%S')})이 "
                 f"컷오프({_live_cutoff_hhmm}) 이후입니다. "
                 f"자동 연장 → 매도={cfg.sell_cutoff_time}, 매수={cfg.buy_cutoff_time} "
@@ -1473,14 +1576,14 @@ def run_daily() -> None:
     now = _now_kst().time()
     plan_time = _parse_hhmm(cfg.plan_time)
     if now < plan_time:
-        print(f"[대기] 계획 수립 시각({cfg.plan_time}) 전입니다. 해당 시각까지 대기합니다.")
+        logger.info(f"[대기] 계획 수립 시각({cfg.plan_time}) 전입니다. 해당 시각까지 대기합니다.")
         _wait_until(cfg.plan_time)
 
     api = None
     adapter_init_error: Exception | None = None
 
     broker_type = os.environ.get("BROKER_TYPE", "KIWOOM").upper()
-    print(f"[DEBUG] BROKER_TYPE='{os.environ.get('BROKER_TYPE')}' → '{broker_type}'")
+    logger.info(f"[DEBUG] BROKER_TYPE='{os.environ.get('BROKER_TYPE')}' → '{broker_type}'")
     if broker_type == "KIS":
         AdapterClass = KisAdapter
         adapter_name = "KIS"
@@ -1493,7 +1596,7 @@ def run_daily() -> None:
             api = AdapterClass()
         except Exception as exc:
             adapter_init_error = exc
-            print(f"[경고] {adapter_name} 어댑터 초기화 실패: {exc}")
+            logger.info(f"[경고] {adapter_name} 어댑터 초기화 실패: {exc}")
 
     if cfg.enable_live_order and api is None:
         if AdapterClass is None:
@@ -1529,7 +1632,7 @@ def run_daily() -> None:
             "last_rebalance_date": state.get("last_rebalance_date"),
         }
         _save_state(new_state)
-        print("[완료] 오늘은 실행할 주문이 없습니다.")
+        logger.info("[완료] 오늘은 실행할 주문이 없습니다.")
         return
 
     if cfg.wait_until_open:
@@ -1537,7 +1640,9 @@ def run_daily() -> None:
 
     dry_run = (not cfg.enable_live_order) or (api is None)
     if dry_run:
-        print("[안전모드] LIVE_ORDER_ENABLED=0 또는 어댑터 미사용 상태입니다. 실제 주문은 전송하지 않습니다.")
+        logger.info(
+            "[안전모드] LIVE_ORDER_ENABLED=0 또는 어댑터 미사용 상태입니다. 실제 주문은 전송하지 않습니다."
+        )
 
     # 실전 모드에서만 텔레그램 알림 활성화
     notifier = None
@@ -1545,20 +1650,30 @@ def run_daily() -> None:
         try:
             notifier = TelegramNotifier()
         except Exception as _tg_exc:
-            print(f"[경고] 텔레그램 알림 초기화 실패: {_tg_exc}")
+            logger.info(f"[경고] 텔레그램 알림 초기화 실패: {_tg_exc}")
 
     # 1) 매도 우선
     if plan["sell_orders"]:
-        print("\n[주문] ─── 매도 단계 ───")
-        sell_results = _submit_orders(api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
+        logger.info("\n[주문] ─── 매도 단계 ───")
+        sell_results = _submit_orders(
+            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier
+        )
         if sell_results:
             for r in sell_results:
-                status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
-                print(f"  SELL {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}")
+                status_txt = (
+                    "DRY_RUN"
+                    if r.get("mode") == "DRY_RUN"
+                    else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
+                )
+                logger.info(
+                    f"  SELL {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}"
+                )
         sell_retry_results: list[dict[str, Any]] = []
 
         if (not dry_run) and api is not None:
-            print(f"[주문] 매도 체결 대기 중 (타임아웃={cfg.sell_fill_timeout_sec}초, 컷오프={cfg.sell_cutoff_time})")
+            logger.info(
+                f"[주문] 매도 체결 대기 중 (타임아웃={cfg.sell_fill_timeout_sec}초, 컷오프={cfg.sell_cutoff_time})"
+            )
             sell_results = _poll_and_finalize_orders(
                 api=api,
                 submitted_results=sell_results,
@@ -1577,7 +1692,7 @@ def run_daily() -> None:
                     _status = "✗ 미체결 (타임아웃)"
                 else:
                     _status = "✗ 미체결"
-                print(
+                logger.info(
                     f"  SELL {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                     f"{_status}"
                 )
@@ -1596,7 +1711,7 @@ def run_daily() -> None:
                 _refresh_order_statuses(api, sell_results)
                 retry_sell_orders = _build_retry_orders(sell_results)
                 if retry_sell_orders:
-                    print(f"[재시도] 매도 잔량 재주문 {len(retry_sell_orders)}건 제출")
+                    logger.info(f"[재시도] 매도 잔량 재주문 {len(retry_sell_orders)}건 제출")
                     sell_retry_results = _submit_orders(
                         api,
                         "SELL",
@@ -1620,11 +1735,13 @@ def run_daily() -> None:
         refreshed_cash = None
         if (not dry_run) and api is not None:
             try:
-                _get_cash = api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
+                _get_cash = (
+                    api.get_available_cash if hasattr(api, "get_available_cash") else api.get_cash
+                )
                 refreshed_cash = _safe_float(_get_cash())
-                print(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
+                logger.info(f"[정보] 매도 후 예수금 재조회: {refreshed_cash:,.0f}")
             except Exception as exc:
-                print(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
+                logger.info(f"[경고] 매도 후 예수금 재조회 실패: {exc}")
                 refreshed_cash = 0.0
 
         # 3) 매도 미완전체결이면 매수 차단
@@ -1642,20 +1759,28 @@ def run_daily() -> None:
                     _strategy_cfg = get_strategy_config()
                     _etf_set = set(_strategy_cfg["etf_list"])
                     _before = len(refreshed_holdings)
-                    refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t in _etf_set}
+                    refreshed_holdings = {
+                        t: q for t, q in refreshed_holdings.items() if t in _etf_set
+                    }
                     if len(refreshed_holdings) < _before:
-                        print(f"[보호] 매도 후 재조회된 유니버스 외 {_before - len(refreshed_holdings)}개는 매수계산에서 제외합니다.")
-                print(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
+                        logger.info(
+                            f"[보호] 매도 후 재조회된 유니버스 외 {_before - len(refreshed_holdings)}개는 매수계산에서 제외합니다."
+                        )
+                logger.info(f"[정보] 매도 후 보유 재조회: {len(refreshed_holdings)}개")
             except Exception as exc:
-                print(f"[경고] 매도 후 보유 재조회 실패: {exc}")
+                logger.info(f"[경고] 매도 후 보유 재조회 실패: {exc}")
                 refreshed_holdings = plan.get("holdings", {})
 
             sold_this_cycle = {o["ticker"] for o in plan.get("sell_orders", []) if o.get("ticker")}
             if sold_this_cycle:
                 _before_sold = len(refreshed_holdings)
-                refreshed_holdings = {t: q for t, q in refreshed_holdings.items() if t not in sold_this_cycle}
+                refreshed_holdings = {
+                    t: q for t, q in refreshed_holdings.items() if t not in sold_this_cycle
+                }
                 if len(refreshed_holdings) < _before_sold:
-                    print(f"[방어] D+2 미결제 매도종목 {_before_sold - len(refreshed_holdings)}개를 보유에서 제외했습니다.")
+                    logger.info(
+                        f"[방어] D+2 미결제 매도종목 {_before_sold - len(refreshed_holdings)}개를 보유에서 제외했습니다."
+                    )
 
             price_tickers = list(set(plan.get("target", [])) | set(refreshed_holdings.keys()))
             try:
@@ -1673,7 +1798,7 @@ def run_daily() -> None:
                         if sell_price is not None:
                             latest_sell_prices_after[ticker] = float(sell_price)
             except Exception as exc:
-                print(f"[경고] 매도 후 가격 재조회 실패: {exc}")
+                logger.info(f"[경고] 매도 후 가격 재조회 실패: {exc}")
                 latest_prices_after = {}
                 latest_buy_prices_after = {}
                 latest_sell_prices_after = {}
@@ -1682,7 +1807,9 @@ def run_daily() -> None:
             # BUDGET_SAFETY_MARGIN_PCT 환경변수로 조정 가능
             _default_margin = 0.03 if broker_type == "KIS" else 0.07
             _budget_safety_margin = parse_pct_env("BUDGET_SAFETY_MARGIN_PCT", _default_margin)
-            _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (1.0 - _budget_safety_margin)
+            _effective_cash = (refreshed_cash if refreshed_cash is not None else 0.0) * (
+                1.0 - _budget_safety_margin
+            )
             try:
                 new_orders = build_rebalance_orders(
                     current_holdings=refreshed_holdings,
@@ -1694,7 +1821,15 @@ def run_daily() -> None:
                     max_positions=cfg.max_positions,
                     max_asset_pct=cfg.max_asset_pct,
                     sell_rank_buffer=cfg.sell_rank_buffer,
-                    slippage=(0.0 if (api is not None and cfg.enable_live_order and not cfg.apply_slippage_in_live) else cfg.live_slippage_pct),
+                    slippage=(
+                        0.0
+                        if (
+                            api is not None
+                            and cfg.enable_live_order
+                            and not cfg.apply_slippage_in_live
+                        )
+                        else cfg.live_slippage_pct
+                    ),
                     allow_empty_target_sell=not plan.get("risk_on", True),
                     sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                     taxable_tickers=TAXABLE_ETF_TICKERS,
@@ -1714,7 +1849,7 @@ def run_daily() -> None:
                 )
                 new_buy_orders = [o for o in new_orders if o.get("side") == "BUY"]
                 plan["buy_orders"] = new_buy_orders
-                print(
+                logger.info(
                     f"[정보] 매도 후 실제 상태로 매수 주문 재계산: 매수 후보={len(new_buy_orders)}건, "
                     f"예수금={refreshed_cash:,.0f} "
                     f"(안전마진 {_budget_safety_margin:.1%} 적용, 실효={_effective_cash:,.0f})"
@@ -1730,9 +1865,13 @@ def run_daily() -> None:
                                 _nrcvb_qty = int(_info.get("nrcvb_buy_qty", "0"))
                                 if _nrcvb_qty > 0 and o["qty"] > _nrcvb_qty:
                                     dn = o.get("display_name", _t)
-                                    print(f"[KIS제한-재계산] {dn} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)")
+                                    logger.info(
+                                        f"[KIS제한-재계산] {dn} 수량 {o['qty']}→{_nrcvb_qty}주 (nrcvb_buy_qty)"
+                                    )
                                     o["qty"] = _nrcvb_qty
-                                    o["estimated_value"] = _nrcvb_qty * float(o.get("reference_price", 0))
+                                    o["estimated_value"] = _nrcvb_qty * float(
+                                        o.get("reference_price", 0)
+                                    )
                 # 복수 매수 주문 합계가 가용 현금 초과 시 마지막 주문 조정
                 if len(plan["buy_orders"]) > 1 and refreshed_cash is not None:
                     _total_actual = sum(
@@ -1749,31 +1888,40 @@ def run_daily() -> None:
                             if _reduce > 0:
                                 new_qty = _qty - _reduce
                                 dn = last.get("display_name", last["ticker"])
-                                print(
+                                logger.info(
                                     f"[현금초과] {dn} 수량 {_qty}→{new_qty}주 "
                                     f"(실합계 {_total_actual:,.0f} > 가용 {refreshed_cash:,.0f})"
                                 )
                                 last["qty"] = new_qty
-                                last["estimated_value"] = new_qty * float(last.get("reference_price", 0))
+                                last["estimated_value"] = new_qty * float(
+                                    last.get("reference_price", 0)
+                                )
             except Exception as exc:
-                print(f"[경고] 매도 후 주문 재계산 실패: {exc}")
+                logger.info(f"[경고] 매도 후 주문 재계산 실패: {exc}")
         elif can_buy and (not dry_run) and api is not None and plan.get("needs_catchup", False):
-            print(f"[정보] 캐치업 모드: 기존 매수 계획 유지 ({len(plan.get('buy_orders', []))}건)")
+            logger.info(
+                f"[정보] 캐치업 모드: 기존 매수 계획 유지 ({len(plan.get('buy_orders', []))}건)"
+            )
     else:
-        print("\n[주문] 매도 대상 없음 — 매도 단계를 건너뜁니다.")
+        logger.info("\n[주문] 매도 대상 없음 — 매도 단계를 건너뜁니다.")
         sell_results = []
         sell_retry_results = []
         refreshed_cash = None
         can_buy = True
         buy_results = []
         buy_retry_results = []
-    print("\n[주문] ─── 매수 단계 ───")
+    logger.info("\n[주문] ─── 매수 단계 ───")
     if can_buy:
         # 중요도(랭킹) 순으로 매수 주문 정렬 — 1순위 종목이 먼저 제출되어 현금 확보
         _target_order = {t: i for i, t in enumerate(plan.get("target", []))}
         plan["buy_orders"].sort(key=lambda o: _target_order.get(o["ticker"], 999))
         # KIS simulated env: 순차 제출 (선행 주문의 cash reservation 반영을 위해 주문별로 get_buyable_info 재조회)
-        _seq_submit = (not dry_run) and api is not None and hasattr(api, "get_buyable_info") and len(plan["buy_orders"]) > 1
+        _seq_submit = (
+            (not dry_run)
+            and api is not None
+            and hasattr(api, "get_buyable_info")
+            and len(plan["buy_orders"]) > 1
+        )
         if _seq_submit:
             buy_results = []
             for _bo in plan["buy_orders"]:
@@ -1785,20 +1933,34 @@ def run_daily() -> None:
                         _bnq = int(_bi.get("nrcvb_buy_qty", "0"))
                         if _bnq > 0 and int(_bo.get("qty", 0)) > _bnq:
                             _bdn = _bo.get("display_name", _bt)
-                            print(f"[KIS제한-순차] {_bdn} 수량 {_bo['qty']}→{_bnq}주 (잔여 nrcvb_buy_qty={_bnq})")
+                            logger.info(
+                                f"[KIS제한-순차] {_bdn} 수량 {_bo['qty']}→{_bnq}주 (잔여 nrcvb_buy_qty={_bnq})"
+                            )
                             _bo["qty"] = _bnq
                             _bo["estimated_value"] = _bnq * float(_bo.get("reference_price", 0))
                     except Exception:
                         pass
-                buy_results.extend(_submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier))
+                buy_results.extend(
+                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier)
+                )
         else:
-            buy_results = _submit_orders(api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier)
+            buy_results = _submit_orders(
+                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier
+            )
         if buy_results:
             for r in buy_results:
-                status_txt = "DRY_RUN" if r.get("mode") == "DRY_RUN" else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
-                print(f"  BUY  {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}")
+                status_txt = (
+                    "DRY_RUN"
+                    if r.get("mode") == "DRY_RUN"
+                    else ("제출완료" if r.get("submitted") else f"오류: {r.get('error')}")
+                )
+                logger.info(
+                    f"  BUY  {r.get('display_name', r['ticker'])} {r['qty']}주 → {status_txt}"
+                )
         if (not dry_run) and api is not None:
-            print(f"[주문] 매수 체결 대기 중 (타임아웃={cfg.buy_fill_timeout_sec}초, 컷오프={cfg.buy_cutoff_time})")
+            logger.info(
+                f"[주문] 매수 체결 대기 중 (타임아웃={cfg.buy_fill_timeout_sec}초, 컷오프={cfg.buy_cutoff_time})"
+            )
             buy_results = _poll_and_finalize_orders(
                 api=api,
                 submitted_results=buy_results,
@@ -1817,7 +1979,7 @@ def run_daily() -> None:
                     _status = "✗ 미체결 (타임아웃)"
                 else:
                     _status = "✗ 미체결"
-                print(
+                logger.info(
                     f"  BUY  {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
                     f"{_status}"
                 )
@@ -1838,7 +2000,7 @@ def run_daily() -> None:
                 failed_retry_orders = _build_failed_retry_orders(buy_results, api)
                 all_retry_orders = retry_buy_orders + failed_retry_orders
                 if all_retry_orders:
-                    print(
+                    logger.info(
                         f"[재시도] 매수 재주문 {len(all_retry_orders)}건 "
                         f"(미체결 {len(retry_buy_orders)}, 실패재시도 {len(failed_retry_orders)})"
                     )
@@ -1861,13 +2023,17 @@ def run_daily() -> None:
                         notifier=notifier,
                     )
     else:
-        print("[안전중단] 매도 주문이 전량 체결되지 않아 매수 주문을 제출하지 않습니다.")
+        logger.info("[안전중단] 매도 주문이 전량 체결되지 않아 매수 주문을 제출하지 않습니다.")
 
     executed_orders = sell_results + sell_retry_results + buy_results + buy_retry_results
 
     if dry_run:
         run_status = "DONE_DRY_RUN"
-    elif can_buy and _is_side_fully_filled(sell_results, sell_retry_results) and _is_side_fully_filled(buy_results, buy_retry_results):
+    elif (
+        can_buy
+        and _is_side_fully_filled(sell_results, sell_retry_results)
+        and _is_side_fully_filled(buy_results, buy_retry_results)
+    ):
         run_status = "DONE"
     elif not can_buy:
         run_status = "BLOCKED_BUY_BY_UNFILLED_SELL"
@@ -1889,25 +2055,33 @@ def run_daily() -> None:
     try:
         _append_execution_log(executed_orders, run_id, today)
     except Exception as exc:
-        print(f"⚠️ 실행로그 기록 중 오류: {exc}")
+        logger.info(f"⚠️ 실행로그 기록 중 오류: {exc}")
 
-    print("=== 실행 결과 ===")
-    print(f"실행 상태: {run_status}")
+    logger.info("=== 실행 결과 ===")
+    logger.info(f"실행 상태: {run_status}")
     for r in sell_results + sell_retry_results:
-        _es_s = "완료" if r.get("is_filled") else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
-        print(
+        _es_s = (
+            "완료"
+            if r.get("is_filled")
+            else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
+        )
+        logger.info(
             f"  SELL {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
             f"({_es_s}, {r.get('mode', '')})"
         )
     for r in buy_results + buy_retry_results:
-        _es_b = "완료" if r.get("is_filled") else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
-        print(
+        _es_b = (
+            "완료"
+            if r.get("is_filled")
+            else (f"오류({r.get('error_code', '')})" if not r.get("submitted") else "미체결")
+        )
+        logger.info(
             f"  BUY  {r.get('display_name', r['ticker'])} 체결={r.get('filled_qty', 0)}/{r.get('requested_qty', r.get('qty', 0))} "
             f"({_es_b}, {r.get('mode', '')})"
         )
-    print(f"매도 제출 건수: {len(sell_results)}")
-    print(f"매수 제출 건수: {len(buy_results)}")
-    print(f"상태 파일: {STATE_PATH}")
+    logger.info(f"매도 제출 건수: {len(sell_results)}")
+    logger.info(f"매수 제출 건수: {len(buy_results)}")
+    logger.info(f"상태 파일: {STATE_PATH}")
 
     if notifier is not None:
         notifier.notify_daily_summary(
@@ -1935,6 +2109,6 @@ if __name__ == "__main__":
     if args.force_live:
         # 프로세스 환경변수로 안전차단 플래그를 덮어써서 컷오프 검사 우회
         os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
-        print("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
+        logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
 
     run_daily()
