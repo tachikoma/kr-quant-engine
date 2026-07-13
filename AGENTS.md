@@ -13,7 +13,9 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - `live_trading/kis/` — KIS API client/auth package (`KisApiClient`, `KisAuthManager`).
 - `live_trading/telegram_notifier.py` — Telegram order/execution notification.
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
-- Analysis scripts: `scripts/` (15 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`.
+- `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
+- `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
+- Analysis scripts: `scripts/` (24 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`.
 
 ## Commands
 
@@ -24,6 +26,10 @@ uv run python live_trading/etf_daily_runner.py  # daily runner (safe mode)
 uv run python live_trading/etf_daily_runner.py --force-live  # bypass safety cutoff
 uv run scripts/grid_backtest.py                 # grid backtest (candidate pool / rebalance / positions)
 uv run scripts/correlation_analysis.py          # drawdown correlation analysis
+uv run scripts/walk_forward_validation.py       # rolling walk-forward parameter selection + OOS eval
+uv run scripts/parameter_stability.py           # parameter neighborhood sensitivity check
+uv run scripts/trade_performance_attribution.py # FIFO trade P&L attribution (cost-aware)
+uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS performance
 uv run scripts/<script>.py                      # any analysis script
 ruff check .                # lint (ruff only, no mypy/pytest config)
 ```
@@ -65,6 +71,10 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `LIVE_SPREAD_PCT` | `0.0005` | Live spread fallback |
 | `KIS_TOKEN_MAX_RETRIES` | `3` | KIS token issuance retry count (network/rate-limit/5xx) |
 | `KIWOOM_TOKEN_CACHE_DIR` | `.kiwoom_token_cache/` | Kiwoom token cache directory |
+| `LOG_LEVEL` | `INFO` | 로그 레벨. `DEBUG`로 설정 시 필터별 탈락 티커 목록 포함 상세 로그 출력 |
+| `LOG_FILE` | (없음) | 파일 로깅 경로. 설정 시 일별 로테이션, 30일 보존 |
+| `ETF_DISTRIBUTIONS_FILE` | `data/etf_distributions.csv` | 정규화 분배금 CSV 경로 |
+| `ETF_DISTRIBUTION_TAX_PCT` | `0` | 분배금 현금 귀속 시 적용할 세율 (gross return 기준 0) |
 
 Full list in `README.md` and `.env.sample`.
 
@@ -73,6 +83,9 @@ Full list in `README.md` and `.env.sample`.
 - `outputs_etf_only/` — backtest results: `etf_equity_curve.csv`, `etf_trades.csv`, `performance.json`
 - `outputs_etf_only/` (experiment mode) — also `etf_trades_slip_5bp.csv`..`_30bp.csv`, `slippage_comparison.csv`
 - `outputs_grid/` — grid backtest results: `grid_summary_*.csv`
+- `outputs_stability/` — parameter stability results
+- `outputs_trade_analysis/` — trade performance attribution results
+- `outputs_walk_forward/` — walk-forward validation results
 - `data_cache/` — pykrx OHLCV parquet cache (gitignored)
 - `runtime_state/` — daily runner state: `etf_daily_state.json` (gitignored)
 
@@ -84,7 +97,13 @@ Full list in `README.md` and `.env.sample`.
 - `add_listing_flag()` adds `listing_ok` from KRX `LIST_DD` when available; unknown listing dates are allowed.
 - `add_deviation_flag()` adds `premium_discount`, `deviation_threshold`, and `deviation_ok` from `close` vs `nav`; missing NAV is allowed for price-only compatibility. Threshold resolution order: `ETF_DEVIATION_THRESHOLD_BY_TICKER` > `ETF_DEVIATION_THRESHOLD_BY_GROUP` > `MAX_PREMIUM_DISCOUNT`.
 - `add_price_basis_columns()` sets `close_adj` from `close` by default or from `nav` when `ETF_RETURN_BASIS=nav`. NAV is a total-return approximation, not a full distribution-reinvested return for income ETFs.
+- `add_total_return_price()` (in `etf_distributions.py`) builds a distribution-reinvested total-return index per ticker. Used when `ETF_RETURN_BASIS=total_return`.
 - `config_utils.parse_pct_env()` — parses env var values as `5bp`, `0.5%`, or `0.0005`; `parse_fraction_env()` handles 0-1 caps such as `MAX_ASSET_PCT`.
+- `etf_distributions.py` loads distribution CSV (`data/etf_distributions.csv`), merges ex-date events onto price data, builds a total-return index via `add_total_return_price()`, and computes per-holding distribution cash via `distribution_cash_for_holdings()`. SHA-256 of the CSV is tracked for freeze drift detection.
+- `strategy_freeze.py` + `strategy_freeze.json` pin the candidate universe and live parameters at a point in time. `load_frozen_strategy()` verifies the SHA-256 integrity; `diff_payloads()` reports drift. `check_strategy_freeze.py` compares current `.env` against the frozen snapshot and prints OOS performance when available.
+- `get_valuation_price()` / `update_last_valid_prices()` in `etf_shared.py` handle missing closing prices by falling back to the last known valid price per ticker. Used in the daily runner to prevent zero valuation on missing data.
+- `rank_etfs()` in `etf_shared.py` applies filters step-by-step (liquidity → listing → deviation → trend/return), logging each step's before/after count and dropped tickers at `DEBUG` level. Summary logged at `INFO` level.
+- Both `run_etf_backtest.py` and `live_trading/etf_daily_runner.py` use Python `logging` module with configurable level (`LOG_LEVEL`, default `INFO`) and optional file rotation (`LOG_FILE`, 30-day retention). `DEBUG` level exposes per-filter dropped ticker lists.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.
