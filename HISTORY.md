@@ -2,6 +2,28 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-07 — US_RISK_PROXY 분석: QQQ vs SPY 우위 원인 규명
+
+**목표:** `US_RISK_PROXY=QQQ`가 SPY보다 더 좋은 결과를 내는 이유를 분석하고, 프록시-지수 매칭이 성과를 개선하는지 검증.
+
+**분석 결과:**
+- QQQ가 KOSPI risk_off 구간에서 52.44% risk_on (SPY 46.74% 대비 ~6%p 더 자 risk_on)
+- KOSPI off + US on 구간 수익률: QQQ 전략 24.03% vs SPY 전략 9.99% (+14%p)
+- 프록시-지수 매칭(SPY→S&P, QQQ→Nasdaq)은 오히려 성과를 떨어뜨림
+- Bootstrap CI: Sortino 개선 유의미 (95% CI [+0.015, +0.170]), CAGR/Sharpe는 노이즈 범위 내
+
+**변경:**
+- `scripts/_proxy_utils.py`: 공유 유틸리티 (yfinance 다운로드, 시그널 계산, 한국 거래일 정렬, equity 컬럼 탐지)
+- `scripts/analyze_proxy_signal.py`: SPY/QQQ 시그널 패턴 비교, 포트폴리오 구성 분석, 레짐별 수익률 분석
+- `scripts/sweep_proxy_match.py`: 6가지 프록시-지수 매칭 시나리오 실험 (ETF_LIST 서브셋 주입)
+- `scripts/validate_proxy_stats.py`: Bootstrap CI, 레짐별 수익률, MDD 비교, PASS/HOLD 판정
+
+**출력:** `outputs_compare/proxy_analysis/`, `outputs_compare/proxy_match/`
+
+**파일:** `scripts/_proxy_utils.py`, `scripts/analyze_proxy_signal.py`, `scripts/sweep_proxy_match.py`, `scripts/validate_proxy_stats.py`
+
+---
+
 ## 2026-07 — 멀티 인덱스 리스크 시그널 (Phase 1)
 
 **목표:** KOSPI 단일 시그널 외에 미국 지수(QQQ)를 추가하여, KOSPI risk_off 구간에서 미국 ETF로 회전하는 레짐 디커플링을 구현.

@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (28 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `analyze_current_drawdown.py`.
+- Analysis scripts: `scripts/` (32 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`.
 
 ## Commands
 
@@ -33,6 +33,9 @@ uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS pe
 uv run scripts/analyze_filter_frequency.py       # risk_on + 후보 0개 빈도 분석
 uv run scripts/analyze_zero_candidate_impact.py  # 후보 0개 사건 포트폴리오 영향 분석
 uv run scripts/analyze_current_drawdown.py       # 현재 MDD 기여도·리밸런싱 이력
+uv run scripts/analyze_proxy_signal.py           # SPY vs QQQ 시그널/포트폴리오/레짐 비교 분석
+uv run scripts/sweep_proxy_match.py              # 프록시-지수 매칭 실험 (6 시나리오)
+uv run scripts/validate_proxy_stats.py           # 통계적 검증 (bootstrap CI, 레짐 분석)
 uv run scripts/<script>.py                      # any analysis script
 ruff check .                # lint (ruff only, no mypy/pytest config)
 ```
@@ -107,6 +110,7 @@ Full list in `README.md` and `.env.sample`.
 - `outputs_trade_analysis/` — trade performance attribution results
 - `outputs_walk_forward/` — walk-forward validation results
 - `outputs_walk_forward_compare/` — walk-forward 비교 결과 (target_weight, legacy 등 시나리오별). gitignored
+- `outputs_compare/` — 프록시 분석/비교 실험 결과: `proxy_analysis/` (시그널·포트폴리오·레짐 비교), `proxy_match/` (매칭 실험·통계 검증). gitignored
 - `data_cache/` — pykrx OHLCV parquet cache (gitignored)
 - `runtime_state/` — daily runner state: `etf_daily_state.json` (gitignored)
 

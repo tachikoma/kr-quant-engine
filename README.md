@@ -190,9 +190,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `live_trading/telegram_notifier.py`: 텔레그램 알림 전송
 - `outputs_etf_only/`: 백테스트 결과물
 - `outputs_grid/`: 그리드 백테스트 결과물
+- `outputs_compare/`: 프록시 분석/비교 실험 결과 (`proxy_analysis/`, `proxy_match/`, gitignored)
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
-- `scripts/`: 분석/실험 스크립트 28개
+- `scripts/`: 분석/실험 스크립트 32개
 - `DOCS/`: 추가 문서
 
 ## 분석/실험 스크립트 (`scripts/`)
@@ -219,6 +220,9 @@ uv run scripts/walk_forward_validation.py                # 롤링 walk-forward �
 uv run scripts/validate_etf_distributions.py             # 분배금 파일 범위·해시 점검
 uv run scripts/parameter_stability.py                     # 현재 설정 주변값 안정성 검증
 uv run scripts/trade_performance_attribution.py           # 비용 포함 거래별·종목별 성과 분해
+uv run scripts/analyze_proxy_signal.py                    # SPY vs QQQ 시그널/포트폴리오/레짐 비교 분석
+uv run scripts/sweep_proxy_match.py                       # 프록시-지수 매칭 실험 (6 시나리오)
+uv run scripts/validate_proxy_stats.py                    # 통계적 검증 (bootstrap CI, 레짐 분석)
 ```
 
 ## 표본외 검증 기준
