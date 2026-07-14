@@ -185,7 +185,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `outputs_grid/`: 그리드 백테스트 결과물
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
-- `scripts/`: 분석/실험 스크립트 24개
+- `scripts/`: 분석/실험 스크립트 27개
 - `DOCS/`: 추가 문서
 
 ## 분석/실험 스크립트 (`scripts/`)
@@ -201,6 +201,7 @@ uv run scripts/analyze_filtered_results.py               # 필터링 결과 분�
 uv run scripts/analyze_grid_results.py                   # 그리드 결과 분석
 uv run scripts/analyze_grid_summary.py                   # 그리드 요약 분석
 uv run scripts/analyze_drawdown_trades.py                # 드로우다운 기간 거래 분석
+uv run scripts/analyze_current_drawdown.py               # 현재 MDD 기여도·리밸런싱 이력
 uv run scripts/compare_filtered_vs_baseline.py           # 필터 vs 베이스라인 비교
 uv run scripts/extract_top_losses.py                     # 최대 손실 거래 추출
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
