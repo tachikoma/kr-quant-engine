@@ -768,6 +768,7 @@ def run_etf_strategy(
     max_asset_pct: float | None = None,
     target_weight_rebalance: bool | None = None,
     rebalance_band_pct: float | None = None,
+    trim_overweight_positions: bool | None = None,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
 ):
@@ -896,6 +897,11 @@ def run_etf_strategy(
                 if rebalance_band_pct is not None
                 else float(strategy_cfg.get("rebalance_band_pct", 0.05))
             )
+            effective_trim_overweight_positions = (
+                trim_overweight_positions
+                if trim_overweight_positions is not None
+                else bool(strategy_cfg.get("trim_overweight_positions", False))
+            )
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,
@@ -916,6 +922,7 @@ def run_etf_strategy(
                 ticker_names=ticker_names,
                 target_weight_rebalance=effective_target_weight_rebalance,
                 rebalance_band_pct=effective_rebalance_band_pct,
+                trim_overweight_positions=effective_trim_overweight_positions,
             )
             rebalance_order_count = len(orders)
 
@@ -1772,6 +1779,7 @@ def _build_performance_config() -> dict:
         "max_asset_pct": parse_fraction_env("MAX_ASSET_PCT", 0.50),
         "target_weight_rebalance": strategy_cfg.get("target_weight_rebalance", False),
         "rebalance_band_pct": strategy_cfg.get("rebalance_band_pct", 0.05),
+        "trim_overweight_positions": strategy_cfg.get("trim_overweight_positions", False),
         "liquidate_on_risk_off": strategy_cfg.get("liquidate_on_risk_off", True),
         "slippage": BASE_SLIPPAGE,
         "spread_pct": SPREAD_PCT,

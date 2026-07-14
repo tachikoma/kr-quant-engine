@@ -241,6 +241,8 @@ def get_strategy_config() -> dict:
         "max_live_spread_pct": MAX_LIVE_SPREAD_PCT,
         "target_weight_rebalance": os.environ.get("TARGET_WEIGHT_REBALANCE", "0") == "1",
         "rebalance_band_pct": parse_pct_env("REBALANCE_BAND_PCT", 0.05),
+        "trim_overweight_positions": os.environ.get("TRIM_OVERWEIGHT_POSITIONS", "0")
+        == "1",
         # risk_off 시 전량 매도할지 보유 유지할지 결정
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
         "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
@@ -681,6 +683,7 @@ def build_rebalance_orders(
     market_order_margin_rate: float = 0.0,
     target_weight_rebalance: bool = False,
     rebalance_band_pct: float = 0.05,
+    trim_overweight_positions: bool = False,
 ) -> list[dict]:
     """리밸런싱 주문 목록을 생성한다.
 
@@ -879,6 +882,64 @@ def build_rebalance_orders(
             max_allowed_per_asset = float(max_asset_pct) * float(current_equity)
     except Exception:
         max_allowed_per_asset = None
+
+    # 비대칭 hard-cap: 승자 보유 로직은 유지하고 상한 초과분만 부분매도한다.
+    if trim_overweight_positions and max_allowed_per_asset is not None:
+        for ticker, qty in list(holdings.items()):
+            qty_i = int(qty or 0)
+            price = sell_prices.get(ticker)
+            if qty_i <= 0 or price is None or pd.isna(price) or price <= 0:
+                continue
+            current_value = qty_i * float(price)
+            if current_value <= max_allowed_per_asset:
+                continue
+
+            desired_qty = max(int(max_allowed_per_asset // float(price)), 0)
+            sell_qty = qty_i - desired_qty
+            if sell_qty <= 0:
+                continue
+
+            cost_basis_per_share = cost_basis_map.get(ticker)
+            tax_rate = 0.0
+            if float(sell_tax_pct or 0.0) > 0:
+                if taxable_tickers is None or ticker in taxable_tickers:
+                    tax_rate = float(sell_tax_pct)
+            estimated_value = apply_sell_value(
+                float(price),
+                sell_qty,
+                tax_rate,
+                slippage,
+                cost_basis_per_share=cost_basis_per_share,
+            )
+            sell_price_adj = float(price) * (1 - slippage)
+            gross_proceeds_adj = sell_qty * sell_price_adj
+            taxable_gain = 0.0
+            if cost_basis_per_share is not None:
+                taxable_gain = max(
+                    0.0,
+                    gross_proceeds_adj - sell_qty * cost_basis_per_share,
+                )
+            estimated_tax = taxable_gain * max(tax_rate, 0.0)
+
+            cash += float(estimated_value)
+            holdings[ticker] = desired_qty
+            current_market_value -= sell_qty * float(price)
+            orders.append(
+                {
+                    "side": "SELL",
+                    "ticker": ticker,
+                    "display_name": _dn(ticker),
+                    "qty": sell_qty,
+                    "reference_price": float(price),
+                    "estimated_value": float(estimated_value),
+                    "estimated_tax": float(estimated_tax),
+                    "reason": "ETF_REBALANCE_CAP_TRIM",
+                }
+            )
+            logger.info(
+                f"[주문계산][hard-cap] {_dn(ticker)} {qty_i}→{desired_qty}주 "
+                f"(평가액={current_value:,.0f}, 상한={max_allowed_per_asset:,.0f})"
+            )
 
     # --- 매수 후보 선정 ---
     buy_list = targets[:max_positions]

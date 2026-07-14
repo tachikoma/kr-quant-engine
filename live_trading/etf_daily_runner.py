@@ -157,6 +157,7 @@ class RunnerConfig:
     max_asset_pct: float = 0.50
     target_weight_rebalance: bool = False
     rebalance_band_pct: float = 0.05
+    trim_overweight_positions: bool = False
     liquidate_on_risk_off: bool = True
     max_premium_discount: float = 0.02
     max_live_spread_pct: float = 0.005
@@ -388,6 +389,9 @@ def _read_env_config() -> RunnerConfig:
         max_asset_pct=parse_fraction_env("MAX_ASSET_PCT", 0.50),
         target_weight_rebalance=bool(strategy_cfg.get("target_weight_rebalance", False)),
         rebalance_band_pct=float(strategy_cfg.get("rebalance_band_pct", 0.05)),
+        trim_overweight_positions=bool(
+            strategy_cfg.get("trim_overweight_positions", False)
+        ),
         liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
         max_premium_discount=float(strategy_cfg.get("max_premium_discount", 0.02)),
         max_live_spread_pct=float(strategy_cfg.get("max_live_spread_pct", 0.005)),
@@ -1026,6 +1030,7 @@ def _build_plan(
             market_order_margin_rate=market_order_margin_rate,
             target_weight_rebalance=config.target_weight_rebalance,
             rebalance_band_pct=config.rebalance_band_pct,
+            trim_overweight_positions=config.trim_overweight_positions,
         )
 
     orders = _filter_buy_orders_by_live_guards(
@@ -1861,6 +1866,7 @@ def run_daily() -> None:
                     market_order_margin_rate=_market_order_margin_rate,
                     target_weight_rebalance=cfg.target_weight_rebalance,
                     rebalance_band_pct=cfg.rebalance_band_pct,
+                    trim_overweight_positions=cfg.trim_overweight_positions,
                 )
                 new_orders = _filter_buy_orders_by_live_guards(
                     new_orders,

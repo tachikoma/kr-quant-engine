@@ -41,6 +41,7 @@
     "max_asset_pct": 0.85,
     "target_weight_rebalance": false,
     "rebalance_band_pct": 0.05,
+    "trim_overweight_positions": false,
     "liquidate_on_risk_off": true,
     "slippage": 0.0005,
     "spread_pct": 0.0002,
@@ -80,5 +81,5 @@
     "486290",
     "498400"
   ],
-  "sha256": "b49604ac141bf66c10bfdbf3944aae147088732a82a4ef0d27a70a9b1905d728"
+  "sha256": "f79188f71f52c43901bada94fc75b6dfab76ec1bf952f75b32ad032ea32aae2a"
 }

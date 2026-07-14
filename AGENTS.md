@@ -79,7 +79,9 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_DISTRIBUTION_TAX_PCT` | `0` | 분배금 현금 귀속 시 적용할 세율 (gross return 기준 0) |
 | `TARGET_WEIGHT_REBALANCE` | `0` | `1`이면 전체 포트폴리오 평가액 기준 목표비중 리밸런싱. `0`은 기존 현금 배분 방식 |
 | `REBALANCE_BAND_PCT` | `0.05` | 목표비중 무거래 허용 폭(절대 비중). `TARGET_WEIGHT_REBALANCE=1`일 때 적용 |
+| `TRIM_OVERWEIGHT_POSITIONS` | `0` | `1`이면 기존 승자 보유 방식 유지 + `MAX_ASSET_PCT` 초과분만 부분매도. 기본 비활성 |
 | `WF_TARGET_WEIGHT_REBALANCE` | (env 기본값) | walk-forward 시 목표비중 방식 사용 여부 |
+| `WF_TRIM_OVERWEIGHT_POSITIONS` | (env 기본값) | walk-forward 시 비대칭 하드캡 trim 사용 여부 |
 | `WF_MAX_ASSET_PCT` | `0.50` | walk-forward 전용 종목 비중 상한 |
 | `WF_REBALANCE_BAND_PCT` | `0.10` | walk-forward 전용 절대 비중 무거래 밴드 |
 | `WF_OUTPUT_DIR` | `outputs_walk_forward` | walk-forward 결과 저장 경로. 기존 결과 보존용 |

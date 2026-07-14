@@ -137,6 +137,10 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "WF_TARGET_WEIGHT_REBALANCE",
         bool(rtb.strategy_cfg.get("target_weight_rebalance", False)),
     )
+    trim_overweight_positions = parse_bool_env(
+        "WF_TRIM_OVERWEIGHT_POSITIONS",
+        bool(rtb.strategy_cfg.get("trim_overweight_positions", False)),
+    )
     max_asset_pct = parse_fraction_env(
         "WF_MAX_ASSET_PCT",
         parse_fraction_env("MAX_ASSET_PCT", 0.50),
@@ -174,6 +178,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 max_asset_pct=max_asset_pct,
                 target_weight_rebalance=target_weight_rebalance,
                 rebalance_band_pct=rebalance_band_pct,
+                trim_overweight_positions=trim_overweight_positions,
             )
             curve = curve[["date", "equity"]].copy()
             curve["date"] = pd.to_datetime(curve["date"])
@@ -277,6 +282,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "step_years": step_years,
         "boundary_cost_pct": boundary_cost_pct,
         "target_weight_rebalance": target_weight_rebalance,
+        "trim_overweight_positions": trim_overweight_positions,
         "max_asset_pct": max_asset_pct,
         "rebalance_band_pct": rebalance_band_pct,
         "rebalance_days_grid": rebalance_days,

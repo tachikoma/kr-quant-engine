@@ -66,6 +66,8 @@ python live_trading/etf_daily_runner.py --force-live
   평가액 기준으로 목표비중을 맞춥니다. 기본 `0`은 기존 주문 방식입니다.
 - `REBALANCE_BAND_PCT`: 목표비중 리밸런싱의 무거래 허용 폭. 기본 `0.05`는 절대 비중
   5%p를 뜻하며, `TARGET_WEIGHT_REBALANCE=1`일 때 적용됩니다.
+- `TRIM_OVERWEIGHT_POSITIONS=0|1`: 기존 승자 보유 방식은 유지하고
+  `MAX_ASSET_PCT`를 넘는 보유분만 부분매도합니다. 기본 `0`.
 
 ### 백테스트(run_etf_backtest.py)
 
@@ -78,6 +80,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `MAX_ASSET_PCT` | `0.50` | 자산별 최대 비중 제한 (0: 제한 없음) |
 | `TARGET_WEIGHT_REBALANCE` | `0` | 전체 평가액 기준 목표비중 리밸런싱 활성화 |
 | `REBALANCE_BAND_PCT` | `0.05` | 목표비중 대비 무거래 허용 폭(절대 비중) |
+| `TRIM_OVERWEIGHT_POSITIONS` | `0` | 종목별 비중 상한 초과분만 부분매도 |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |
@@ -232,6 +235,7 @@ uv run scripts/trade_performance_attribution.py           # 비용 포함 거래
 - `WF_ANCHORED=0`: `0`은 rolling window, `1`은 expanding window
 - `WF_BOUNDARY_COST_PCT=0.0015`: 각 테스트 폴드 시작 시 전량 교체를 가정한 비용
 - `WF_TARGET_WEIGHT_REBALANCE=0|1`: walk-forward 시 목표비중 주문 방식 사용 여부
+- `WF_TRIM_OVERWEIGHT_POSITIONS=0|1`: 기존 방식에서 비중 상한 초과분 trim 여부
 - `WF_MAX_ASSET_PCT=0.50`: walk-forward 전용 종목 비중 상한
 - `WF_REBALANCE_BAND_PCT=0.10`: 목표비중 방식의 절대 비중 무거래 밴드
 - `WF_OUTPUT_DIR=outputs_walk_forward`: 기존 결과를 보존할 별도 출력 경로 지정

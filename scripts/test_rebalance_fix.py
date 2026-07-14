@@ -143,6 +143,26 @@ def main():
     assert_condition(not orders, f"Expected no orders inside band, got {orders}")
     print("  Edge 7 (target-weight no-trade band): ✅")
 
+    # Edge case 8: 비대칭 hard-cap은 초과 승자만 trim하고 다시 매수하지 않음
+    orders = build_rebalance_orders(
+        current_holdings={"091160": 80, "102110": 20},
+        target_tickers=["091160", "102110"],
+        latest_prices={"091160": 10_000, "102110": 10_000},
+        available_cash=0,
+        slippage=0,
+        max_asset_pct=0.65,
+        trim_overweight_positions=True,
+    )
+    cap_sell = next(
+        order for order in orders if order["side"] == "SELL" and order["ticker"] == "091160"
+    )
+    assert_condition(cap_sell["qty"] == 15, f"Expected 15 cap-trim sell, got {cap_sell}")
+    assert_condition(
+        not any(order["side"] == "BUY" and order["ticker"] == "091160" for order in orders),
+        f"Cap-trimmed ticker must not be repurchased: {orders}",
+    )
+    print("  Edge 8 (asymmetric hard-cap trim): ✅")
+
     print("\nALL TESTS PASSED")
     sys.exit(0)
 
