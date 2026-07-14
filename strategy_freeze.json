@@ -44,6 +44,7 @@
     "trim_overweight_positions": false,
     "exit_check_days": 0,
     "trailing_stop_pct": 0.0,
+    "portfolio_trailing_stop_pct": 0.0,
     "liquidate_on_risk_off": true,
     "slippage": 0.0005,
     "spread_pct": 0.0002,
@@ -83,5 +84,5 @@
     "486290",
     "498400"
   ],
-  "sha256": "224eee6d05e2622dae4cf4dba39618f96d732357be836b6ba8b0fdef0eae85a6"
+  "sha256": "144fdd04a0da1d0f7856a6d99dba555ae4d3b38c7cb0b500dd510f3ad1f2a55e"
 }

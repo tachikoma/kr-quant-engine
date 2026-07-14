@@ -772,6 +772,7 @@ def run_etf_strategy(
     trim_overweight_positions: bool | None = None,
     exit_check_days: int | None = None,
     trailing_stop_pct: float | None = None,
+    portfolio_trailing_stop_pct: float | None = None,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
 ):
@@ -792,6 +793,7 @@ def run_etf_strategy(
     holdings = {}
     holding_cost_basis = {}
     holding_peak_closes: dict[str, float] = {}
+    portfolio_peak_equity: float | None = None
     last_valid_closes: dict[str, float] = {}
     trades = []
     equity_rows = []
@@ -807,10 +809,67 @@ def run_etf_strategy(
         if trailing_stop_pct is not None
         else parse_fraction_env("ETF_TRAILING_STOP_PCT", 0.0)
     )
+    effective_portfolio_trailing_stop_pct = (
+        float(portfolio_trailing_stop_pct)
+        if portfolio_trailing_stop_pct is not None
+        else parse_fraction_env("ETF_PORTFOLIO_TRAILING_STOP_PCT", 0.0)
+    )
     if effective_exit_check_days < 0:
         raise ValueError("ETF_EXIT_CHECK_DAYS는 0 이상이어야 합니다.")
     if not 0 <= effective_trailing_stop_pct < 1:
         raise ValueError("ETF_TRAILING_STOP_PCT는 0 이상 1 미만이어야 합니다.")
+    if not 0 <= effective_portfolio_trailing_stop_pct < 1:
+        raise ValueError("ETF_PORTFOLIO_TRAILING_STOP_PCT는 0 이상 1 미만이어야 합니다.")
+
+    def execute_exit(
+        ticker: str,
+        qty: int,
+        next_open: pd.Series,
+        next_dt: pd.Timestamp,
+        reason: str,
+    ) -> bool:
+        nonlocal cash
+
+        open_price = safe_get(next_open, ticker)
+        if open_price is None:
+            return False
+        reference_price = open_price * (1 - SPREAD_PCT / 2)
+        cost_basis = holding_cost_basis.get(ticker)
+        tax_rate = ETF_TAXABLE_SELL_TAX_PCT if ticker in TAXABLE_ETF_TICKERS else 0.0
+        net_value = apply_sell_value(
+            reference_price,
+            int(qty),
+            tax_rate,
+            slippage,
+            cost_basis_per_share=cost_basis,
+        )
+        sell_price_adj = reference_price * (1 - slippage)
+        taxable_gain = (
+            max(0.0, int(qty) * (sell_price_adj - cost_basis))
+            if cost_basis is not None
+            else 0.0
+        )
+        estimated_tax = taxable_gain * tax_rate
+        cash += net_value
+        holdings.pop(ticker, None)
+        holding_cost_basis.pop(ticker, None)
+        holding_peak_closes.pop(ticker, None)
+        trades.append(
+            {
+                "date": next_dt,
+                "ticker": ticker,
+                "name": get_ticker_name(ticker),
+                "side": "SELL",
+                "reason": reason,
+                "qty": int(qty),
+                "price": reference_price,
+                "net_value": net_value,
+                "cash_flow": net_value,
+                "estimated_tax": estimated_tax,
+                "cash_after": cash,
+            }
+        )
+        return True
 
     warmup_days = max(120, MARKET_MA_DAYS + MARKET_SLOPE_DAYS)
     for i, dt in enumerate(common_dates[:-1]):
@@ -836,7 +895,20 @@ def run_etf_strategy(
         rebalance_order_count = 0
         exit_order_count = 0
         stopped_tickers: set[str] = set()
+        portfolio_stop_triggered = False
         observer_event: dict | None = None
+
+        current_market_value = 0.0
+        for ticker, qty in holdings.items():
+            close_price = get_valuation_price(ticker, today.get("close"), last_valid_closes)
+            if close_price is not None:
+                current_market_value += qty * close_price
+        current_equity = cash + current_market_value
+        if holdings:
+            portfolio_peak_equity = max(
+                portfolio_peak_equity or current_equity,
+                current_equity,
+            )
 
         # Exit-only overlay: 보유 중 형성된 종가 고점 대비 하락을 별도 주기로 확인하고
         # 다음 거래일 시가에 전량 매도한다. 신규 진입은 기존 리밸런싱 주기를 유지한다.
@@ -849,10 +921,40 @@ def run_etf_strategy(
                 )
         should_check_exit = (
             effective_exit_check_days > 0
-            and effective_trailing_stop_pct > 0
+            and (
+                effective_trailing_stop_pct > 0
+                or effective_portfolio_trailing_stop_pct > 0
+            )
             and (i - warmup_days) % effective_exit_check_days == 0
         )
-        if should_check_exit:
+        should_stop_portfolio = (
+            should_check_exit
+            and effective_portfolio_trailing_stop_pct > 0
+            and portfolio_peak_equity is not None
+            and current_equity
+            <= portfolio_peak_equity * (1 - effective_portfolio_trailing_stop_pct)
+        )
+        if should_stop_portfolio:
+            sellable = all(safe_get(next_open, ticker) is not None for ticker in holdings)
+            if sellable:
+                for ticker, qty in list(holdings.items()):
+                    if execute_exit(
+                        ticker,
+                        int(qty),
+                        next_open,
+                        next_dt,
+                        "ETF_PORTFOLIO_TRAILING_STOP",
+                    ):
+                        stopped_tickers.add(ticker)
+                        exit_order_count += 1
+                portfolio_peak_equity = None
+                portfolio_stop_triggered = True
+
+        if (
+            should_check_exit
+            and effective_trailing_stop_pct > 0
+            and not portfolio_stop_triggered
+        ):
             for ticker, qty in list(holdings.items()):
                 close_price = safe_get(today.get("close"), ticker)
                 peak_close = holding_peak_closes.get(ticker)
@@ -861,49 +963,15 @@ def run_etf_strategy(
                 if close_price > peak_close * (1 - effective_trailing_stop_pct):
                     continue
 
-                open_price = safe_get(next_open, ticker)
-                if open_price is None:
-                    continue
-                reference_price = open_price * (1 - SPREAD_PCT / 2)
-                cost_basis = holding_cost_basis.get(ticker)
-                tax_rate = (
-                    ETF_TAXABLE_SELL_TAX_PCT if ticker in TAXABLE_ETF_TICKERS else 0.0
-                )
-                net_value = apply_sell_value(
-                    reference_price,
+                if execute_exit(
+                    ticker,
                     int(qty),
-                    tax_rate,
-                    slippage,
-                    cost_basis_per_share=cost_basis,
-                )
-                sell_price_adj = reference_price * (1 - slippage)
-                taxable_gain = (
-                    max(0.0, int(qty) * (sell_price_adj - cost_basis))
-                    if cost_basis is not None
-                    else 0.0
-                )
-                estimated_tax = taxable_gain * tax_rate
-                cash += net_value
-                holdings.pop(ticker, None)
-                holding_cost_basis.pop(ticker, None)
-                holding_peak_closes.pop(ticker, None)
-                stopped_tickers.add(ticker)
-                exit_order_count += 1
-                trades.append(
-                    {
-                        "date": next_dt,
-                        "ticker": ticker,
-                        "name": get_ticker_name(ticker),
-                        "side": "SELL",
-                        "reason": "ETF_TRAILING_STOP",
-                        "qty": int(qty),
-                        "price": reference_price,
-                        "net_value": net_value,
-                        "cash_flow": net_value,
-                        "estimated_tax": estimated_tax,
-                        "cash_after": cash,
-                    }
-                )
+                    next_open,
+                    next_dt,
+                    "ETF_TRAILING_STOP",
+                ):
+                    stopped_tickers.add(ticker)
+                    exit_order_count += 1
 
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
@@ -923,6 +991,8 @@ def run_etf_strategy(
                     # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
                     targets = []
             else:
+                targets = []
+            if portfolio_stop_triggered:
                 targets = []
             if stopped_tickers:
                 targets = [ticker for ticker in targets if ticker not in stopped_tickers]
@@ -1088,11 +1158,16 @@ def run_etf_strategy(
                     holding_peak_closes.get(ticker, close_price),
                     close_price,
                 )
+        post_equity = cash + market_value
+        if holdings:
+            portfolio_peak_equity = max(portfolio_peak_equity or post_equity, post_equity)
+        else:
+            portfolio_peak_equity = None
 
         equity_rows.append(
             {
                 "date": next_dt,
-                "equity": cash + market_value,
+                "equity": post_equity,
                 "cash": cash,
                 "market_value": market_value,
                 "holdings": ",".join(sorted(map(str, holdings.keys()))),
@@ -1878,6 +1953,9 @@ def _build_performance_config() -> dict:
         "trim_overweight_positions": strategy_cfg.get("trim_overweight_positions", False),
         "exit_check_days": int(os.environ.get("ETF_EXIT_CHECK_DAYS", "0")),
         "trailing_stop_pct": parse_fraction_env("ETF_TRAILING_STOP_PCT", 0.0),
+        "portfolio_trailing_stop_pct": parse_fraction_env(
+            "ETF_PORTFOLIO_TRAILING_STOP_PCT", 0.0
+        ),
         "liquidate_on_risk_off": strategy_cfg.get("liquidate_on_risk_off", True),
         "slippage": BASE_SLIPPAGE,
         "spread_pct": SPREAD_PCT,

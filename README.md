@@ -83,6 +83,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `TRIM_OVERWEIGHT_POSITIONS` | `0` | 종목별 비중 상한 초과분만 부분매도 |
 | `ETF_EXIT_CHECK_DAYS` | `0` | trailing exit 점검 주기(거래일, 0=비활성) |
 | `ETF_TRAILING_STOP_PCT` | `0` | 보유 종가 고점 대비 trailing stop 비율 |
+| `ETF_PORTFOLIO_TRAILING_STOP_PCT` | `0` | 포트폴리오 고점 대비 전량 청산 비율 |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |
@@ -185,7 +186,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `outputs_grid/`: 그리드 백테스트 결과물
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
-- `scripts/`: 분석/실험 스크립트 27개
+- `scripts/`: 분석/실험 스크립트 28개
 - `DOCS/`: 추가 문서
 
 ## 분석/실험 스크립트 (`scripts/`)
@@ -202,6 +203,7 @@ uv run scripts/analyze_grid_results.py                   # 그리드 결과 분�
 uv run scripts/analyze_grid_summary.py                   # 그리드 요약 분석
 uv run scripts/analyze_drawdown_trades.py                # 드로우다운 기간 거래 분석
 uv run scripts/analyze_current_drawdown.py               # 현재 MDD 기여도·리밸런싱 이력
+uv run scripts/portfolio_stop_sensitivity.py             # 포트폴리오 stop 민감도 분석
 uv run scripts/compare_filtered_vs_baseline.py           # 필터 vs 베이스라인 비교
 uv run scripts/extract_top_losses.py                     # 최대 손실 거래 추출
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
@@ -244,6 +246,7 @@ uv run scripts/trade_performance_attribution.py           # 비용 포함 거래
 - `WF_OUTPUT_DIR=outputs_walk_forward`: 기존 결과를 보존할 별도 출력 경로 지정
 - `WF_EXIT_CHECK_DAYS=0`: OOS trailing exit 점검 주기
 - `WF_TRAILING_STOP_PCT=0`: OOS trailing stop 비율
+- `WF_PORTFOLIO_TRAILING_STOP_PCT=0`: OOS 포트폴리오 trailing stop 비율
 
 ### 파라미터 주변값 안정성
 

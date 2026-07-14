@@ -70,6 +70,9 @@ def current_strategy_payload() -> dict:
             "trim_overweight_positions": cfg.get("trim_overweight_positions", False),
             "exit_check_days": int(os.environ.get("ETF_EXIT_CHECK_DAYS", "0")),
             "trailing_stop_pct": parse_fraction_env("ETF_TRAILING_STOP_PCT", 0.0),
+            "portfolio_trailing_stop_pct": parse_fraction_env(
+                "ETF_PORTFOLIO_TRAILING_STOP_PCT", 0.0
+            ),
             "liquidate_on_risk_off": cfg.get("liquidate_on_risk_off", True),
             "slippage": parse_pct_env("ETF_BASE_SLIPPAGE", 0.0005),
             "spread_pct": parse_pct_env("ETF_SPREAD_PCT", 0.0005),

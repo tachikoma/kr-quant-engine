@@ -151,6 +151,9 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     )
     exit_check_days = int(os.environ.get("WF_EXIT_CHECK_DAYS", "0"))
     trailing_stop_pct = parse_fraction_env("WF_TRAILING_STOP_PCT", 0.0)
+    portfolio_trailing_stop_pct = parse_fraction_env(
+        "WF_PORTFOLIO_TRAILING_STOP_PCT", 0.0
+    )
     if exit_check_days < 0:
         raise ValueError("WF_EXIT_CHECK_DAYS는 0 이상이어야 합니다.")
     if min(train_years, test_years, step_years) <= 0:
@@ -185,6 +188,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 trim_overweight_positions=trim_overweight_positions,
                 exit_check_days=exit_check_days,
                 trailing_stop_pct=trailing_stop_pct,
+                portfolio_trailing_stop_pct=portfolio_trailing_stop_pct,
             )
             curve = curve[["date", "equity"]].copy()
             curve["date"] = pd.to_datetime(curve["date"])
@@ -293,6 +297,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "rebalance_band_pct": rebalance_band_pct,
         "exit_check_days": exit_check_days,
         "trailing_stop_pct": trailing_stop_pct,
+        "portfolio_trailing_stop_pct": portfolio_trailing_stop_pct,
         "rebalance_days_grid": rebalance_days,
         "max_positions_grid": max_positions,
         "fold_count": len(folds_df),

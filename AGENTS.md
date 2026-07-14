@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (27 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `analyze_current_drawdown.py`.
+- Analysis scripts: `scripts/` (28 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `analyze_current_drawdown.py`.
 
 ## Commands
 
@@ -83,10 +83,12 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `TRIM_OVERWEIGHT_POSITIONS` | `0` | `1`이면 기존 승자 보유 방식 유지 + `MAX_ASSET_PCT` 초과분만 부분매도. 기본 비활성 |
 | `ETF_EXIT_CHECK_DAYS` | `0` | trailing exit 점검 주기(거래일, 0=비활성). 백테스트 실험 전용 |
 | `ETF_TRAILING_STOP_PCT` | `0` | 보유 종가 고점 대비 trailing stop 비율 (0=비활성) |
+| `ETF_PORTFOLIO_TRAILING_STOP_PCT` | `0` | 포트폴리오 고점 대비 전량 청산 비율 (0=비활성). 백테스트 실험 전용 |
 | `WF_TARGET_WEIGHT_REBALANCE` | (env 기본값) | walk-forward 시 목표비중 방식 사용 여부 |
 | `WF_TRIM_OVERWEIGHT_POSITIONS` | (env 기본값) | walk-forward 시 비대칭 하드캡 trim 사용 여부 |
 | `WF_EXIT_CHECK_DAYS` | `0` | walk-forward trailing exit 점검 주기 |
 | `WF_TRAILING_STOP_PCT` | `0` | walk-forward trailing stop 비율 |
+| `WF_PORTFOLIO_TRAILING_STOP_PCT` | `0` | walk-forward 포트폴리오 trailing stop 비율 |
 | `WF_MAX_ASSET_PCT` | `0.50` | walk-forward 전용 종목 비중 상한 |
 | `WF_REBALANCE_BAND_PCT` | `0.10` | walk-forward 전용 절대 비중 무거래 밴드 |
 | `WF_OUTPUT_DIR` | `outputs_walk_forward` | walk-forward 결과 저장 경로. 기존 결과 보존용 |
