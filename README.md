@@ -81,6 +81,8 @@ python live_trading/etf_daily_runner.py --force-live
 | `TARGET_WEIGHT_REBALANCE` | `0` | 전체 평가액 기준 목표비중 리밸런싱 활성화 |
 | `REBALANCE_BAND_PCT` | `0.05` | 목표비중 대비 무거래 허용 폭(절대 비중) |
 | `TRIM_OVERWEIGHT_POSITIONS` | `0` | 종목별 비중 상한 초과분만 부분매도 |
+| `ETF_EXIT_CHECK_DAYS` | `0` | trailing exit 점검 주기(거래일, 0=비활성) |
+| `ETF_TRAILING_STOP_PCT` | `0` | 보유 종가 고점 대비 trailing stop 비율 |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |
@@ -239,6 +241,8 @@ uv run scripts/trade_performance_attribution.py           # 비용 포함 거래
 - `WF_MAX_ASSET_PCT=0.50`: walk-forward 전용 종목 비중 상한
 - `WF_REBALANCE_BAND_PCT=0.10`: 목표비중 방식의 절대 비중 무거래 밴드
 - `WF_OUTPUT_DIR=outputs_walk_forward`: 기존 결과를 보존할 별도 출력 경로 지정
+- `WF_EXIT_CHECK_DAYS=0`: OOS trailing exit 점검 주기
+- `WF_TRAILING_STOP_PCT=0`: OOS trailing stop 비율
 
 ### 파라미터 주변값 안정성
 

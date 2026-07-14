@@ -149,6 +149,10 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "WF_REBALANCE_BAND_PCT",
         float(rtb.strategy_cfg.get("rebalance_band_pct", 0.05)),
     )
+    exit_check_days = int(os.environ.get("WF_EXIT_CHECK_DAYS", "0"))
+    trailing_stop_pct = parse_fraction_env("WF_TRAILING_STOP_PCT", 0.0)
+    if exit_check_days < 0:
+        raise ValueError("WF_EXIT_CHECK_DAYS는 0 이상이어야 합니다.")
     if min(train_years, test_years, step_years) <= 0:
         raise ValueError("WF_TRAIN_YEARS/WF_TEST_YEARS/WF_STEP_YEARS는 양수여야 합니다.")
     if not 0 <= boundary_cost_pct <= 0.1:
@@ -179,6 +183,8 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 target_weight_rebalance=target_weight_rebalance,
                 rebalance_band_pct=rebalance_band_pct,
                 trim_overweight_positions=trim_overweight_positions,
+                exit_check_days=exit_check_days,
+                trailing_stop_pct=trailing_stop_pct,
             )
             curve = curve[["date", "equity"]].copy()
             curve["date"] = pd.to_datetime(curve["date"])
@@ -285,6 +291,8 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "trim_overweight_positions": trim_overweight_positions,
         "max_asset_pct": max_asset_pct,
         "rebalance_band_pct": rebalance_band_pct,
+        "exit_check_days": exit_check_days,
+        "trailing_stop_pct": trailing_stop_pct,
         "rebalance_days_grid": rebalance_days,
         "max_positions_grid": max_positions,
         "fold_count": len(folds_df),

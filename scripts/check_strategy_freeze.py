@@ -68,6 +68,8 @@ def current_strategy_payload() -> dict:
             "target_weight_rebalance": cfg.get("target_weight_rebalance", False),
             "rebalance_band_pct": cfg.get("rebalance_band_pct", 0.05),
             "trim_overweight_positions": cfg.get("trim_overweight_positions", False),
+            "exit_check_days": int(os.environ.get("ETF_EXIT_CHECK_DAYS", "0")),
+            "trailing_stop_pct": parse_fraction_env("ETF_TRAILING_STOP_PCT", 0.0),
             "liquidate_on_risk_off": cfg.get("liquidate_on_risk_off", True),
             "slippage": parse_pct_env("ETF_BASE_SLIPPAGE", 0.0005),
             "spread_pct": parse_pct_env("ETF_SPREAD_PCT", 0.0005),
