@@ -2,6 +2,31 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-07 — 포트폴리오 리스크 관리 실험 및 성과 리포트 교정
+
+**목표:** 현재 모멘텀 전략의 집중 위험을 완화할 수 있는 리밸런싱/청산 규칙을 구현하고 OOS로 검증.
+
+**구현 및 검증 결과:**
+
+| 실험 | 구현 | OOS 결과 | 결정 |
+|---|---|---|---|
+| 목표비중 리밸런싱 | `TARGET_WEIGHT_REBALANCE`, `REBALANCE_BAND_PCT` | CAGR 17.36→14.57%, MDD -15→-20% | 채택 안 함 |
+| 비대칭 하드캡 | `TRIM_OVERWEIGHT_POSITIONS` | cap 70% CAGR 하락만, 85%는 미작동 | 채택 안 함 |
+| 종목별 trailing stop | `ETF_EXIT_CHECK_DAYS`, `ETF_TRAILING_STOP_PCT` | 마지막 fold에만 미미한 개선 | 채택 안 함 |
+| 포트폴리오 trailing stop | `ETF_PORTFOLIO_TRAILING_STOP_PCT` | 20%가 우수하나 엔드포인트 과적합 의심 | 채택 안 함 |
+
+**공통 교훈:** 승자 비중을 줄이거나 조기에 청산하는 규칙은 모멘텀 전략의 상승 참여율을 떨어뜨리지만, 하락 방어 효과는 충분히 나오지 않았다. 특히 OOS 마지막 fold에만 집중된 개선은 일반화되기 어렵다.
+
+**기타 변경:**
+- 성과 리포트 교정: MDD 고점/저점/회복일/진행 여부, Rolling CAGR/MDD/Sharpe/Sortino 누락 버그 수정, 회전율 gross/one-way 분리, 리밸런싱 판단/거래/무거래 분리, 청산/미청산 lot 보유기간 분리
+- `analyze_current_drawdown.py`: 포지션별 고점 비중·가격 하락·손실 기여도 및 리밸런싱 판단 이력 분석 스크립트
+- `portfolio_stop_sensitivity.py`: 포트폴리오 stop 민감도 분석 스크립트
+- `walk_forward_validation.py`: 목표비중/cap/밴드/trailing stop 별 독립 실행, `WF_OUTPUT_DIR`로 기존 결과 보존
+
+**파일:** `etf_shared.py`, `run_etf_backtest.py`, `live_trading/etf_daily_runner.py`, `scripts/walk_forward_validation.py`, `scripts/analyze_current_drawdown.py`, `scripts/portfolio_stop_sensitivity.py`, `scripts/check_strategy_freeze.py`, `scripts/test_rebalance_fix.py`, `strategy_freeze.json`, `.env.sample`, `README.md`, `AGENTS.md`
+
+---
+
 ## 2026-07 — 후보 0개 진단 프레임워크 및 영향 분석
 
 **문제:** `risk_on + 후보 0개` 빈도(11.7%)가 5% 기준을 초과하여 정상 작동인지 조사 필요.
