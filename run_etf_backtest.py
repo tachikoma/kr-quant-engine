@@ -812,6 +812,7 @@ def run_etf_strategy(
         )
         update_last_valid_prices(last_valid_closes, today.get("close"))
         should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
+        rebalance_order_count = 0
         observer_event: dict | None = None
 
         if should_rebalance:
@@ -902,6 +903,7 @@ def run_etf_strategy(
                 max_asset_pct=effective_max_asset_pct,
                 ticker_names=ticker_names,
             )
+            rebalance_order_count = len(orders)
 
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)
             for o in orders:
@@ -975,6 +977,8 @@ def run_etf_strategy(
                 "market_value": market_value,
                 "holdings": ",".join(sorted(map(str, holdings.keys()))),
                 "distribution_cash": distribution_cash,
+                "rebalance_decision": should_rebalance,
+                "rebalance_order_count": rebalance_order_count,
             }
         )
 
@@ -1087,6 +1091,17 @@ def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dic
     mdd = drawdown.min()
     # 주의: mdd는 음수로 반환됩니다 (예: -0.25 == -25% 최대 낙폭)
 
+    trough_idx = drawdown.idxmin()
+    peak_idx = temp.loc[:trough_idx, equity_col].idxmax()
+    peak_value = float(temp.loc[peak_idx, equity_col])
+    recovery_mask = temp.loc[trough_idx + 1 :, equity_col] >= peak_value
+    recovery_idx = recovery_mask[recovery_mask].index.min() if recovery_mask.any() else None
+    current_peak_idx = temp[equity_col].idxmax()
+    current_drawdown = float(drawdown.iloc[-1])
+    current_drawdown_days = int(
+        (temp["date"].iloc[-1] - temp.loc[current_peak_idx, "date"]).days
+    )
+
     # 변동성은 모집단 기준(ddof=0) 표준편차로 계산
     volatility = returns.std(ddof=0) * np.sqrt(252) if not returns.empty else 0.0
 
@@ -1126,6 +1141,15 @@ def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dic
         "total_return": total_return,
         "cagr": cagr,
         "mdd": mdd,
+        "mdd_peak_date": str(temp.loc[peak_idx, "date"].date()),
+        "mdd_trough_date": str(temp.loc[trough_idx, "date"].date()),
+        "mdd_recovery_date": (
+            str(temp.loc[recovery_idx, "date"].date()) if recovery_idx is not None else None
+        ),
+        "mdd_in_progress": recovery_idx is None,
+        "current_drawdown": current_drawdown,
+        "current_drawdown_peak_date": str(temp.loc[current_peak_idx, "date"].date()),
+        "current_drawdown_days": current_drawdown_days,
         "volatility": volatility,
         "sharpe": sharpe,
         "sortino": sortino,
@@ -1138,31 +1162,63 @@ def calc_stats(df: pd.DataFrame, equity_col: str, risk_free: float = 0.0) -> dic
     }
 
 
-def calc_trading_stats(trades: pd.DataFrame, equity: pd.Series, dates: pd.Series) -> dict:
+def calc_trading_stats(
+    trades: pd.DataFrame,
+    equity: pd.Series,
+    dates: pd.Series,
+    rebalance_decisions: pd.Series | None = None,
+) -> dict:
     """거래내역에서 회전율·보유기간·리밸런싱 빈도를 계산한다.
 
-    turnover는 매수와 매도의 총 체결대금을 평균 운용자산으로 나눈 값이다. 따라서
-    100%는 평균 자산과 동일한 금액이 한 번 거래된 것을 뜻하며, 매수/매도 모두 포함한다.
+    gross turnover은 매수와 매도의 총 체결대금을 평균 운용자산으로
+    나눈 값이다. one-way turnover은 매수·매도 중 작은 금액을 사용한다.
     """
     period_days = max((pd.to_datetime(dates).max() - pd.to_datetime(dates).min()).days, 1)
     years = period_days / 365.25
     if trades.empty:
+        scheduled_rebalance_count = (
+            int(pd.Series(rebalance_decisions).fillna(False).astype(bool).sum())
+            if rebalance_decisions is not None
+            else 0
+        )
         return {
             "trade_count": 0,
             "rebalance_count": 0,
             "rebalances_per_year": 0.0,
             "turnover": 0.0,
             "annual_turnover": 0.0,
+            "gross_turnover": 0.0,
+            "annual_gross_turnover": 0.0,
+            "one_way_turnover": 0.0,
+            "annual_one_way_turnover": 0.0,
+            "buy_value": 0.0,
+            "sell_value": 0.0,
             "avg_holding_days": np.nan,
+            "avg_closed_holding_days": np.nan,
+            "avg_open_holding_days": np.nan,
+            "oldest_open_holding_days": np.nan,
+            "open_quantity": 0,
+            "scheduled_rebalance_count": scheduled_rebalance_count,
+            "trade_rebalance_count": 0,
+            "no_trade_rebalance_count": scheduled_rebalance_count,
+            "scheduled_rebalances_per_year": (
+                scheduled_rebalance_count / years
+                if years > 0
+                else float(scheduled_rebalance_count)
+            ),
+            "trade_rebalances_per_year": 0.0,
         }
 
     data = trades.copy()
     data["date"] = pd.to_datetime(data["date"])
     data["qty"] = pd.to_numeric(data["qty"], errors="coerce").fillna(0).astype(int)
     data["net_value"] = pd.to_numeric(data["net_value"], errors="coerce").fillna(0.0).abs()
-    total_traded_value = float(data["net_value"].sum())
+    buy_value = float(data.loc[data["side"].str.upper() == "BUY", "net_value"].sum())
+    sell_value = float(data.loc[data["side"].str.upper() == "SELL", "net_value"].sum())
+    total_traded_value = buy_value + sell_value
     average_equity = float(pd.to_numeric(equity, errors="coerce").mean())
-    turnover = total_traded_value / average_equity if average_equity > 0 else np.nan
+    gross_turnover = total_traded_value / average_equity if average_equity > 0 else np.nan
+    one_way_turnover = min(buy_value, sell_value) / average_equity if average_equity > 0 else np.nan
 
     # FIFO로 매수 수량과 매도 수량을 대응시켜, 부분매도가 있어도 수량 가중 보유기간을 계산한다.
     open_lots: dict[str, list[list[object]]] = {}
@@ -1189,19 +1245,65 @@ def calc_trading_stats(trades: pd.DataFrame, equity: pd.Series, dates: pd.Series
             remaining -= matched
         open_lots[ticker] = [lot for lot in open_lots.get(ticker, []) if int(lot[1]) > 0]
 
-    rebalance_count = int(data["date"].dt.normalize().nunique())
+    trade_rebalance_count = int(data["date"].dt.normalize().nunique())
+    scheduled_rebalance_count = (
+        int(pd.Series(rebalance_decisions).fillna(False).astype(bool).sum())
+        if rebalance_decisions is not None
+        else trade_rebalance_count
+    )
+    as_of_date = pd.to_datetime(dates).max()
+    open_holding_day_weight = 0.0
+    open_qty = 0
+    oldest_open_holding_days = 0
+    for lots in open_lots.values():
+        for lot_date, lot_qty in lots:
+            qty = int(lot_qty)
+            age_days = max((as_of_date - lot_date).days, 0)
+            open_holding_day_weight += qty * age_days
+            open_qty += qty
+            oldest_open_holding_days = max(oldest_open_holding_days, age_days)
+
+    avg_closed_holding_days = holding_day_weight / closed_qty if closed_qty > 0 else np.nan
     return {
         "trade_count": int(len(data)),
-        "rebalance_count": rebalance_count,
-        "rebalances_per_year": rebalance_count / years if years > 0 else float(rebalance_count),
-        "turnover": turnover,
-        "annual_turnover": turnover / years if years > 0 else np.nan,
-        "avg_holding_days": holding_day_weight / closed_qty if closed_qty > 0 else np.nan,
+        # 기존 키는 하위 호환을 위해 거래 발생일/gross 정의를 유지한다.
+        "rebalance_count": trade_rebalance_count,
+        "rebalances_per_year": (
+            trade_rebalance_count / years if years > 0 else float(trade_rebalance_count)
+        ),
+        "turnover": gross_turnover,
+        "annual_turnover": gross_turnover / years if years > 0 else np.nan,
+        "gross_turnover": gross_turnover,
+        "annual_gross_turnover": gross_turnover / years if years > 0 else np.nan,
+        "one_way_turnover": one_way_turnover,
+        "annual_one_way_turnover": one_way_turnover / years if years > 0 else np.nan,
+        "buy_value": buy_value,
+        "sell_value": sell_value,
+        "scheduled_rebalance_count": scheduled_rebalance_count,
+        "trade_rebalance_count": trade_rebalance_count,
+        "no_trade_rebalance_count": max(
+            scheduled_rebalance_count - trade_rebalance_count, 0
+        ),
+        "scheduled_rebalances_per_year": (
+            scheduled_rebalance_count / years
+            if years > 0
+            else float(scheduled_rebalance_count)
+        ),
+        "trade_rebalances_per_year": (
+            trade_rebalance_count / years if years > 0 else float(trade_rebalance_count)
+        ),
+        "avg_holding_days": avg_closed_holding_days,
+        "avg_closed_holding_days": avg_closed_holding_days,
+        "avg_open_holding_days": (
+            open_holding_day_weight / open_qty if open_qty > 0 else np.nan
+        ),
+        "oldest_open_holding_days": oldest_open_holding_days if open_qty > 0 else np.nan,
+        "open_quantity": open_qty,
     }
 
 
 def build_return_reports(df: pd.DataFrame, equity_col: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """월간/연간 수익률과 1년 롤링 위험지표를 반환한다."""
+    """월간/연간 수익률과 1년·3년 롤링 위험지표를 반환한다."""
     temp = df[["date", equity_col]].dropna().copy().sort_values("date")
     temp["date"] = pd.to_datetime(temp["date"])
     temp = temp.set_index("date")
@@ -1209,20 +1311,57 @@ def build_return_reports(df: pd.DataFrame, equity_col: str) -> tuple[pd.DataFram
     monthly = temp[equity_col].resample("ME").last().pct_change().dropna().rename("return").reset_index()
     annual = temp[equity_col].resample("YE").last().pct_change().dropna().rename("return").reset_index()
 
-    window = 252
+    def rolling_mdd(values: np.ndarray) -> float:
+        return float((values / np.maximum.accumulate(values) - 1).min())
+
+    def rolling_sharpe(values: np.ndarray) -> float:
+        volatility = values.std(ddof=0) * np.sqrt(252)
+        return float(values.mean() * 252 / volatility) if volatility > 0 else np.nan
+
+    def rolling_sortino(values: np.ndarray) -> float:
+        downside = np.sqrt(np.mean(np.square(np.minimum(values, 0.0)))) * np.sqrt(252)
+        return float(values.mean() * 252 / downside) if downside > 0 else np.nan
+
+    window_1y = 252
+    window_3y = 252 * 3
     rolling = pd.DataFrame({"date": temp.index, "equity": temp[equity_col].to_numpy()})
-    rolling["rolling_1y_cagr"] = temp[equity_col].pct_change(window)
-    rolling["rolling_1y_mdd"] = temp[equity_col].rolling(window, min_periods=window).apply(
-        lambda values: (values / np.maximum.accumulate(values) - 1).min(), raw=True
+    # temp의 DatetimeIndex와 rolling의 RangeIndex가 자동 정렬되지 않도록 위치 기준으로 대입한다.
+    rolling["rolling_1y_cagr"] = temp[equity_col].pct_change(window_1y).to_numpy()
+    rolling["rolling_1y_mdd"] = (
+        temp[equity_col]
+        .rolling(window_1y, min_periods=window_1y)
+        .apply(rolling_mdd, raw=True)
+        .to_numpy()
     )
-    rolling["rolling_1y_sortino"] = daily_returns.rolling(window, min_periods=window).apply(
-        lambda values: (
-            values.mean() * 252 / (np.sqrt(np.mean(np.square(np.minimum(values, 0.0)))) * np.sqrt(252))
-            if np.any(values < 0)
-            else np.nan
-        ),
-        raw=True,
+    rolling["rolling_1y_sharpe"] = (
+        daily_returns.rolling(window_1y, min_periods=window_1y)
+        .apply(rolling_sharpe, raw=True)
+        .to_numpy()
+    )
+    rolling["rolling_1y_sortino"] = (
+        daily_returns.rolling(window_1y, min_periods=window_1y)
+        .apply(rolling_sortino, raw=True)
+        .to_numpy()
+    )
+    rolling["rolling_3y_cagr"] = (
+        (temp[equity_col] / temp[equity_col].shift(window_3y)) ** (1 / 3) - 1
     ).to_numpy()
+    rolling["rolling_3y_mdd"] = (
+        temp[equity_col]
+        .rolling(window_3y, min_periods=window_3y)
+        .apply(rolling_mdd, raw=True)
+        .to_numpy()
+    )
+    rolling["rolling_3y_sharpe"] = (
+        daily_returns.rolling(window_3y, min_periods=window_3y)
+        .apply(rolling_sharpe, raw=True)
+        .to_numpy()
+    )
+    rolling["rolling_3y_sortino"] = (
+        daily_returns.rolling(window_3y, min_periods=window_3y)
+        .apply(rolling_sortino, raw=True)
+        .to_numpy()
+    )
     return monthly, annual, rolling
 
 
@@ -1371,6 +1510,12 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
     result["equity"] = result["equity"].ffill().fillna(INITIAL_CASH)
     result["cash"] = result["cash"].ffill().fillna(INITIAL_CASH)
     result["market_value"] = result["market_value"].ffill().fillna(0)
+    result["rebalance_decision"] = (
+        result["rebalance_decision"].astype("boolean").fillna(False).astype(bool)
+    )
+    result["rebalance_order_count"] = (
+        result["rebalance_order_count"].fillna(0).astype(int)
+    )
 
     if ENABLE_BENCHMARK and "equity_kodex200_bh" in result.columns:
         result["equity_kodex200_bh"] = result["equity_kodex200_bh"].ffill().fillna(INITIAL_CASH)
@@ -1442,7 +1587,12 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     strategy_stats = calc_stats(df, "equity")
     period = get_backtest_period(df, "equity")
     invested_ratio = (df["market_value"] / df["equity"]).replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).mean()
-    trading_stats = calc_trading_stats(trades, df["equity"], df["date"])
+    trading_stats = calc_trading_stats(
+        trades,
+        df["equity"],
+        df["date"],
+        df.get("rebalance_decision"),
+    )
     strategy_stats.update({"avg_invested_ratio": invested_ratio, **trading_stats})
 
     print("\n=== 일반 백테스트 결과 ===")
@@ -1455,6 +1605,16 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     print(f"누적 수익률: {strategy_stats['total_return']:.2%}")
     print(f"CAGR: {strategy_stats['cagr']:.2%}")
     print(f"MDD: {strategy_stats['mdd']:.2%}")
+    print(
+        "MDD 구간: "
+        f"{strategy_stats['mdd_peak_date']} → {strategy_stats['mdd_trough_date']} "
+        f"(회복: {strategy_stats['mdd_recovery_date'] or '미회복'})"
+    )
+    print(
+        f"현재 낙폭: {strategy_stats['current_drawdown']:.2%} "
+        f"({strategy_stats['current_drawdown_peak_date']} 고점 이후 "
+        f"{strategy_stats['current_drawdown_days']}일)"
+    )
     print(f"변동성(연환산): {strategy_stats['volatility']:.2%}")
     print(f"샤프: {strategy_stats['sharpe']:.4f}")
     print(f"Sortino: {strategy_stats['sortino']:.4f}")
@@ -1464,9 +1624,24 @@ def summarize_single(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[dict, dict
     print(f"Tail Ratio: {strategy_stats['tail_ratio']:.4f}")
     print(f"Recovery Factor: {strategy_stats['recovery_factor']:.4f}")
     print(f"거래 수: {trading_stats['trade_count']}")
-    print(f"회전율(전체/연환산): {trading_stats['turnover']:.2%} / {trading_stats['annual_turnover']:.2%}")
-    print(f"평균 보유기간(청산분): {trading_stats['avg_holding_days']:.1f}일")
-    print(f"연간 리밸런싱 횟수: {trading_stats['rebalances_per_year']:.2f}")
+    print(
+        "연환산 회전율(gross/one-way): "
+        f"{trading_stats['annual_gross_turnover']:.2%} / "
+        f"{trading_stats['annual_one_way_turnover']:.2%}"
+    )
+    print(f"평균 보유기간(청산 lot): {trading_stats['avg_closed_holding_days']:.1f}일")
+    if pd.notna(trading_stats["avg_open_holding_days"]):
+        print(
+            f"평균 보유기간(미청산 lot): "
+            f"{trading_stats['avg_open_holding_days']:.1f}일 "
+            f"(최장 {trading_stats['oldest_open_holding_days']}일)"
+        )
+    print(
+        "리밸런싱 판단/거래 발생/무거래: "
+        f"{trading_stats['scheduled_rebalance_count']} / "
+        f"{trading_stats['trade_rebalance_count']} / "
+        f"{trading_stats['no_trade_rebalance_count']}"
+    )
     print(f"평균 투자 비중: {invested_ratio:.4f}")
 
     benchmark_stats = None
@@ -1760,6 +1935,8 @@ def main():
             "market_value",
             "holdings",
             "distribution_cash",
+            "rebalance_decision",
+            "rebalance_order_count",
         ]
         if "equity_benchmark" in curve_to_save.columns:
             save_cols.append("equity_benchmark")
