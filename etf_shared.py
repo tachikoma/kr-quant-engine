@@ -93,31 +93,67 @@ ETF_LIST = [
     "367760",  # RISE 네트워크인프라
 ]
 
-# 환경변수 `ETF_LIST`가 쉼표로 전달되면 모듈 로드 시점에 기본 후보풀을 재정의합니다.
-env_list = os.environ.get("ETF_LIST")
-if env_list:
-    parsed = [t.strip() for t in env_list.split(",") if t.strip()]
+# ── 유니버스 모드 ───────────────────────────────────────────────
+# static (기본): hardcoded ETF_LIST 사용
+# auto: KRX 분류 기반 자동 구축 (etf_universe.build_universe)
+UNIVERSE_MODE = os.environ.get("ETF_UNIVERSE_MODE", "static").strip().lower()
+_UNIVERSE_BUILD_RESULT = None  # auto 모드 시 UniverseResult 저장 (freeze용)
+
+# ── ETF_LIST override ───────────────────────────────────────────
+# 1순위: ETF_LIST env var (명시적 override)
+# 2순위: ETF_UNIVERSE_MODE=auto (KRX 분류 기반 자동 구축)
+_env_list = os.environ.get("ETF_LIST")
+_universe_overridden = False
+
+if _env_list:
+    parsed = [t.strip() for t in _env_list.split(",") if t.strip()]
     if parsed:
         ETF_LIST = parsed
+        _universe_overridden = True
         print(f"[etf_shared] ETF_LIST overridden from env: {len(ETF_LIST)} tickers")
-        # KRX 분류 데이터로 TAXABLE_ETF_TICKERS 자동 산출 (KRX_ID/KRX_PW 필요)
-        try:
-            from pykrx_utils import get_taxable_tickers
+        UNIVERSE_MODE = "static"  # 명시적 override가 우선
+elif UNIVERSE_MODE == "auto":
+    try:
+        from etf_universe import build_universe, config_from_env
+        from pykrx_utils import load_tax_classification
 
-            taxable = get_taxable_tickers(ticker_subset=set(ETF_LIST))
-            if taxable is not None:
-                TAXABLE_ETF_TICKERS = taxable
-                print(
-                    f"[etf_shared] TAXABLE_ETF_TICKERS auto-computed from KRX data: {len(TAXABLE_ETF_TICKERS)} tickers"
-                )
-            else:
-                # KRX API 실패 → hardcoded set에서 ETF_LIST에 있는 것만 유지
-                TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
-                print(
-                    f"[etf_shared] TAXABLE_ETF_TICKERS fallback (filtered hardcoded): {len(TAXABLE_ETF_TICKERS)} tickers"
-                )
-        except Exception:
+        _classification = load_tax_classification()
+        if _classification is not None:
+            _result = build_universe(_classification, config_from_env())
+            ETF_LIST = _result.tickers
+            _UNIVERSE_BUILD_RESULT = _result
+            _universe_overridden = True
+            print(
+                f"[etf_shared] ETF_LIST auto-built from KRX: {len(ETF_LIST)} tickers "
+                f"(sha256={_result.universe_sha256[:12]}...)"
+            )
+        else:
+            print("[etf_shared] KRX 분류 데이터 없음 — static 유니버스 사용")
+            UNIVERSE_MODE = "static"
+    except Exception as exc:
+        print(f"[etf_shared] 유니버스 자동 구축 실패 — static 사용: {exc}")
+        UNIVERSE_MODE = "static"
+
+# ── TAXABLE_ETF_TICKERS 자동 산출 ──────────────────────────────
+# ETF_LIST env override 또는 auto 모드 시 KRX 분류 데이터로 자동 산출
+if _universe_overridden:
+    try:
+        from pykrx_utils import get_taxable_tickers
+
+        taxable = get_taxable_tickers(ticker_subset=set(ETF_LIST))
+        if taxable is not None:
+            TAXABLE_ETF_TICKERS = taxable
+            print(
+                f"[etf_shared] TAXABLE_ETF_TICKERS auto-computed from KRX data: {len(TAXABLE_ETF_TICKERS)} tickers"
+            )
+        else:
+            # KRX API 실패 → hardcoded set에서 ETF_LIST에 있는 것만 유지
             TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
+            print(
+                f"[etf_shared] TAXABLE_ETF_TICKERS fallback (filtered hardcoded): {len(TAXABLE_ETF_TICKERS)} tickers"
+            )
+    except Exception:
+        TAXABLE_ETF_TICKERS = {t for t in TAXABLE_ETF_TICKERS if t in ETF_LIST}
 
 # TAXABLE_ETF_TICKERS env var가 명시되면 최우선으로 오버라이드
 env_taxable = os.environ.get("TAXABLE_ETF_TICKERS")
@@ -179,6 +215,13 @@ ETF_TICKER_GROUPS: dict[str, str] = {
     "498400": "foreign_investment",  # KODEX 200타겟위클리커버드콜
     "411060": "commodity",  # ACE KRX금현물
 }
+
+# auto 모드 시 ETF_TICKER_GROUPS를 자동 구축 결과로 override
+if _UNIVERSE_BUILD_RESULT is not None:
+    ETF_TICKER_GROUPS = _UNIVERSE_BUILD_RESULT.ticker_groups
+    print(
+        f"[etf_shared] ETF_TICKER_GROUPS auto-built: {len(ETF_TICKER_GROUPS)} tickers"
+    )
 
 # KOSPI risk_off여도 거래를 허용할 그룹 (외국 투자, 원자재는 방어자산 역할)
 GROUP_RISK_OVERRIDE: set[str] = {"foreign_investment", "commodity"}
@@ -257,7 +300,8 @@ def is_ticker_risk_on(ticker: str, kospi_risk_on: bool) -> bool:
 
 def get_strategy_config() -> dict:
     """백테스트와 실전에서 공통으로 쓰는 ETF 전략 설정을 반환한다."""
-    return {
+    cfg: dict = {
+        "universe_mode": UNIVERSE_MODE,
         "etf_list": ETF_LIST,
         "max_positions": ETF_MAX_POSITIONS,
         "sell_rank_buffer": ETF_SELL_RANK_BUFFER,
@@ -287,6 +331,7 @@ def get_strategy_config() -> dict:
         # True: 전량 매도 (실전 기본), False: 보유 유지 (기존 백테스트 기본)
         "liquidate_on_risk_off": os.environ.get("LIQUIDATE_ON_RISK_OFF", "1") == "1",
     }
+    return cfg
 
 
 def add_liquidity_flag(price: pd.DataFrame) -> pd.DataFrame:
