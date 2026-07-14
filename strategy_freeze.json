@@ -39,6 +39,8 @@
     },
     "min_avg_trading_value": 1000000000,
     "max_asset_pct": 0.85,
+    "target_weight_rebalance": false,
+    "rebalance_band_pct": 0.05,
     "liquidate_on_risk_off": true,
     "slippage": 0.0005,
     "spread_pct": 0.0002,
@@ -78,5 +80,5 @@
     "486290",
     "498400"
   ],
-  "sha256": "5d5a038549c94a267921f5f5c9a4a7f14b736361e75edcefc7b36d81cc53d68e"
+  "sha256": "b49604ac141bf66c10bfdbf3944aae147088732a82a4ef0d27a70a9b1905d728"
 }

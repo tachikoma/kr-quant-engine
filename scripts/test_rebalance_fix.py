@@ -108,6 +108,41 @@ def main():
     assert_condition(len(buy_orders) == 1, f"Expected one buy order for single target, got {len(buy_orders)}")
     print("  Edge 5 (single target): ✅")
 
+    # Edge case 6: 목표비중 리밸런싱은 80/20 드리프트를 50/50 근처로 조정
+    orders = build_rebalance_orders(
+        current_holdings={"091160": 80, "102110": 20},
+        target_tickers=["091160", "102110"],
+        latest_prices={"091160": 10_000, "102110": 10_000},
+        available_cash=0,
+        slippage=0,
+        max_asset_pct=0.85,
+        target_weight_rebalance=True,
+        rebalance_band_pct=0.05,
+    )
+    sell_091160 = next(
+        order for order in orders if order["side"] == "SELL" and order["ticker"] == "091160"
+    )
+    buy_102110 = next(
+        order for order in orders if order["side"] == "BUY" and order["ticker"] == "102110"
+    )
+    assert_condition(sell_091160["qty"] == 30, f"Expected 30 sell, got {sell_091160}")
+    assert_condition(buy_102110["qty"] >= 29, f"Expected at least 29 buy, got {buy_102110}")
+    print("  Edge 6 (target-weight drift rebalance): ✅")
+
+    # Edge case 7: 5%p 밴드 내 55/45는 무거래
+    orders = build_rebalance_orders(
+        current_holdings={"091160": 55, "102110": 45},
+        target_tickers=["091160", "102110"],
+        latest_prices={"091160": 10_000, "102110": 10_000},
+        available_cash=0,
+        slippage=0,
+        max_asset_pct=0.85,
+        target_weight_rebalance=True,
+        rebalance_band_pct=0.05,
+    )
+    assert_condition(not orders, f"Expected no orders inside band, got {orders}")
+    print("  Edge 7 (target-weight no-trade band): ✅")
+
     print("\nALL TESTS PASSED")
     sys.exit(0)
 

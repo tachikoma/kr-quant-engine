@@ -65,6 +65,8 @@ def current_strategy_payload() -> dict:
             "deviation_threshold_by_ticker": dict(ETF_DEVIATION_THRESHOLD_BY_TICKER),
             "min_avg_trading_value": cfg.get("min_avg_trading_value", 1_000_000_000),
             "max_asset_pct": parse_fraction_env("MAX_ASSET_PCT", 0.50),
+            "target_weight_rebalance": cfg.get("target_weight_rebalance", False),
+            "rebalance_band_pct": cfg.get("rebalance_band_pct", 0.05),
             "liquidate_on_risk_off": cfg.get("liquidate_on_risk_off", True),
             "slippage": parse_pct_env("ETF_BASE_SLIPPAGE", 0.0005),
             "spread_pct": parse_pct_env("ETF_SPREAD_PCT", 0.0005),

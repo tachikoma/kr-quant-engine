@@ -62,6 +62,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `ETF_DISTRIBUTION_TAX_PCT`: 분배금 현금 귀속 시 적용할 세율(기본 `0`, gross return). 백테스트 전용(라이브는 증권사 예수금에 자동 반영)
 - `MIN_LISTING_DAYS`: 최소 상장 거래일 필터. 기본 `60`
 - `MAX_PREMIUM_DISCOUNT`: NAV 대비 괴리율 절대값 임계. 기본 `0.02` (2%)
+- `TARGET_WEIGHT_REBALANCE=0|1`: `1`이면 남은 현금만 배분하지 않고 전체 포트폴리오
+  평가액 기준으로 목표비중을 맞춥니다. 기본 `0`은 기존 주문 방식입니다.
+- `REBALANCE_BAND_PCT`: 목표비중 리밸런싱의 무거래 허용 폭. 기본 `0.05`는 절대 비중
+  5%p를 뜻하며, `TARGET_WEIGHT_REBALANCE=1`일 때 적용됩니다.
 
 ### 백테스트(run_etf_backtest.py)
 
@@ -72,6 +76,8 @@ python live_trading/etf_daily_runner.py --force-live
 | `ETF_SPREAD_PCT` | `0.0005` (5bp) | 호가 스프레드 |
 | `ETF_ENABLE_BENCHMARK` | `1` | KODEX200 비교 포함 여부 |
 | `MAX_ASSET_PCT` | `0.50` | 자산별 최대 비중 제한 (0: 제한 없음) |
+| `TARGET_WEIGHT_REBALANCE` | `0` | 전체 평가액 기준 목표비중 리밸런싱 활성화 |
+| `REBALANCE_BAND_PCT` | `0.05` | 목표비중 대비 무거래 허용 폭(절대 비중) |
 | `ETF_USE_CACHE` | `1` | parquet 캐시 사용 |
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |

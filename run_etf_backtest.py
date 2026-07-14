@@ -766,6 +766,8 @@ def run_etf_strategy(
     risk_off_liquidate: bool = True,
     price_data: pd.DataFrame | None = None,
     max_asset_pct: float | None = None,
+    target_weight_rebalance: bool | None = None,
+    rebalance_band_pct: float | None = None,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
 ):
@@ -884,6 +886,16 @@ def run_etf_strategy(
                 if max_asset_pct is not None
                 else parse_fraction_env("MAX_ASSET_PCT", 0.50)
             )
+            effective_target_weight_rebalance = (
+                target_weight_rebalance
+                if target_weight_rebalance is not None
+                else bool(strategy_cfg.get("target_weight_rebalance", False))
+            )
+            effective_rebalance_band_pct = (
+                rebalance_band_pct
+                if rebalance_band_pct is not None
+                else float(strategy_cfg.get("rebalance_band_pct", 0.05))
+            )
 
             orders = build_rebalance_orders(
                 current_holdings=holdings,
@@ -902,6 +914,8 @@ def run_etf_strategy(
                 generate_orders=True,
                 max_asset_pct=effective_max_asset_pct,
                 ticker_names=ticker_names,
+                target_weight_rebalance=effective_target_weight_rebalance,
+                rebalance_band_pct=effective_rebalance_band_pct,
             )
             rebalance_order_count = len(orders)
 
@@ -914,8 +928,13 @@ def run_etf_strategy(
                 side = o.get("side")
 
                 if side == "SELL":
-                    holdings.pop(ticker, None)
-                    holding_cost_basis.pop(ticker, None)
+                    held_qty = int(holdings.get(ticker, 0) or 0)
+                    remaining_qty = max(held_qty - qty, 0)
+                    if remaining_qty > 0:
+                        holdings[ticker] = remaining_qty
+                    else:
+                        holdings.pop(ticker, None)
+                        holding_cost_basis.pop(ticker, None)
                     cash += float(o.get("estimated_value", 0.0))
                     trades.append(
                         {
@@ -1751,6 +1770,8 @@ def _build_performance_config() -> dict:
         "max_premium_discount": strategy_cfg.get("max_premium_discount", 0.02),
         "min_avg_trading_value": strategy_cfg.get("min_avg_trading_value", 1_000_000_000),
         "max_asset_pct": parse_fraction_env("MAX_ASSET_PCT", 0.50),
+        "target_weight_rebalance": strategy_cfg.get("target_weight_rebalance", False),
+        "rebalance_band_pct": strategy_cfg.get("rebalance_band_pct", 0.05),
         "liquidate_on_risk_off": strategy_cfg.get("liquidate_on_risk_off", True),
         "slippage": BASE_SLIPPAGE,
         "spread_pct": SPREAD_PCT,

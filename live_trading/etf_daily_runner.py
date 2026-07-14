@@ -155,6 +155,8 @@ class RunnerConfig:
     spread_pct: float
     enable_catchup: bool
     max_asset_pct: float = 0.50
+    target_weight_rebalance: bool = False
+    rebalance_band_pct: float = 0.05
     liquidate_on_risk_off: bool = True
     max_premium_discount: float = 0.02
     max_live_spread_pct: float = 0.005
@@ -384,6 +386,8 @@ def _read_env_config() -> RunnerConfig:
         spread_pct=parse_pct_env("LIVE_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005)),
         enable_catchup=_parse_bool("ENABLE_CATCHUP", True),
         max_asset_pct=parse_fraction_env("MAX_ASSET_PCT", 0.50),
+        target_weight_rebalance=bool(strategy_cfg.get("target_weight_rebalance", False)),
+        rebalance_band_pct=float(strategy_cfg.get("rebalance_band_pct", 0.05)),
         liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
         max_premium_discount=float(strategy_cfg.get("max_premium_discount", 0.02)),
         max_live_spread_pct=float(strategy_cfg.get("max_live_spread_pct", 0.005)),
@@ -1020,6 +1024,8 @@ def _build_plan(
             generate_orders=(rebalance_due or needs_catchup),
             ticker_names=ticker_names,
             market_order_margin_rate=market_order_margin_rate,
+            target_weight_rebalance=config.target_weight_rebalance,
+            rebalance_band_pct=config.rebalance_band_pct,
         )
 
     orders = _filter_buy_orders_by_live_guards(
@@ -1853,6 +1859,8 @@ def run_daily() -> None:
                     generate_orders=True,
                     ticker_names=plan.get("ticker_names", {}),
                     market_order_margin_rate=_market_order_margin_rate,
+                    target_weight_rebalance=cfg.target_weight_rebalance,
+                    rebalance_band_pct=cfg.rebalance_band_pct,
                 )
                 new_orders = _filter_buy_orders_by_live_guards(
                     new_orders,
