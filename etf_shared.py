@@ -188,6 +188,45 @@ def get_etf_group(ticker: str) -> str:
     return ETF_TICKER_GROUPS.get(ticker, "domestic_equity")
 
 
+def get_allowed_groups(
+    kospi_risk_on: bool,
+    us_risk_on: bool,
+    gating_mode: str = "hybrid",
+) -> set[str]:
+    """리스크 시그널 조합에 따라 허용할 ETF 그룹을 반환한다.
+
+    gating_mode:
+    - hybrid: 기존 Option C
+      - KOSPI risk_on: 모든 그룹 허용
+      - KOSPI risk_off + US risk_on: foreign_investment만 허용
+      - KOSPI risk_off + US risk_off: commodity만 허용
+    - split: 그룹별 기준 지수 분리
+      - domestic_equity: KOSPI risk_on일 때만 허용
+      - foreign_investment: US risk_on일 때만 허용
+      - commodity: 항상 허용
+    """
+    mode = str(gating_mode).strip().lower()
+    all_groups = {"domestic_equity", "foreign_investment", "commodity"}
+
+    if mode == "split":
+        allowed = {"commodity"}
+        if kospi_risk_on:
+            allowed.add("domestic_equity")
+        if us_risk_on:
+            allowed.add("foreign_investment")
+        return allowed
+
+    if kospi_risk_on:
+        return all_groups
+    if us_risk_on:
+        return {"foreign_investment"}
+    return {"commodity"}
+
+
+def is_ticker_allowed(ticker: str, allowed_groups: set[str]) -> bool:
+    return get_etf_group(ticker) in allowed_groups
+
+
 def get_deviation_threshold(ticker: str) -> float:
     """ETF별 NAV 괴리율 임계값을 반환한다.
 
@@ -206,6 +245,7 @@ def get_deviation_threshold(ticker: str) -> float:
 
 
 def is_ticker_risk_on(ticker: str, kospi_risk_on: bool) -> bool:
+    """KOSPI 단일 시그널 기반의 기존 게이팅(하위호환)."""
     if kospi_risk_on:
         return True
     return get_etf_group(ticker) in GROUP_RISK_OVERRIDE

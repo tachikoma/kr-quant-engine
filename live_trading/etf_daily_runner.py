@@ -68,6 +68,8 @@ from etf_shared import (
     rank_etfs,
     ETF_TAXABLE_SELL_TAX_PCT,
     TAXABLE_ETF_TICKERS,
+    get_allowed_groups,
+    is_ticker_allowed,
     is_ticker_risk_on,
     add_deviation_flag,
     add_liquidity_flag,
@@ -102,6 +104,11 @@ except Exception:
 
 import pandas as pd
 from pykrx import stock
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 from pykrx_utils import (
     KRX_PASSWORD_CHANGE_URL,
     _call_capture_stderr,
@@ -133,6 +140,11 @@ class RunnerConfig:
     rebalance_step_days: int
     market_ma_days: int
     market_slope_days: int
+    enable_multi_index_risk: bool
+    multi_index_gating_mode: str
+    us_risk_proxy: str
+    us_market_ma_days: int
+    us_market_slope_days: int
     max_positions: int
     sell_rank_buffer: int
     plan_time: str
@@ -358,6 +370,7 @@ def setup_logging(level: str = "INFO", log_file: str = "") -> None:
 
 def _read_env_config() -> RunnerConfig:
     strategy_cfg = get_strategy_config()
+    us_proxy = os.environ.get("US_RISK_PROXY", "SPY").strip().upper() or "SPY"
     return RunnerConfig(
         wait_until_open=_parse_bool("WAIT_UNTIL_MARKET_OPEN", True),
         enable_live_order=_parse_bool("LIVE_ORDER_ENABLED", False),
@@ -367,6 +380,13 @@ def _read_env_config() -> RunnerConfig:
         rebalance_step_days=int(strategy_cfg["rebalance_step_days"]),
         market_ma_days=int(strategy_cfg["market_ma_days"]),
         market_slope_days=int(strategy_cfg["market_slope_days"]),
+        enable_multi_index_risk=_parse_bool("ENABLE_MULTI_INDEX_RISK", False),
+        multi_index_gating_mode=(
+            os.environ.get("MULTI_INDEX_GATING_MODE", "hybrid").strip().lower() or "hybrid"
+        ),
+        us_risk_proxy=us_proxy,
+        us_market_ma_days=int(os.environ.get("US_MARKET_MA_DAYS", str(strategy_cfg["market_ma_days"]))),
+        us_market_slope_days=int(os.environ.get("US_MARKET_SLOPE_DAYS", str(strategy_cfg["market_slope_days"]))),
         max_positions=int(strategy_cfg["max_positions"]),
         sell_rank_buffer=int(strategy_cfg["sell_rank_buffer"]),
         plan_time=os.environ.get("DAILY_PLAN_TIME", DEFAULT_PLAN_TIME),
@@ -636,6 +656,95 @@ def _load_market_risk_on(market_index_code: str, ma_days: int, slope_days: int) 
         f"기울기({slope_days}일)={slope_val:+.1f} → risk_on={risk_on}"
     )
     return risk_on
+
+
+def _load_us_risk_on(proxy_symbol: str, ma_days: int, slope_days: int) -> bool:
+    if yf is None:
+        logger.info("[시장필터] yfinance 미설치/로드 실패 → us_risk_on=True (기본값)")
+        return True
+
+    end_day = _today_kst()
+    start_day = end_day - dt.timedelta(days=360)
+    logger.info(f"[시장필터] US 지수({proxy_symbol}) 조회 중... ")
+    t0 = dt.datetime.now()
+
+    try:
+        raw = yf.download(
+            proxy_symbol,
+            start=start_day,
+            end=end_day + dt.timedelta(days=1),
+            progress=False,
+            auto_adjust=False,
+        )
+    except Exception as e:
+        elapsed = (dt.datetime.now() - t0).total_seconds()
+        logger.info(f"조회 실패 ({elapsed:.1f}초): {e}")
+        logger.info("  → us_risk_on=True (기본값)")
+        return True
+
+    elapsed = (dt.datetime.now() - t0).total_seconds()
+    if raw is None or raw.empty:
+        logger.info(f"데이터 없음 ({elapsed:.1f}초) → us_risk_on=True (기본값)")
+        return True
+
+    raw = raw.reset_index()
+
+    if getattr(raw.columns, "nlevels", 1) > 1:
+        flat_cols = []
+        for col in raw.columns:
+            if isinstance(col, tuple):
+                candidates = [str(x) for x in col if x is not None and str(x)]
+                flat_cols.append("_".join(candidates))
+            else:
+                flat_cols.append(str(col))
+        raw.columns = flat_cols
+
+    close_col = None
+    for candidate in ["Adj Close", "Close", "Adj_Close", "Close_SPY", "Adj_Close_SPY"]:
+        if candidate in raw.columns:
+            close_col = candidate
+            break
+    if close_col is None:
+        for c in raw.columns:
+            c_lower = str(c).lower().replace(" ", "_")
+            if "adj_close" in c_lower or c_lower.startswith("close") or "_close" in c_lower:
+                close_col = c
+                break
+    if close_col is None:
+        logger.info(f"종가 컬럼 없음 ({elapsed:.1f}초) → us_risk_on=True (기본값)")
+        return True
+
+    date_col = "Date" if "Date" in raw.columns else ("date" if "date" in raw.columns else None)
+    if date_col is None:
+        logger.info(f"날짜 컬럼 없음 ({elapsed:.1f}초) → us_risk_on=True (기본값)")
+        return True
+
+    close_series = raw[close_col]
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+
+    close = pd.to_numeric(close_series, errors="coerce")
+    us = pd.DataFrame({"date": pd.to_datetime(raw[date_col]), "close": close}).dropna(subset=["close"])
+    us = us.sort_values("date").copy()
+    us["market_ma"] = us["close"].rolling(ma_days).mean()
+    us["market_ma_slope"] = us["market_ma"] - us["market_ma"].shift(slope_days)
+
+    if us.empty:
+        logger.info(f"정규화 후 데이터 없음 ({elapsed:.1f}초) → us_risk_on=True (기본값)")
+        return True
+
+    last = us.iloc[-1]
+    if pd.isna(last["market_ma"]) or pd.isna(last["market_ma_slope"]):
+        logger.info(f"MA 계산 불가 ({elapsed:.1f}초) → us_risk_on=True (기본값)")
+        return True
+
+    us_risk_on = bool((last["close"] >= last["market_ma"]) and (last["market_ma_slope"] >= 0))
+    logger.info(
+        f"완료 ({elapsed:.1f}초) | "
+        f"종가={float(last['close']):,.2f}, MA{ma_days}={float(last['market_ma']):,.2f}, "
+        f"기울기({slope_days}일)={float(last['market_ma_slope']):+.4f} → us_risk_on={us_risk_on}"
+    )
+    return us_risk_on
 
 
 def _load_recent_trading_dates(reference_ticker: str, lookback_days: int = 120) -> list[str]:
@@ -1030,13 +1139,35 @@ def _build_plan(
             )
 
     # 3단계: 시장 필터
+    kospi_risk_on = True
+    us_risk_on = True
+    allowed_groups = {"domestic_equity", "foreign_investment", "commodity"}
     risk_on = True
     if config.market_filter:
-        risk_on = _load_market_risk_on(
+        kospi_risk_on = _load_market_risk_on(
             market_index_code=strategy_cfg["market_index_code"],
             ma_days=config.market_ma_days,
             slope_days=config.market_slope_days,
         )
+        risk_on = kospi_risk_on
+        if config.enable_multi_index_risk:
+            us_risk_on = _load_us_risk_on(
+                proxy_symbol=config.us_risk_proxy,
+                ma_days=config.us_market_ma_days,
+                slope_days=config.us_market_slope_days,
+            )
+            allowed_groups = get_allowed_groups(kospi_risk_on=kospi_risk_on, us_risk_on=us_risk_on)
+            allowed_groups = get_allowed_groups(
+                kospi_risk_on=kospi_risk_on,
+                us_risk_on=us_risk_on,
+                gating_mode=config.multi_index_gating_mode,
+            )
+            logger.info(
+                "[시장필터] 멀티 인덱스 적용 | "
+                f"KOSPI={kospi_risk_on}, US({config.us_risk_proxy})={us_risk_on}, "
+                f"mode={config.multi_index_gating_mode}, "
+                f"허용그룹={sorted(list(allowed_groups))}"
+            )
     else:
         logger.info("[시장필터] USE_MARKET_FILTER=0 — 시장 필터 비활성화")
 
@@ -1067,22 +1198,26 @@ def _build_plan(
         logger.info("[캐치업] 전일 미체결 주문 감지 → 오늘 리밸런싱을 실행하여 포지션을 채웁니다.")
 
     # 5단계: 목표 티커 결정
-    if not risk_on:
+    if not kospi_risk_on:
         if config.liquidate_on_risk_off:
             # KOSPI risk_off: foreign/commodity만 buy target 유지, domestic은 매도
             if not ranked.empty:
                 ticker_list = [str(t) for t in ranked["ticker"]]
-                target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+                if config.enable_multi_index_risk:
+                    target = [t for t in ticker_list if is_ticker_allowed(t, allowed_groups)]
+                else:
+                    target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
                 target = target[: config.max_positions + config.sell_rank_buffer]
             else:
                 target = []
             if target:
                 logger.info(
-                    f"[계획수립] risk_on=False → foreign/commodity만 목표: {[ticker_names.get(t, t) for t in target]}"
+                    "[계획수립] KOSPI risk_off 목표: "
+                    f"{[ticker_names.get(t, t) for t in target]}"
                 )
             else:
                 logger.info(
-                    "[계획수립] risk_on=False → 전량 매도 모드 (foreign/commodity 목표 없음)"
+                    "[계획수립] KOSPI risk_off → 전량 매도 모드 (허용그룹 목표 없음)"
                 )
         else:
             # LIQUIDATE_ON_RISK_OFF=0: 기존 보유 유지, 신규 매수 없음
@@ -1202,6 +1337,10 @@ def _build_plan(
     return {
         "today": today,
         "risk_on": risk_on,
+        "kospi_risk_on": kospi_risk_on,
+        "us_risk_on": us_risk_on,
+        "multi_index_gating_mode": config.multi_index_gating_mode,
+        "allowed_groups": sorted(list(allowed_groups)),
         "rebalance_due": rebalance_due,
         "needs_catchup": needs_catchup,
         "holdings": holdings,

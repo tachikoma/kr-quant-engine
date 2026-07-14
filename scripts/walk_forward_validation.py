@@ -133,6 +133,13 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     step_years = int(os.environ.get("WF_STEP_YEARS", "1"))
     anchored = os.environ.get("WF_ANCHORED", "0") == "1"
     boundary_cost_pct = float(os.environ.get("WF_BOUNDARY_COST_PCT", "0.0015"))
+    enable_multi_index_risk = parse_bool_env("ENABLE_MULTI_INDEX_RISK", False)
+    multi_index_gating_mode = (
+        os.environ.get("MULTI_INDEX_GATING_MODE", "hybrid").strip().lower() or "hybrid"
+    )
+    us_risk_proxy = os.environ.get("US_RISK_PROXY", "SPY").strip().upper() or "SPY"
+    us_market_ma_days = int(os.environ.get("US_MARKET_MA_DAYS", str(rtb.MARKET_MA_DAYS)))
+    us_market_slope_days = int(os.environ.get("US_MARKET_SLOPE_DAYS", str(rtb.MARKET_SLOPE_DAYS)))
     target_weight_rebalance = parse_bool_env(
         "WF_TARGET_WEIGHT_REBALANCE",
         bool(rtb.strategy_cfg.get("target_weight_rebalance", False)),
@@ -166,6 +173,13 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     common_dates = list(index_df["date"])
     price_data = rtb.load_etf_price()
     risk_off_liquidate = rtb.strategy_cfg.get("liquidate_on_risk_off", True)
+    if enable_multi_index_risk:
+        rtb.ENABLE_MULTI_INDEX_RISK = True
+        rtb.MULTI_INDEX_GATING_MODE = multi_index_gating_mode
+        rtb.US_RISK_PROXY = us_risk_proxy
+        rtb.US_MARKET_MA_DAYS = us_market_ma_days
+        rtb.US_MARKET_SLOPE_DAYS = us_market_slope_days
+    us_index_df = rtb.get_us_index_data() if enable_multi_index_risk else None
 
     original_rebalance_days = rtb.REBALANCE_STEP_DAYS
     scenario_curves: dict[tuple[int, int], pd.DataFrame] = {}
@@ -189,6 +203,8 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 exit_check_days=exit_check_days,
                 trailing_stop_pct=trailing_stop_pct,
                 portfolio_trailing_stop_pct=portfolio_trailing_stop_pct,
+                us_index_df=us_index_df,
+                enable_multi_index_risk=enable_multi_index_risk,
             )
             curve = curve[["date", "equity"]].copy()
             curve["date"] = pd.to_datetime(curve["date"])
@@ -298,6 +314,11 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "exit_check_days": exit_check_days,
         "trailing_stop_pct": trailing_stop_pct,
         "portfolio_trailing_stop_pct": portfolio_trailing_stop_pct,
+        "enable_multi_index_risk": enable_multi_index_risk,
+        "multi_index_gating_mode": multi_index_gating_mode,
+        "us_risk_proxy": us_risk_proxy,
+        "us_market_ma_days": us_market_ma_days,
+        "us_market_slope_days": us_market_slope_days,
         "rebalance_days_grid": rebalance_days,
         "max_positions_grid": max_positions,
         "fold_count": len(folds_df),

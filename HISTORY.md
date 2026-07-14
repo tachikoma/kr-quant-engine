@@ -2,6 +2,49 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-07 — 멀티 인덱스 리스크 시그널 (Phase 1)
+
+**목표:** KOSPI 단일 시그널 외에 미국 지수(QQQ)를 추가하여, KOSPI risk_off 구간에서 미국 ETF로 회전하는 레짐 디커플링을 구현.
+
+**변경:**
+- `etf_shared.py`: `get_allowed_groups()` (hybrid/split 모드), `is_ticker_allowed()` 게이팅 헬퍼 추가
+- `run_etf_backtest.py`: `get_us_index_data()` (yfinance 기반 미국 지수 조회·캐시), `is_us_risk_on()`, `run_etf_strategy()`에 `us_index_df`/`enable_multi_index_risk` 파라미터 추가
+- `live_trading/etf_daily_runner.py`: `RunnerConfig`에 멀티 인덱스 필드 추가, `_load_us_risk_on()` 실시간 시그널, `_build_plan()`에서 하이브리드/스플릿 게이팅 적용
+- `pyproject.toml`: `yfinance>=0.2.44` 의존성 추가
+- `scripts/run_phase1_ab_and_compare.py`: baseline vs multi-index A/B 비교 스크립트
+- `scripts/compare_phase1_results.py`: CAGR/MDD/Sharpe/Sortino 비교 + 게이트 체크 (Sharpe/Sortino 10%↑ AND MDD 1%p↓)
+- `scripts/sweep_multi_index_split.py`: US 프록시(SPY/QQQ) × MA/slope 그리드 스윕
+
+**환경변수:**
+- `ENABLE_MULTI_INDEX_RISK=0|1` — 멀티 인덱스 활성화
+- `MULTI_INDEX_GATING_MODE=hybrid|split` — 게이팅 모드 (split: 국내=KOSPI, 미국=US 지수 독립)
+- `US_RISK_PROXY=QQQ` — 미국 리스크 프록시 심볼 (yfinance)
+- `US_MARKET_MA_DAYS=100`, `US_MARKET_SLOPE_DAYS=20` — 미국 시그널 윈도우
+
+**백테스트 결과 (single mode, 2016-01~2026-07):**
+
+| 지표 | Baseline | split+QQQ | Δ |
+|---|---|---|---|
+| CAGR | 28.79% | 29.74% | +0.95% |
+| Sharpe | 1.319 | 1.366 | +3.6% |
+| Sortino | 2.058 | 2.138 | +3.9% |
+| MDD | -19.61% | -19.57% | +0.04% |
+
+**워크포워드 검증 (6폴드, 2019-08~2025-08):**
+
+| 지표 | Baseline | split+QQQ | Δ |
+|---|---|---|---|
+| OOS CAGR | 17.36% | 18.08% | +0.72% |
+| OOS Sharpe | 1.089 | 1.212 | +11.3% |
+| OOS Sortino | 1.568 | 1.758 | +12.1% |
+| OOS MDD | -15.34% | -13.02% | +2.32%p |
+
+스윕 결과 QQQ가 모든 MA/slope 조합에서 동일하게 우세 (100/20, 120/10, 120/20, 140/20 모두 동일 결과). SPY는 모든 조합에서 baseline 대비 열세. MDD 개선은 전 폴드에서 일관적.
+
+**파일:** `etf_shared.py`, `run_etf_backtest.py`, `live_trading/etf_daily_runner.py`, `scripts/walk_forward_validation.py`, `scripts/run_phase1_ab_and_compare.py`, `scripts/compare_phase1_results.py`, `scripts/sweep_multi_index_split.py`, `pyproject.toml`, `.env.sample`
+
+---
+
 ## 2026-07 — 포트폴리오 리스크 관리 실험 및 성과 리포트 교정
 
 **목표:** 현재 모멘텀 전략의 집중 위험을 완화할 수 있는 리밸런싱/청산 규칙을 구현하고 OOS로 검증.

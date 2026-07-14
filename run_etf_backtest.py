@@ -9,6 +9,11 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 logger = logging.getLogger(__name__)
 
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
@@ -84,6 +89,8 @@ from etf_shared import (
     add_price_basis_columns,
     get_valuation_price,
     get_strategy_config,
+    get_allowed_groups,
+    is_ticker_allowed,
     is_ticker_risk_on,
     update_last_valid_prices,
 )
@@ -121,6 +128,13 @@ ENABLE_BENCHMARK = os.environ.get("ETF_ENABLE_BENCHMARK", "1") == "1"
 
 # 비교 실험을 위한 시장 필터(risk-on/off) 사용 여부
 USE_MARKET_FILTER = True
+ENABLE_MULTI_INDEX_RISK = os.environ.get("ENABLE_MULTI_INDEX_RISK", "0") == "1"
+MULTI_INDEX_GATING_MODE = (
+    os.environ.get("MULTI_INDEX_GATING_MODE", "hybrid").strip().lower() or "hybrid"
+)
+US_RISK_PROXY = os.environ.get("US_RISK_PROXY", "SPY").strip().upper() or "SPY"
+US_MARKET_MA_DAYS = int(os.environ.get("US_MARKET_MA_DAYS", str(MARKET_MA_DAYS)))
+US_MARKET_SLOPE_DAYS = int(os.environ.get("US_MARKET_SLOPE_DAYS", str(MARKET_SLOPE_DAYS)))
 
 # ETF 후보군 선택 관련 상수는 etf_shared 모듈에서 관리합니다.
 
@@ -689,6 +703,121 @@ def is_risk_on(index_df: pd.DataFrame, date: pd.Timestamp) -> bool:
     return bool(last["risk_on"])
 
 
+def get_us_index_data() -> pd.DataFrame:
+    """미국 지수(ETF proxy) 데이터를 조회해 risk_on 시그널을 계산한다."""
+    if yf is None:
+        print("[경고] yfinance를 불러오지 못해 미국 risk 시그널을 비활성화합니다.")
+        return pd.DataFrame(columns=["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"])
+
+    cache_dir = Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_file = cache_dir / f"us_index_{US_RISK_PROXY}.parquet"
+    use_cache = os.environ.get("ETF_USE_CACHE", "1") != "0"
+    force_refresh = os.environ.get("ETF_REFRESH_CACHE", "0") == "1"
+
+    if use_cache and cache_file.exists() and not force_refresh:
+        try:
+            cached = pd.read_parquet(cache_file)
+            cached["date"] = pd.to_datetime(cached["date"])
+            req_start = pd.to_datetime(START)
+            req_end = pd.to_datetime(END)
+            out = cached[(cached["date"] >= req_start) & (cached["date"] <= req_end)].copy()
+            if not out.empty:
+                return out[["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"]]
+        except Exception:
+            pass
+
+    try:
+        end_dt = pd.to_datetime(END) + pd.Timedelta(days=1)
+        raw = yf.download(
+            US_RISK_PROXY,
+            start=pd.to_datetime(START),
+            end=end_dt,
+            progress=False,
+            auto_adjust=False,
+        )
+    except Exception as e:
+        print(f"[경고] 미국 지수 조회 실패({US_RISK_PROXY}): {e} — us_risk_on=True로 폴백")
+        return pd.DataFrame(columns=["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"])
+
+    if raw is None or raw.empty:
+        print(f"[경고] 미국 지수 데이터 없음({US_RISK_PROXY}) — us_risk_on=True로 폴백")
+        return pd.DataFrame(columns=["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"])
+
+    raw = raw.reset_index()
+
+    # yfinance가 MultiIndex 컬럼으로 반환하는 경우(예: ('Close','SPY'))를 평탄화한다.
+    if getattr(raw.columns, "nlevels", 1) > 1:
+        flat_cols = []
+        for col in raw.columns:
+            if isinstance(col, tuple):
+                candidates = [str(x) for x in col if x is not None and str(x)]
+                flat_cols.append("_".join(candidates))
+            else:
+                flat_cols.append(str(col))
+        raw.columns = flat_cols
+
+    close_col = None
+    for candidate in ["Adj Close", "Close", "Adj_Close", "Close_SPY", "Adj_Close_SPY"]:
+        if candidate in raw.columns:
+            close_col = candidate
+            break
+    if close_col is None:
+        for c in raw.columns:
+            c_lower = str(c).lower().replace(" ", "_")
+            if "adj_close" in c_lower or c_lower.startswith("close") or "_close" in c_lower:
+                close_col = c
+                break
+    if close_col is None:
+        print(f"[경고] 미국 지수 종가 컬럼을 찾지 못했습니다({US_RISK_PROXY})")
+        return pd.DataFrame(columns=["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"])
+
+    date_col = "Date" if "Date" in raw.columns else ("date" if "date" in raw.columns else None)
+    if date_col is None:
+        print(f"[경고] 미국 지수 날짜 컬럼을 찾지 못했습니다({US_RISK_PROXY})")
+        return pd.DataFrame(columns=["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"])
+
+    close_series = raw[close_col]
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+
+    us = pd.DataFrame(
+        {
+            "date": pd.to_datetime(raw[date_col]),
+            "close": pd.to_numeric(close_series, errors="coerce"),
+        }
+    )
+    us = us.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+    us["us_market_ma"] = us["close"].rolling(US_MARKET_MA_DAYS).mean()
+    us["us_market_ma_slope"] = us["us_market_ma"] - us["us_market_ma"].shift(US_MARKET_SLOPE_DAYS)
+    us["us_risk_on"] = (us["close"] >= us["us_market_ma"]) & (us["us_market_ma_slope"] >= 0)
+
+    if use_cache:
+        try:
+            tmp = cache_file.with_suffix(".parquet.tmp")
+            us.to_parquet(tmp)
+            os.replace(tmp, cache_file)
+        except Exception:
+            pass
+
+    req_start = pd.to_datetime(START)
+    req_end = pd.to_datetime(END)
+    out = us[(us["date"] >= req_start) & (us["date"] <= req_end)].copy()
+    return out[["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"]]
+
+
+def is_us_risk_on(us_index_df: pd.DataFrame | None, date: pd.Timestamp) -> bool:
+    if us_index_df is None or us_index_df.empty:
+        return True
+    rows = us_index_df[us_index_df["date"] <= date]
+    if rows.empty:
+        return True
+    last = rows.iloc[-1]
+    if pd.isna(last.get("us_market_ma")) or pd.isna(last.get("us_market_ma_slope")):
+        return True
+    return bool(last["us_risk_on"])
+
+
 def safe_get(series: pd.Series, key: str):
     value = series.get(key)
     if value is None or pd.isna(value) or value <= 0:
@@ -773,6 +902,8 @@ def run_etf_strategy(
     exit_check_days: int | None = None,
     trailing_stop_pct: float | None = None,
     portfolio_trailing_stop_pct: float | None = None,
+    us_index_df: pd.DataFrame | None = None,
+    enable_multi_index_risk: bool = False,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
 ):
@@ -976,6 +1107,14 @@ def run_etf_strategy(
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
             kospi_risk_on = is_risk_on(index_df, dt) if use_market_filter else True
+            us_risk_on = (
+                is_us_risk_on(us_index_df, dt) if (use_market_filter and enable_multi_index_risk) else True
+            )
+            allowed_groups = get_allowed_groups(
+                kospi_risk_on,
+                us_risk_on,
+                gating_mode=MULTI_INDEX_GATING_MODE,
+            )
             ranked = rank_etfs(today.reset_index())
             # targets를 문자열 리스트로 통일
             if not ranked.empty:
@@ -985,7 +1124,10 @@ def run_etf_strategy(
                 elif risk_off_liquidate:
                     # KOSPI risk_off + liquidate: foreign/commodity만 buy target
                     # (domestic ETFs는 targets에서 제외되어 매도됨)
-                    targets = [t for t in ticker_list if is_ticker_risk_on(t, False)]
+                    if enable_multi_index_risk:
+                        targets = [t for t in ticker_list if is_ticker_allowed(t, allowed_groups)]
+                    else:
+                        targets = [t for t in ticker_list if is_ticker_risk_on(t, False)]
                     targets = targets[:max_positions + ETF_SELL_RANK_BUFFER]
                 else:
                     # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
@@ -1015,6 +1157,11 @@ def run_etf_strategy(
                 observer_event = {
                     "decision_date": dt,
                     "risk_on": kospi_risk_on,
+                    "kospi_risk_on": kospi_risk_on,
+                    "us_risk_on": us_risk_on,
+                    "multi_index_enabled": enable_multi_index_risk,
+                    "multi_index_gating_mode": MULTI_INDEX_GATING_MODE,
+                    "allowed_groups": sorted(list(allowed_groups)),
                     "n_candidates": len(ranked),
                     "ranked_tickers": [str(t) for t in ranked.get("ticker", [])],
                     "targets": list(targets),
@@ -1670,6 +1817,7 @@ def build_period_comparison(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
     index_df = get_index_data()
+    us_index_df = get_us_index_data() if ENABLE_MULTI_INDEX_RISK else None
     common_dates = list(index_df["date"])
 
     strategy_cfg = get_strategy_config()
@@ -1681,6 +1829,8 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
         max_positions=ETF_MAX_POSITIONS,
         slippage=BASE_SLIPPAGE,
         risk_off_liquidate=strategy_cfg.get("liquidate_on_risk_off", True),
+        us_index_df=us_index_df,
+        enable_multi_index_risk=ENABLE_MULTI_INDEX_RISK,
     )
 
     if ENABLE_BENCHMARK:
@@ -1722,6 +1872,7 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     index_df = get_index_data()
+    us_index_df = get_us_index_data() if ENABLE_MULTI_INDEX_RISK else None
     common_dates = list(index_df["date"])
 
     results = []
@@ -1731,7 +1882,17 @@ def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     risk_off_liquidate = strategy_cfg.get("liquidate_on_risk_off", True)
 
     for slip in SLIPPAGE_OPTIONS:
-        curve, trades = run_etf_strategy(INITIAL_CASH, common_dates, index_df, True, 2, slip, risk_off_liquidate=risk_off_liquidate)
+        curve, trades = run_etf_strategy(
+            INITIAL_CASH,
+            common_dates,
+            index_df,
+            True,
+            2,
+            slip,
+            risk_off_liquidate=risk_off_liquidate,
+            us_index_df=us_index_df,
+            enable_multi_index_risk=ENABLE_MULTI_INDEX_RISK,
+        )
         label = f"slip_{int(slip*10000)}bp"
         curve = curve.rename(
             columns={
@@ -1962,6 +2123,11 @@ def _build_performance_config() -> dict:
         "rebalance_step_days": strategy_cfg.get("rebalance_step_days", 10),
         "market_ma_days": strategy_cfg.get("market_ma_days", 120),
         "market_slope_days": strategy_cfg.get("market_slope_days", 20),
+        "enable_multi_index_risk": ENABLE_MULTI_INDEX_RISK,
+        "multi_index_gating_mode": MULTI_INDEX_GATING_MODE,
+        "us_risk_proxy": US_RISK_PROXY,
+        "us_market_ma_days": US_MARKET_MA_DAYS,
+        "us_market_slope_days": US_MARKET_SLOPE_DAYS,
         "max_positions": strategy_cfg.get("max_positions", 2),
         "sell_rank_buffer": strategy_cfg.get("sell_rank_buffer", 3),
         "enable_benchmark": ENABLE_BENCHMARK,
@@ -1971,6 +2137,7 @@ def _build_performance_config() -> dict:
 def run_risk_off_compare_mode() -> None:
     """liquidate_on_risk_off=True vs False 비교 실행"""
     index_df = get_index_data()
+    us_index_df = get_us_index_data() if ENABLE_MULTI_INDEX_RISK else None
     common_dates = list(index_df["date"])
 
     print("\n=== Risk-Off 행동 비교: Liquidate(매도) vs Hold(보유) ===")
@@ -1980,6 +2147,7 @@ def run_risk_off_compare_mode() -> None:
         INITIAL_CASH, common_dates, index_df,
         use_market_filter=True, max_positions=ETF_MAX_POSITIONS,
         slippage=BASE_SLIPPAGE, risk_off_liquidate=True,
+        us_index_df=us_index_df, enable_multi_index_risk=ENABLE_MULTI_INDEX_RISK,
     )
     curve_liquidate = curve_liquidate.rename(columns={
         "equity": "equity_liquidate",
@@ -1990,6 +2158,7 @@ def run_risk_off_compare_mode() -> None:
         INITIAL_CASH, common_dates, index_df,
         use_market_filter=True, max_positions=ETF_MAX_POSITIONS,
         slippage=BASE_SLIPPAGE, risk_off_liquidate=False,
+        us_index_df=us_index_df, enable_multi_index_risk=ENABLE_MULTI_INDEX_RISK,
     )
     curve_hold = curve_hold.rename(columns={
         "equity": "equity_hold",
