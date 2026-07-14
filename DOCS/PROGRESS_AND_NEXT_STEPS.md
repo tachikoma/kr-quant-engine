@@ -1,45 +1,85 @@
 # 진행상황 및 향후 작업
 
-작성일: 2026-06-01
+최종 갱신: 2026-07-14
 
-요약
-- docs: README, AGENTS.md, .env.sample 문서를 현재 코드 기준으로 전면 갱신
-- KIS 어댑터(`live_trading/kis_adapter.py`), 텔레그램 알림(`telegram_notifier.py`) 안정화 완료
-- 백테스트 슬리피지/스프레드 모델, 매매차익 과세(TAXABLE_ETF_TICKERS) 반영 완료
+## 현재 상태
 
-이번 커밋에서 변경된 사항
-- `README.md` — CLI 인자 문서화, KIS/텔레그렘/과세 env var 보강, scripts 15개 목록 추가, experiment 출력 상세화
-- `AGENTS.md` — env var 테이블 확장, KIS/텔레그램/그리드 진입점 추가, output layout 보강
-- `.env.sample` — `FORCE_REBALANCE`, `FORCE_LIVE_CUTOFF_EXTEND_MIN`, `ETF_USE_CACHE`, `ETF_REFRESH_CACHE`, `ETF_LIST` 오버라이드 추가
-- `DOCS/PROGRESS_AND_NEXT_STEPS.md` — 최신 상태로 갱신
+ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 있습니다.
 
-현재 상태(핵심 결과)
-- ETF 백테스트 (single/experiment 모드) 정상 동작
-- 데일리 러너 안전모드 + 실전 모드 (Kiwoom/KIS 선택 가능)
-- 텔레그램 주문/체결 알림 연동
+**핵심 결과 (기본 설정, 2016-01~2026-07):**
+
+| 지표 | 값 |
+|---|---|
+| CAGR | 25.05% |
+| MDD | -31.75% (2026-06-22~07-14, 미회복) |
+| Sharpe | 1.137 |
+| Calmar | 0.789 |
+| 최종자산 | 10,497,729원 (기본 1,000,000원 기준) |
+
+**운영 체계:**
+- 백테스트: `run_etf_backtest.py` (single/experiment 모드)
+- 데일리 러너: `live_trading/etf_daily_runner.py` (기본 안전모드)
+- 증권사: 키움/한국투자증권 선택 가능 (`BROKER_TYPE`)
+- 텔레그램 알림 연동
 - 매매차익 과세 8개 ETF 자동 반영 (15.4%)
-- MAX_ASSET_PCT 기반 자산별 비중 제한
-- 그리드/상관관계/cap 분석 스크립트 15개 운영 중
+- 분배금 포함 수익률 (`total_return` 모드, CSV 기반)
 
-권장되는 다음 작업(우선순위)
-1. cap 그리드 실험: `MAX_ASSET_PCT` 값을 여러 값(예: 0.10, 0.15, 0.20)으로 돌려 성능·MDD 변화 비교
-2. 리밸런스/포지션 민감도 테스트: `REBALANCE_STEP_DAYS`와 `MAX_POSITIONS` 민감도 실험
-3. `scripts/filter_and_retest_by_risk.py`를 이용한 리스크 기반 후보군 필터링 그리드 실행
-4. 결과 비교 보고서 및 최종 추천 필터/정책 문서화(시각화 포함)
+**분석 스크립트 28개** — 그리드 백테스트, walk-forward 검증, 파라미터 안정성, 거래별 성과 분해, MDD 기여도 분석, 포트폴리오 stop 민감도 등.
 
-실행 예시
-```bash
-# 드로우다운 상관분석 실행
-uv run scripts/correlation_analysis.py
+## 완료된 작업 요약
 
-# cap 적용 재백테스트 (예: cap=0.10)
-MAX_ASSET_PCT=0.10 uv run scripts/apply_cap_and_retest.py
+### 성과 리포트 교정 (2026-07)
+- MDD 고점/저점/회복일/진행 여부 및 현재 낙폭 추가
+- Rolling CAGR/MDD/Sharpe/Sortino 누락 버그 수정
+- 회전율 gross(500%)/one-way(248%) 분리
+- 리밸런싱 판단/거래/무거래(122/64/58) 분리
+- 청산(71.7일)/미청산(311.0일) lot 보유기간 분리
+- 에쿼티 곡선에 리밸런싱 판단·주문 수 기록
 
-# cap 그리드: 간단한 반복 예시
-for cap in 0.10 0.15 0.20; do
-  MAX_ASSET_PCT=$cap uv run scripts/apply_cap_and_retest.py
-done
-```
+### 포트폴리오 리스크 관리 실험 (2026-07)
+4개 리스크 관리 규칙을 구현하고 OOS로 검증했으나 모두 채택하지 않았습니다:
 
-참고/메모
-- `.env`는 반드시 `pykrx` import 이전에 로드되어야 합니다(로그인 토큰 만료 이슈 방지).
+| 실험 | OOS 결과 | 채택 여부 |
+|---|---|---|
+| 목표비중 리밸런싱 | CAGR 17→15%, MDD -15→-20% | 미채택 |
+| 비대칭 하드캡 (70%/85%) | cap 85% 미작동, 70% CAGR만 하락 | 미채택 |
+| 종목별 trailing stop | 마지막 fold에만 미미한 개선 | 미채택 |
+| 포트폴리오 trailing stop | 엔드포인트 과적합 의심 | 미채택 |
+
+**핵심 교훈:** 승자 비중을 줄이거나 조기에 청산하는 규칙은 모멘텀 전략의 상승 참여율을 떨어뜨리지만, 하락 방어 효과는 충분하지 않았다. OOS 마지막 fold에만 집중된 개선은 일반화되기 어렵다.
+
+### 현재 MDD 분석 (2026-07)
+- 원인: 필터 오류가 아닌 구조적 집중 위험 (반도체 69.8% + 네트워크인프라 30.1%)
+- 리밸런싱 판단은 정상 작동, 랭킹 1·2위 유지로 무문제 보유 반복
+- `analyze_current_drawdown.py`로 포지션별 손실 기여도 추적 가능
+
+### 기타 완료 작업
+- 후보 0개 진단 프레임워크 구축 및 정상 방어 판정
+- NAV 기반 랭킹, 상장일/괴리율 필터 적용
+- ETF 균등분배 리밸런싱 수정
+- KIS/키움 어댑터 안정화 (토큰 발급/retry/throttle)
+- 전략 동결 (`strategy_freeze.json`) 시스템 구축
+
+## 실험 옵션 보존 현황
+
+기본값 `0`(비활성)으로 보존 중이며, `.env` 미변경으로 기존 전략 유지:
+
+| 옵션 | 용도 |
+|---|---|
+| `TARGET_WEIGHT_REBALANCE` / `REBALANCE_BAND_PCT` | 목표비중 리밸런싱 |
+| `TRIM_OVERWEIGHT_POSITIONS` | 비대칭 하드캡 |
+| `ETF_EXIT_CHECK_DAYS` / `ETF_TRAILING_STOP_PCT` | 종목별 trailing stop |
+| `ETF_PORTFOLIO_TRAILING_STOP_PCT` | 포트폴리오 trailing stop |
+
+## 권장되는 다음 작업
+
+현재 우선순위는 매매 로직 변경이 아니라 **위험 모니터링 강화**입니다.
+
+1. **실전 러너 비중 집중도·현재 낙폭 경고:** 매매를 바꾸지 않으면서 포트폴리오 위험 상태를 Telegram 알림에 포함. 예: 종목별 비중 60% 초과 경고, MDD 15% 초과 경고.
+2. **집중 위험 완화 실험:** 기존에 탈락한 규칙과 다른 방식 — 예: 변동성 기반 비중 축소, 상관관계 기반 분산, 시장 컨디션별 비중 조절 등 포트폴리오 단위 규칙을 OOS로 검증.
+3. **진입 주기 유지 + 위험 신호 빈도:** 진입 주기는 20거래일로 두고 위험 신호만 더 자주 확인하는 방식 연구.
+
+## 참고
+
+- `.env`는 반드시 `pykrx` import 이전에 로드되어야 합니다 (로그인 토큰 만료 이슈 방지).
+- 표본외 트랙은 `strategy_freeze.json` (2026-07-13 기준)을 따르며, 새 동결 버전은 표본외와 섞지 않습니다.
