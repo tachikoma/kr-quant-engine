@@ -2,6 +2,21 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-07 — 후보 0개 진단 프레임워크 및 영향 분석
+
+**문제:** `risk_on + 후보 0개` 빈도(11.7%)가 5% 기준을 초과하여 정상 작동인지 조사 필요.
+
+**변경:**
+- `run_etf_backtest.py`: `run_etf_strategy()`에 선택적 `rebalance_observer` 콜백 추가. 각 리밸런싱 전후 포트폴리오 상태(의사결정, 주문, 체결)를 기록. 기존 11개 호출부 변경 없음 (keyword-only, 기본값 `None`).
+- `scripts/analyze_filter_frequency.py`: 리밸런싱 시점별 risk_on 상태와 필터 통과 종목 수를 집계하는 진단 스크립트.
+- `scripts/analyze_zero_candidate_impact.py`: `risk_on + 후보 0개` 사건의 실제 포트폴리오 영향을 분석. 기존 보유 유지 여부, 무포지션 비율, 이후 5/10/20/40거래일 KOSPI/고정 포트폴리오/실제 전략 수익률 비교.
+
+**분석 결과:** 7건 중 6건은 기존 보유를 유지했으며, 실제 무포지션은 1건(1.7%)에 불과. 유일한 무포지션 사건(2018-03-20)에서도 시장 하락(-1.35%~-1.73%)을 회피. 현재 로직은 정상 방어 기능으로 판정.
+
+**파일:** `run_etf_backtest.py`, `scripts/analyze_filter_frequency.py`, `scripts/analyze_zero_candidate_impact.py`
+
+---
+
 ## 2026-07 — NAV 기반 랭킹 및 ETF 안전 필터 1차 적용
 
 **문제:** 가격수익률만으로 랭킹하면 해외/커버드콜/고배당 ETF의 NAV 변화와 괴리율을 충분히 반영하지 못하고, 신규 상장 ETF가 충분한 이력 없이 후보에 들어올 수 있음.

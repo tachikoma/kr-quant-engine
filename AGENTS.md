@@ -6,7 +6,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 
 ## Key entrypoints
 
-- `run_etf_backtest.py` — primary backtest (1250+ lines, procedural). Config via env vars. CLI: `--start`, `--end`, `--mode`.
+- `run_etf_backtest.py` — primary backtest (1800+ lines, procedural). Config via env vars. CLI: `--start`, `--end`, `--mode`. `run_etf_strategy()` supports optional `rebalance_observer` callback for diagnostics.
 - `live_trading/etf_daily_runner.py` — daily live order runner (default: safe mode, no real orders). CLI: `--force-live`.
 - `live_trading/kiwoom_adapter.py` — Kiwoom REST API adapter for live brokerage.
 - `live_trading/kis_adapter.py` — Korea Investment & Securities (KIS) REST API adapter.
@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (24 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`.
+- Analysis scripts: `scripts/` (26 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`.
 
 ## Commands
 
@@ -30,6 +30,8 @@ uv run scripts/walk_forward_validation.py       # rolling walk-forward parameter
 uv run scripts/parameter_stability.py           # parameter neighborhood sensitivity check
 uv run scripts/trade_performance_attribution.py # FIFO trade P&L attribution (cost-aware)
 uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS performance
+uv run scripts/analyze_filter_frequency.py       # risk_on + 후보 0개 빈도 분석
+uv run scripts/analyze_zero_candidate_impact.py  # 후보 0개 사건 포트폴리오 영향 분석
 uv run scripts/<script>.py                      # any analysis script
 ruff check .                # lint (ruff only, no mypy/pytest config)
 ```
@@ -82,6 +84,7 @@ Full list in `README.md` and `.env.sample`.
 
 - `outputs_etf_only/` — backtest results: `etf_equity_curve.csv`, `etf_trades.csv`, `performance.json`
 - `outputs_etf_only/` (experiment mode) — also `etf_trades_slip_5bp.csv`..`_30bp.csv`, `slippage_comparison.csv`
+- `outputs_etf_only/` (diagnostics) — `rebalance_diagnostics.csv`, `zero_candidate_impact.csv`, `filter_frequency.csv`
 - `outputs_grid/` — grid backtest results: `grid_summary_*.csv`
 - `outputs_stability/` — parameter stability results
 - `outputs_trade_analysis/` — trade performance attribution results
@@ -104,6 +107,7 @@ Full list in `README.md` and `.env.sample`.
 - `get_valuation_price()` / `update_last_valid_prices()` in `etf_shared.py` handle missing closing prices by falling back to the last known valid price per ticker. Used in the daily runner to prevent zero valuation on missing data.
 - `rank_etfs()` in `etf_shared.py` applies filters step-by-step (liquidity → listing → deviation → trend/return), logging each step's before/after count and dropped tickers at `DEBUG` level. Summary logged at `INFO` level.
 - Both `run_etf_backtest.py` and `live_trading/etf_daily_runner.py` use Python `logging` module with configurable level (`LOG_LEVEL`, default `INFO`) and optional file rotation (`LOG_FILE`, 30-day retention). `DEBUG` level exposes per-filter dropped ticker lists.
+- `run_etf_strategy()` accepts an optional `rebalance_observer` keyword-only callback. When provided, it is called at each rebalance with a dict containing pre/post portfolio state, risk flags, targets, and order results. The callback does not affect backtest logic; observer errors are logged and re-raised.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.

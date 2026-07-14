@@ -1,11 +1,15 @@
 from pathlib import Path
+from collections.abc import Callable
 import json
+import logging
 import os
 import argparse
 from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
@@ -762,12 +766,18 @@ def run_etf_strategy(
     risk_off_liquidate: bool = True,
     price_data: pd.DataFrame | None = None,
     max_asset_pct: float | None = None,
+    *,
+    rebalance_observer: Callable[[dict], None] | None = None,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
     리밸런싱 시점에서 랭킹 상위 종목을 매수하고, 분배락일에는 보유 수량에 한하여
     현금분배금을 계산해 자산에 반영한다. 같은 날 신규 매수분에는 분배금이 귀속되지
     않는다.
+
+    Args:
+        rebalance_observer: 선택적 콜백. 각 리밸런싱 전후 상태(의사결정, 주문, 체결)
+           를 담은 dict를 전달한다. ``None``이면 기존 동작과 동일하다.
     """
     price = price_data.copy() if price_data is not None else load_etf_price()
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
@@ -802,6 +812,7 @@ def run_etf_strategy(
         )
         update_last_valid_prices(last_valid_closes, today.get("close"))
         should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
+        observer_event: dict | None = None
 
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
@@ -822,6 +833,35 @@ def run_etf_strategy(
                     targets = []
             else:
                 targets = []
+
+            allow_empty_target_sell = (
+                (not kospi_risk_on) if risk_off_liquidate else False
+            )
+            empty_target_protected = (not targets) and (not allow_empty_target_sell)
+
+            pre_holdings_snapshot = dict(holdings)
+            pre_cash = cash
+            pre_market_value = 0.0
+            for ticker, qty in pre_holdings_snapshot.items():
+                close_price = get_valuation_price(ticker, today.get("close"), last_valid_closes)
+                if close_price is not None:
+                    pre_market_value += qty * close_price
+            pre_equity = pre_cash + pre_market_value
+
+            if rebalance_observer is not None:
+                observer_event = {
+                    "decision_date": dt,
+                    "risk_on": kospi_risk_on,
+                    "n_candidates": len(ranked),
+                    "ranked_tickers": [str(t) for t in ranked.get("ticker", [])],
+                    "targets": list(targets),
+                    "allow_empty_target_sell": allow_empty_target_sell,
+                    "empty_target_protected": empty_target_protected,
+                    "pre_cash": pre_cash,
+                    "pre_holdings": pre_holdings_snapshot,
+                    "pre_market_value": pre_market_value,
+                    "pre_equity": pre_equity,
+                }
 
             # 최신 참조가격(다음 시가)을 기반으로 호가 스프레드를 적용한 매수/매도 참조가격 사전 생성
             latest_prices = next_open.to_dict()
@@ -857,7 +897,7 @@ def run_etf_strategy(
                 slippage=slippage,
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
-                allow_empty_target_sell=not kospi_risk_on if risk_off_liquidate else False,
+                allow_empty_target_sell=allow_empty_target_sell,
                 generate_orders=True,
                 max_asset_pct=effective_max_asset_pct,
                 ticker_names=ticker_names,
@@ -937,6 +977,29 @@ def run_etf_strategy(
                 "distribution_cash": distribution_cash,
             }
         )
+
+        if observer_event is not None:
+            post_holdings_snapshot = dict(holdings)
+            post_equity = cash + market_value
+            observer_event.update(
+                {
+                    "execution_date": next_dt,
+                    "post_cash": cash,
+                    "post_holdings": post_holdings_snapshot,
+                    "post_market_value": market_value,
+                    "post_equity": post_equity,
+                    "n_orders": len(orders),
+                    "n_buys": sum(1 for order in orders if order.get("side") == "BUY"),
+                    "n_sells": sum(1 for order in orders if order.get("side") == "SELL"),
+                    "held_unchanged": pre_holdings_snapshot == post_holdings_snapshot,
+                    "uninvested": not post_holdings_snapshot,
+                }
+            )
+            try:
+                rebalance_observer(observer_event)
+            except Exception:
+                logger.exception("rebalance_observer 실행 실패")
+                raise
 
     return pd.DataFrame(equity_rows), pd.DataFrame(trades)
 
