@@ -17,9 +17,31 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import run_etf_backtest as rtb
+from config_utils import parse_fraction_env, parse_pct_env
 
 
 OUTPUT_DIR = ROOT / "outputs_walk_forward"
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def serialize_stats(stats: dict) -> dict:
+    result = {}
+    for key, value in stats.items():
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            result[key] = None
+        elif isinstance(value, (np.integer, np.floating)):
+            result[key] = float(value)
+        elif isinstance(value, pd.Timestamp):
+            result[key] = str(value.date())
+        else:
+            result[key] = value
+    return result
 
 
 def parse_int_list(name: str, default: list[int]) -> list[int]:
@@ -111,6 +133,18 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     step_years = int(os.environ.get("WF_STEP_YEARS", "1"))
     anchored = os.environ.get("WF_ANCHORED", "0") == "1"
     boundary_cost_pct = float(os.environ.get("WF_BOUNDARY_COST_PCT", "0.0015"))
+    target_weight_rebalance = parse_bool_env(
+        "WF_TARGET_WEIGHT_REBALANCE",
+        bool(rtb.strategy_cfg.get("target_weight_rebalance", False)),
+    )
+    max_asset_pct = parse_fraction_env(
+        "WF_MAX_ASSET_PCT",
+        parse_fraction_env("MAX_ASSET_PCT", 0.50),
+    )
+    rebalance_band_pct = parse_pct_env(
+        "WF_REBALANCE_BAND_PCT",
+        float(rtb.strategy_cfg.get("rebalance_band_pct", 0.05)),
+    )
     if min(train_years, test_years, step_years) <= 0:
         raise ValueError("WF_TRAIN_YEARS/WF_TEST_YEARS/WF_STEP_YEARS는 양수여야 합니다.")
     if not 0 <= boundary_cost_pct <= 0.1:
@@ -137,6 +171,9 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 slippage=rtb.BASE_SLIPPAGE,
                 risk_off_liquidate=risk_off_liquidate,
                 price_data=price_data,
+                max_asset_pct=max_asset_pct,
+                target_weight_rebalance=target_weight_rebalance,
+                rebalance_band_pct=rebalance_band_pct,
             )
             curve = curve[["date", "equity"]].copy()
             curve["date"] = pd.to_datetime(curve["date"])
@@ -239,30 +276,37 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "test_years": test_years,
         "step_years": step_years,
         "boundary_cost_pct": boundary_cost_pct,
+        "target_weight_rebalance": target_weight_rebalance,
+        "max_asset_pct": max_asset_pct,
+        "rebalance_band_pct": rebalance_band_pct,
         "rebalance_days_grid": rebalance_days,
         "max_positions_grid": max_positions,
         "fold_count": len(folds_df),
         "oos_start": str(stitched_df["date"].iloc[0].date()),
         "oos_end": str(stitched_df["date"].iloc[-1].date()),
-        "oos_stats": {
-            key: None if pd.isna(value) else float(value) for key, value in overall_stats.items()
-        },
+        "oos_stats": serialize_stats(overall_stats),
     }
     return folds_df, stitched_df, summary
 
 
 def main() -> None:
     folds_df, stitched_df, summary = run_validation()
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    folds_df.to_csv(OUTPUT_DIR / "walk_forward_folds.csv", index=False, encoding="utf-8-sig")
-    stitched_df.to_csv(
-        OUTPUT_DIR / "walk_forward_equity_curve.csv", index=False, encoding="utf-8-sig"
+    output_dir_raw = os.environ.get("WF_OUTPUT_DIR", str(OUTPUT_DIR))
+    output_dir = Path(output_dir_raw)
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    folds_df.to_csv(
+        output_dir / "walk_forward_folds.csv", index=False, encoding="utf-8-sig"
     )
-    (OUTPUT_DIR / "walk_forward_summary.json").write_text(
+    stitched_df.to_csv(
+        output_dir / "walk_forward_equity_curve.csv", index=False, encoding="utf-8-sig"
+    )
+    (output_dir / "walk_forward_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(f"[walk-forward] 저장 완료: {OUTPUT_DIR}")
+    print(f"[walk-forward] 저장 완료: {output_dir}")
 
 
 if __name__ == "__main__":

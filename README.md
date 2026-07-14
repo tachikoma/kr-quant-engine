@@ -231,6 +231,10 @@ uv run scripts/trade_performance_attribution.py           # 비용 포함 거래
 - `WF_STEP_YEARS=1`
 - `WF_ANCHORED=0`: `0`은 rolling window, `1`은 expanding window
 - `WF_BOUNDARY_COST_PCT=0.0015`: 각 테스트 폴드 시작 시 전량 교체를 가정한 비용
+- `WF_TARGET_WEIGHT_REBALANCE=0|1`: walk-forward 시 목표비중 주문 방식 사용 여부
+- `WF_MAX_ASSET_PCT=0.50`: walk-forward 전용 종목 비중 상한
+- `WF_REBALANCE_BAND_PCT=0.10`: 목표비중 방식의 절대 비중 무거래 밴드
+- `WF_OUTPUT_DIR=outputs_walk_forward`: 기존 결과를 보존할 별도 출력 경로 지정
 
 ### 파라미터 주변값 안정성
 
