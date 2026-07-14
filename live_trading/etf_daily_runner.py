@@ -161,6 +161,8 @@ class RunnerConfig:
     liquidate_on_risk_off: bool = True
     max_premium_discount: float = 0.02
     max_live_spread_pct: float = 0.005
+    concentration_warn_pct: float = 0.60
+    drawdown_warn_pct: float = 0.15
     log_level: str = "INFO"
     log_file: str = ""
 
@@ -395,6 +397,8 @@ def _read_env_config() -> RunnerConfig:
         liquidate_on_risk_off=_parse_bool("LIQUIDATE_ON_RISK_OFF", True),
         max_premium_discount=float(strategy_cfg.get("max_premium_discount", 0.02)),
         max_live_spread_pct=float(strategy_cfg.get("max_live_spread_pct", 0.005)),
+        concentration_warn_pct=parse_fraction_env("LIVE_CONCENTRATION_WARN_PCT", 0.60),
+        drawdown_warn_pct=parse_fraction_env("LIVE_DRAWDOWN_WARN_PCT", 0.15),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         log_file=os.environ.get("LOG_FILE", ""),
     )
@@ -825,6 +829,128 @@ def _filter_buy_orders_by_live_guards(
     return filtered
 
 
+def _calculate_risk_snapshot(
+    holdings: dict[str, int],
+    cash: float,
+    latest_prices: dict[str, float],
+    previous_peak_equity: object,
+    ticker_names: dict[str, str],
+    concentration_warn_pct: float,
+    drawdown_warn_pct: float,
+) -> dict[str, Any]:
+    """현재 전략 자산의 집중도와 누적 고점 대비 낙폭을 계산한다."""
+    position_values: list[dict[str, Any]] = []
+    missing_price_tickers: list[str] = []
+    for ticker, qty in holdings.items():
+        if int(qty) <= 0:
+            continue
+        price = latest_prices.get(ticker)
+        if price is None or pd.isna(price) or float(price) <= 0:
+            missing_price_tickers.append(ticker)
+            continue
+        position_values.append(
+            {
+                "ticker": ticker,
+                "name": ticker_names.get(ticker, ticker),
+                "qty": int(qty),
+                "price": float(price),
+                "market_value": int(qty) * float(price),
+            }
+        )
+
+    previous_peak = None
+    try:
+        parsed_peak = float(previous_peak_equity)
+        if parsed_peak > 0:
+            previous_peak = parsed_peak
+    except (TypeError, ValueError):
+        pass
+
+    if missing_price_tickers:
+        names = [ticker_names.get(ticker, ticker) for ticker in missing_price_tickers]
+        return {
+            "complete": False,
+            "peak_initialized_now": False,
+            "current_equity": None,
+            "peak_equity": previous_peak,
+            "current_drawdown": None,
+            "cash": float(cash),
+            "cash_weight": None,
+            "max_position": None,
+            "positions": position_values,
+            "missing_price_tickers": missing_price_tickers,
+            "warnings": [f"가격 누락으로 위험지표 계산 불가: {', '.join(names)}"],
+        }
+
+    market_value = sum(float(row["market_value"]) for row in position_values)
+    current_equity = float(cash) + market_value
+    if current_equity <= 0:
+        return {
+            "complete": False,
+            "peak_initialized_now": False,
+            "current_equity": current_equity,
+            "peak_equity": previous_peak,
+            "current_drawdown": None,
+            "cash": float(cash),
+            "cash_weight": None,
+            "max_position": None,
+            "positions": position_values,
+            "missing_price_tickers": [],
+            "warnings": ["평가자산이 0 이하라 위험지표를 계산할 수 없음"],
+        }
+
+    peak_equity = max(previous_peak or current_equity, current_equity)
+    current_drawdown = current_equity / peak_equity - 1
+    for row in position_values:
+        row["weight"] = float(row["market_value"]) / current_equity
+    position_values.sort(key=lambda row: float(row["weight"]), reverse=True)
+    max_position = position_values[0] if position_values else None
+
+    warnings = []
+    if (
+        concentration_warn_pct > 0
+        and max_position is not None
+        and float(max_position["weight"]) >= concentration_warn_pct
+    ):
+        warnings.append(
+            f"종목 집중 {max_position['name']} {float(max_position['weight']):.1%} "
+            f">= {concentration_warn_pct:.1%}"
+        )
+    if drawdown_warn_pct > 0 and current_drawdown <= -drawdown_warn_pct:
+        warnings.append(
+            f"고점 대비 낙폭 {current_drawdown:.1%} <= -{drawdown_warn_pct:.1%}"
+        )
+
+    return {
+        "complete": True,
+        "peak_initialized_now": previous_peak is None,
+        "current_equity": current_equity,
+        "peak_equity": peak_equity,
+        "current_drawdown": current_drawdown,
+        "cash": float(cash),
+        "cash_weight": float(cash) / current_equity,
+        "max_position": max_position,
+        "positions": position_values,
+        "missing_price_tickers": [],
+        "warnings": warnings,
+    }
+
+
+def _risk_state_fields(
+    plan: dict[str, Any], previous_state: dict[str, Any]
+) -> dict[str, Any]:
+    risk_snapshot = plan.get("risk_snapshot") or {}
+    if risk_snapshot.get("source") != "broker":
+        return {
+            "risk_peak_equity": previous_state.get("risk_peak_equity"),
+            "risk_snapshot": previous_state.get("risk_snapshot"),
+        }
+    return {
+        "risk_peak_equity": risk_snapshot.get("peak_equity"),
+        "risk_snapshot": risk_snapshot,
+    }
+
+
 def _build_plan(
     config: RunnerConfig,
     api: Any | None,
@@ -916,6 +1042,16 @@ def _build_plan(
 
     # 4단계: 리밸런싱 주기 판단
     state = _load_state()
+    risk_snapshot = _calculate_risk_snapshot(
+        holdings=holdings_for_rebalance,
+        cash=cash,
+        latest_prices=latest_prices,
+        previous_peak_equity=state.get("risk_peak_equity"),
+        ticker_names=ticker_names,
+        concentration_warn_pct=config.concentration_warn_pct,
+        drawdown_warn_pct=config.drawdown_warn_pct,
+    )
+    risk_snapshot["source"] = "broker" if api is not None else "mock"
     today = _date_to_iso(_today_kst())
     rebalance_due = config.force_rebalance or _should_rebalance(
         today=today,
@@ -1079,6 +1215,7 @@ def _build_plan(
         "buy_orders": buy_orders,
         "all_orders": orders,
         "market_order_margin_rate": market_order_margin_rate,
+        "risk_snapshot": risk_snapshot,
     }
 
 
@@ -1478,6 +1615,27 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
         logger.info("  현재 보유:")
         for ticker, qty in plan["holdings"].items():
             logger.info(f"    {tn.get(ticker, ticker)}: {qty}주")
+    risk = plan.get("risk_snapshot") or {}
+    risk_source = "실계좌" if risk.get("source") == "broker" else "모의"
+    if risk.get("complete"):
+        logger.info(
+            f"[주문 전 위험현황/{risk_source}] 전략 평가액={risk['current_equity']:,.0f}, "
+            f"고점={risk['peak_equity']:,.0f}, 낙폭={risk['current_drawdown']:.2%}, "
+            f"현금비중={risk['cash_weight']:.1%}"
+        )
+        for position in risk.get("positions", []):
+            logger.info(
+                f"  비중 {position['name']}: {position['weight']:.1%} "
+                f"({position['market_value']:,.0f}원)"
+            )
+        if risk.get("peak_initialized_now"):
+            logger.info(
+                "[주문 전 위험현황] 저장된 고점이 없어 현재 평가액으로 고점 기준을 초기화합니다."
+            )
+    else:
+        logger.warning("[주문 전 위험현황] 가격 누락 또는 평가액 오류로 지표가 불완전합니다.")
+    for warning in risk.get("warnings", []):
+        logger.warning(f"[위험경고] {warning}")
     blocked_external = plan.get("blocked_external_holdings") or {}
     if blocked_external:
         logger.info("  매도 제외(유니버스 외 보유):")
@@ -1658,9 +1816,22 @@ def run_daily() -> None:
             "target": plan["target"],
             "orders": [],
             "last_rebalance_date": state.get("last_rebalance_date"),
+            **_risk_state_fields(plan, state),
         }
         _save_state(new_state)
         logger.info("[완료] 오늘은 실행할 주문이 없습니다.")
+        if cfg.enable_live_order and api is not None and TelegramNotifier is not None:
+            try:
+                notifier = TelegramNotifier()
+                notifier.notify_daily_summary(
+                    trading_date=today,
+                    run_status="NO_ACTION",
+                    sell_results=[],
+                    buy_results=[],
+                    risk_snapshot=plan.get("risk_snapshot"),
+                )
+            except Exception as exc:
+                logger.info(f"[경고] 텔레그램 위험요약 발송 실패: {exc}")
         return
 
     if cfg.wait_until_open:
@@ -2081,6 +2252,7 @@ def run_daily() -> None:
         "target": plan["target"],
         "orders": executed_orders,
         "last_rebalance_date": today if plan["rebalance_due"] else state.get("last_rebalance_date"),
+        **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
     try:
@@ -2120,6 +2292,7 @@ def run_daily() -> None:
             run_status=run_status,
             sell_results=sell_results + sell_retry_results,
             buy_results=buy_results + buy_retry_results,
+            risk_snapshot=plan.get("risk_snapshot"),
         )
 
 

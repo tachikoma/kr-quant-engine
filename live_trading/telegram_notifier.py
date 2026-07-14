@@ -132,6 +132,7 @@ class TelegramNotifier:
         run_status: str,
         sell_results: list[dict[str, Any]],
         buy_results: list[dict[str, Any]],
+        risk_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """일일 실행 완료 요약 알림."""
         status_emoji = {
@@ -165,6 +166,25 @@ class TelegramNotifier:
 
         if not sell_results and not buy_results:
             lines.append("주문 없음")
+
+        if risk_snapshot:
+            lines.append("\n<b>[주문 전 위험 현황]</b>")
+            if risk_snapshot.get("complete"):
+                equity = float(risk_snapshot.get("current_equity") or 0.0)
+                drawdown = float(risk_snapshot.get("current_drawdown") or 0.0)
+                max_position = risk_snapshot.get("max_position")
+                lines.append(f"평가액: {equity:,.0f}원 / 고점 대비 {drawdown:.1%}")
+                if max_position:
+                    lines.append(
+                        f"최대 비중: {max_position.get('name', max_position.get('ticker', ''))} "
+                        f"{float(max_position.get('weight') or 0.0):.1%}"
+                    )
+                if risk_snapshot.get("peak_initialized_now"):
+                    lines.append("고점 기준: 오늘 평가액으로 초기화")
+            else:
+                lines.append("위험지표 불완전")
+            for warning in risk_snapshot.get("warnings", []):
+                lines.append(f"⚠️ {warning}")
 
         # 요약은 동기 발송 (실행 직후 즉시 수신 보장)
         self.send("\n".join(lines))

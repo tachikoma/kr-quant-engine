@@ -37,4 +37,8 @@ run_etf_backtest.py는 지수 이동평균과 기울기로 risk_on/risk_off를 �
 - `ETF_EXIT_CHECK_DAYS` / `ETF_TRAILING_STOP_PCT`: 종목별 trailing stop
 - `ETF_PORTFOLIO_TRAILING_STOP_PCT`: 포트폴리오 trailing stop
 
+## 7. 실전 위험 모니터링 한계
+
+`_calculate_risk_snapshot()`은 주문 전 시점의 스냅샷이며, 체결 이후 실시간으로 갱신되지 않는다. 또한 계좌 입출금(입금/출금)이 고점 변동으로 인식되어 낙폭 경고가 왜곡될 수 있다. 큰 현금 이동 후에는 `runtime_state/etf_daily_state.json`의 `risk_peak_equity`를 직접 확인하거나 리셋해야 한다.
+
 

@@ -116,6 +116,8 @@ python live_trading/etf_daily_runner.py --force-live
 | `LIVE_SLIPPAGE_PCT` | `0.0005` | 실전 슬리피지 |
 | `LIVE_SPREAD_PCT` | `0.0005` | 실전 호가 스프레드 fallback |
 | `MAX_LIVE_SPREAD_PCT` | `0.005` | 실전 bid-ask 스프레드 초과 시 매수 스킵 |
+| `LIVE_CONCENTRATION_WARN_PCT` | `0.60` | 전략 종목 최대 비중 경고 임계값 |
+| `LIVE_DRAWDOWN_WARN_PCT` | `0.15` | 실전 누적 고점 대비 낙폭 경고 임계값 |
 
 ### 증권사 API (BROKER_TYPE에 따라)
 
@@ -139,6 +141,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `TELEGRAM_BOT_TOKEN`: 봇 토큰
 - `TELEGRAM_CHAT_ID`: 수신 채팅/채널 ID
 - 토큰/채팅ID 미설정 시 조용히 비활성화됨
+- 실전 실행 요약에 주문 전 전략 평가액, 최대 종목 비중, 누적 고점 대비 낙폭 경고 포함
+- 실계좌 고점은 `runtime_state/etf_daily_state.json`에 누적되며 최초 실행 시 현재 평가액으로 초기화
+- 증권사 API가 없는 모의 잔고는 저장된 실계좌 고점과 위험 스냅샷을 갱신하지 않음
+- 계좌 입출금은 수익이 아니어도 낙폭에 영향을 줄 수 있으므로 큰 현금 이동 후 고점 기준 확인 필요
 
 기본 동작에서는 종목명 조회 없이 티커를 그대로 사용하므로, 인증 정보 없이도 백테스트는 실행됩니다.
 

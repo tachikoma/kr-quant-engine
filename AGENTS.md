@@ -67,6 +67,8 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_DEVIATION_THRESHOLD_BY_GROUP` | `domestic_equity=0.02,foreign_investment=0.02,commodity=0.02` | Group-specific price/NAV deviation thresholds |
 | `ETF_DEVIATION_THRESHOLD_BY_TICKER` | `472150=0.02,486290=0.02,498400=0.02` | Per-ticker deviation override (e.g. covered-call ETFs) |
 | `MAX_LIVE_SPREAD_PCT` | `0.005` | Skip live BUY orders when bid-ask spread exceeds threshold |
+| `LIVE_CONCENTRATION_WARN_PCT` | `0.60` | 실전 종목 비중 경고 임계값 (0=비활성). 매매에 영향 없음 |
+| `LIVE_DRAWDOWN_WARN_PCT` | `0.15` | 실전 누적 고점 대비 낙폭 경고 임계값 (0=비활성). 계좌 입출금 영향 주의 |
 | `PROTECT_EXTERNAL_HOLDINGS` | `1` | Skip sell for tickers outside strategy universe |
 | `BLOCK_LIVE_AFTER_CUTOFF` | `1` | Block live orders past cutoff time |
 | `APPLY_SLIPPAGE_IN_LIVE` | `0` | Apply artificial slippage in live mode |
@@ -125,6 +127,7 @@ Full list in `README.md` and `.env.sample`.
 - Both `run_etf_backtest.py` and `live_trading/etf_daily_runner.py` use Python `logging` module with configurable level (`LOG_LEVEL`, default `INFO`) and optional file rotation (`LOG_FILE`, 30-day retention). `DEBUG` level exposes per-filter dropped ticker lists.
 - `run_etf_strategy()` accepts an optional `rebalance_observer` keyword-only callback. When provided, it is called at each rebalance with a dict containing pre/post portfolio state, risk flags, targets, and order results. The callback does not affect backtest logic; observer errors are logged and re-raised.
 - Exit-only trailing overlay (`ETF_EXIT_CHECK_DAYS` / `ETF_TRAILING_STOP_PCT`): backtest only, not applied in live runner. Tracks per-ticker peak close and sells at next-day open when drop exceeds threshold. Stopped tickers are excluded from same-day rebalance targets. Default inactive (both `0`).
+- Live risk monitoring (`_calculate_risk_snapshot()` in `etf_daily_runner.py`): computes per-position weights and drawdown from peak equity before order placement. Alerts logged and sent to Telegram summary; does not affect orders. Peak equity persisted in `runtime_state/etf_daily_state.json`. Mock accounts (no API) do not overwrite peak equity. Missing prices block drawdown calculation to prevent false alerts.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.
