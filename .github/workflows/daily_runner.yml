@@ -24,7 +24,13 @@ env:
   ENV_MODE: ${{ vars.ENV_MODE || 'demo' }}
   ENABLE_TICKER_NAME_LOOKUP: ${{ vars.ENABLE_TICKER_NAME_LOOKUP || '0' }}
   LIVE_ORDER_ENABLED: ${{ vars.LIVE_ORDER_ENABLED || '0' }}
-  REBALANCE_STEP_DAYS: ${{ vars.REBALANCE_STEP_DAYS || '10' }}
+  REBALANCE_STEP_DAYS: ${{ vars.REBALANCE_STEP_DAYS || '20' }}
+  # === Multi-Index Risk ===
+  ENABLE_MULTI_INDEX_RISK: ${{ vars.ENABLE_MULTI_INDEX_RISK || '1' }}
+  MULTI_INDEX_GATING_MODE: ${{ vars.MULTI_INDEX_GATING_MODE || 'split' }}
+  US_RISK_PROXY: ${{ vars.US_RISK_PROXY || 'QQQ' }}
+  US_MARKET_MA_DAYS: ${{ vars.US_MARKET_MA_DAYS || '120' }}
+  US_MARKET_SLOPE_DAYS: ${{ vars.US_MARKET_SLOPE_DAYS || '20' }}
   KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
   KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
   KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
