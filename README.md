@@ -54,7 +54,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `ENABLE_TICKER_NAME_LOOKUP=1`: 종목명 조회 활성화 (기본 0)
 - `ENV_MODE=real|demo`: 운영 모드 (기본 real)
 - `BROKER_TYPE=KIWOOM|KIS`: 증권사 선택 (기본 KIWOOM)
-- `ETF_LIST`: 티커 쉼표 목록으로 ETF 후보풀 오버라이드 (예: `069500,091160`)
+- `ETF_LIST`: 티커 쉼표 목록으로 ETF 후보풀 오버라이드 (예: `069500,091160`). `ETF_UNIVERSE_MODE=auto` 시 우선
+- `ETF_UNIVERSE_MODE=static|auto`: `static`(기본, 하드코딩된 `ETF_LIST`) 또는 `auto`(KRX 분류 기반 자동 구축)
+- `ETF_UNIVERSE_EXCLUDE_KEYWORDS`: 자동 모드에서 이름 키워드로 제외 (기본: `커버드콜`)
+- `ETF_UNIVERSE_INCLUDE_COMMODITY=0|1`: 자동 모드에서 원자재 ETF 포함 여부 (기본 0, 주식형만)
 - `MIN_AVG_TRADING_VALUE`: trailing 60거래일 평균 거래대금 기준 유동성 임계값(원). 기본 `1000000000` (10억). 미달 시 리밸런싱 snapshot에서 제외 (백테스트/라이브 공통)
 - `ETF_RETURN_BASIS=price|nav|total_return`: 랭킹 수익률 기준. `total_return`은 검증된
   현금분배금을 분배락일에 재투자합니다(기본 `price`).
@@ -88,7 +91,7 @@ python live_trading/etf_daily_runner.py --force-live
 | `ETF_REFRESH_CACHE` | `0` | 캐시 무시하고 재조회 |
 | `ETF_TAXABLE_SELL_TAX_PCT` | `0.154` (15.4%) | 과세 ETF 매도 시 배당소득세율 |
 
-과세 대상 ETF (`TAXABLE_ETF_TICKERS`): 미국S&P500(H), ACE 미국S&P500, TIGER 미국S&P500, TIGER 미국나스닥100, TIGER 배당커버드콜액티브, TIGER 미국나스닥100TDCC, KODEX 200TWCC, ACE KRX금현물
+과세 대상 ETF (`TAXABLE_ETF_TICKERS`): auto 모드 시 KRX 분류에서 자동 산출, static 모드 시 기본 8종목 (미국S&P500(H), ACE 미국S&P500, TIGER 미국S&P500, TIGER 미국나스닥100, TIGER 배당커버드콜액티브, TIGER 미국나스닥100TDCC, KODEX 200TWCC, ACE KRX금현물)
 
 ### 데일리 러너(live_trading/etf_daily_runner.py)
 
@@ -181,6 +184,7 @@ python live_trading/etf_daily_runner.py --force-live
 
 - `run_etf_backtest.py`: ETF 백테스트 메인 (CLI: `--start`, `--end`, `--mode`)
 - `etf_shared.py`: 공통 전략 상수/로직 (ETF_LIST, ranking, 주문 생성)
+- `etf_universe.py`: KRX 분류 기반 ETF 유니버스 자동 구축 (`build_universe()`, `config_from_env()`)
 - `config_utils.py`: 환경변수 파싱 유틸 (`parse_pct_env`, `parse_fraction_env`)
 - `pykrx_utils.py`: pykrx 호출 유틸 (FD 캡처, 캐시)
 - `live_trading/etf_daily_runner.py`: 데일리 주문 계획/실행 러너

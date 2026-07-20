@@ -47,7 +47,8 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 - **Safety first** — `live_trading/etf_daily_runner.py` defaults to `LIVE_ORDER_ENABLED=0`. Live orders require `--force-live` CLI flag.
 - **Env-var-driven config** — backtest mode (`ETF_BACKTEST_MODE=single|experiment`), slippage (`ETF_BASE_SLIPPAGE=0.0005`), slippage units accept `"5bp"`, `"0.5%"`, or `"0.0005"` via `config_utils.parse_pct_env()`.
 - **BROKER_TYPE=KIWOOM|KIS** — selects live brokerage adapter (default KIWOOM).
-- **TAXABLE_ETF_TICKERS** — 8 tickers subject to 15.4% dividend tax on trading gains.
+- **TAXABLE_ETF_TICKERS** — auto-computed from KRX classification in auto mode; hardcoded 8 tickers in static mode. Subject to 15.4% dividend tax on trading gains.
+- **ETF_UNIVERSE_MODE** — `static` (default, hardcoded `ETF_LIST`) or `auto` (KRX-classification-based auto-build). `ETF_LIST` env var takes precedence over auto.
 
 ## Key env vars
 
@@ -57,6 +58,9 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_BASE_SLIPPAGE` | `0.0005` | Backtest slippage fraction |
 | `ETF_SPREAD_PCT` | `0.0005` | Bid-ask spread |
 | `ETF_ENABLE_BENCHMARK` | `1` | Include KODEX200 comparison in single mode |
+| `ETF_UNIVERSE_MODE` | `static` | `static` (hardcoded ETF_LIST) or `auto` (KRX-classification-based auto-build). `ETF_LIST` env var takes precedence over auto |
+| `ETF_UNIVERSE_EXCLUDE_KEYWORDS` | `커버드콜` | Comma-separated keywords to exclude ETFs by name (auto mode only) |
+| `ETF_UNIVERSE_INCLUDE_COMMODITY` | `0` | `1` to include commodity ETFs in auto universe (default: equity-only) |
 | `MAX_ASSET_PCT` | `0.50` | Per-asset position cap. `0` = unlimited |
 | `ETF_USE_CACHE` | `1` | Use parquet data cache |
 | `ETF_REFRESH_CACHE` | `0` | Force refetch data |
@@ -117,7 +121,8 @@ Full list in `README.md` and `.env.sample`.
 ## Architecture notes
 
 - `etf_shared.py` holds the shared constants and core strategy: ETF_LIST, fees (buy 0.015%, sell 0.015%), `REBALANCE_STEP_DAYS=20`, `MARKET_MA_DAYS=120`, `MARKET_SLOPE_DAYS=20`, `ETF_MAX_POSITIONS=2`, `ETF_SELL_RANK_BUFFER=3`, `TAXABLE_ETF_TICKERS` (8 tickers).
-- `ETF_TICKER_GROUPS` (16 tickers) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Hardcoded, no env override.
+- `etf_universe.py` exposes `build_universe()` (pure function) and `config_from_env()` for auto-building the ETF universe from KRX classification data. Used when `ETF_UNIVERSE_MODE=auto`.
+- `ETF_TICKER_GROUPS` (16 tickers in static / 573 in auto) classifies ETFs into `domestic_equity`/`foreign_investment`/`commodity`. When KOSPI is risk_off, `foreign_investment` and `commodity` groups remain tradable via `is_ticker_risk_on()`. Auto mode overrides from `etf_universe.build_universe()`. **검증 결과: auto 유니버스는 static 대비 열등 (CAGR 12.2% vs 25.7%), static 유지 권장.**
 - `add_liquidity_flag()` adds a `liquidity_ok` boolean column based on trailing 60-day avg trading value vs `MIN_AVG_TRADING_VALUE` (default 1B KRW). Always active in backtest. Filtering is as-of per rebalance snapshot.
 - `add_listing_flag()` adds `listing_ok` from KRX `LIST_DD` when available; unknown listing dates are allowed.
 - `add_deviation_flag()` adds `premium_discount`, `deviation_threshold`, and `deviation_ok` from `close` vs `nav`; missing NAV is allowed for price-only compatibility. Threshold resolution order: `ETF_DEVIATION_THRESHOLD_BY_TICKER` > `ETF_DEVIATION_THRESHOLD_BY_GROUP` > `MAX_PREMIUM_DISCOUNT`.

@@ -9,3 +9,4 @@ outputs_*/
 .env
 .kis_token_cache/
 .kiwoom_token_cache/
+.opencode/

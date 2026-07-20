@@ -45,6 +45,8 @@ from etf_shared import (
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     TAXABLE_ETF_TICKERS,
+    UNIVERSE_MODE,
+    _UNIVERSE_BUILD_RESULT,
     get_strategy_config,
 )
 from strategy_freeze import canonical_payload, diff_payloads, load_frozen_strategy
@@ -52,7 +54,8 @@ from strategy_freeze import canonical_payload, diff_payloads, load_frozen_strate
 
 def current_strategy_payload() -> dict:
     cfg = get_strategy_config()
-    return {
+    payload: dict = {
+        "universe_mode": UNIVERSE_MODE,
         "universe": list(ETF_LIST),
         "parameters": {
             "return_basis": cfg.get("return_basis", "price"),
@@ -87,6 +90,10 @@ def current_strategy_payload() -> dict:
         "group_risk_override": sorted(GROUP_RISK_OVERRIDE),
         "taxable_tickers": sorted(TAXABLE_ETF_TICKERS),
     }
+    if UNIVERSE_MODE == "auto" and _UNIVERSE_BUILD_RESULT is not None:
+        payload["universe_config"] = _UNIVERSE_BUILD_RESULT.config.to_dict()
+        payload["universe_sha256"] = _UNIVERSE_BUILD_RESULT.universe_sha256
+    return payload
 
 
 def calc_stats(curve: pd.DataFrame, equity_col: str) -> dict:
