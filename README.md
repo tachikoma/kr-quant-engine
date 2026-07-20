@@ -321,3 +321,4 @@ ticker,ex_date,amount_per_share,payment_date,source
 - pykrx 데이터는 제공처 정책/호출 제한을 준수해야 합니다.
 - 백테스트는 미래 성과를 보장하지 않습니다.
 - 실전 적용 전 etf_daily_runner 안전모드(LIVE_ORDER_ENABLED=0)와 소액 검증을 권장합니다.
+- 데일리 러너는 `_KRX_HOLIDAYS`(2026년 KRX 공휴일 목록)로 휴장일을 감지하여 자동 중단합니다. 매년 초 갱신이 필요합니다.

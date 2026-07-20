@@ -204,8 +204,30 @@ def _now_kst() -> dt.datetime:
     return now_utc.astimezone(dt.timezone(dt.timedelta(hours=9)))
 
 
-def _is_weekday(day: dt.date) -> bool:
-    return day.weekday() < 5
+_KRX_HOLIDAYS: set[dt.date] = {
+    dt.date(2026, 1, 1),   # 신정
+    dt.date(2026, 2, 16),   # 설날 연휴
+    dt.date(2026, 2, 17),   # 설날
+    dt.date(2026, 2, 18),   # 설날 연휴
+    dt.date(2026, 3, 1),    # 삼일절
+    dt.date(2026, 5, 5),    # 어린이날
+    dt.date(2026, 5, 24),   # 부처님오신날
+    dt.date(2026, 6, 6),    # 현충일
+    dt.date(2026, 7, 17),   # 제헌절
+    dt.date(2026, 8, 15),   # 광복절
+    dt.date(2026, 9, 24),   # 추석
+    dt.date(2026, 9, 25),   # 추석 대체공휴일
+    dt.date(2026, 9, 26),   # 추석 연휴
+    dt.date(2026, 10, 3),   # 개천절
+    dt.date(2026, 12, 25),  # 크리스마스
+}
+
+
+def _is_trading_day(day: dt.date) -> bool:
+    """주말 및 한국 증시 공휴일을 제외한 영업일 여부를 반환합니다."""
+    if day.weekday() >= 5:
+        return False
+    return day not in _KRX_HOLIDAYS
 
 
 def _date_to_krx(day: dt.date) -> str:
@@ -784,9 +806,11 @@ def _should_rebalance(
 
     trading_dates = _load_recent_trading_dates(reference_ticker=reference_ticker, lookback_days=220)
     if not trading_dates or last not in trading_dates:
-        # last_rebalance_date가 캘린더에 없으면 판단 불가
-        logger.info(f"[리밸런싱] last={last}가 거래일 캘린더에 없음 → 스킵")
-        return False
+        logger.warning(
+            f"[리밸런싱] last_rebalance_date={last}가 거래일 캘린더에 없음(오염 추정) → "
+            f"기록 무시, 즉시 리밸런싱 허용"
+        )
+        return True
 
     last_idx = trading_dates.index(last)
     # 장 전/중 실행 시 오늘 데이터가 아직 없을 수 있으므로
@@ -1816,6 +1840,21 @@ def run_daily() -> None:
     state = _load_state()
     today = _date_to_iso(_today_kst())
 
+    last_rebal = state.get("last_rebalance_date")
+    if last_rebal:
+        try:
+            last_rebal_date = dt.date.fromisoformat(last_rebal)
+            if not _is_trading_day(last_rebal_date):
+                logger.warning(
+                    f"[상태복구] last_rebalance_date={last_rebal}이 거래일이 아님 → 초기화"
+                )
+                state["last_rebalance_date"] = None
+                _save_state(state)
+        except ValueError:
+            logger.warning(f"[상태복구] last_rebalance_date={last_rebal} 파싱 실패 → 초기화")
+            state["last_rebalance_date"] = None
+            _save_state(state)
+
     logger.info(f"[시작] ETF 데일리 러너 — {today} {_now_kst().strftime('%H:%M:%S')} (KST)")
     logger.info(
         f"  LIVE_ORDER_ENABLED={cfg.enable_live_order}  FORCE={cfg.force}  FORCE_REBALANCE={cfg.force_rebalance}"
@@ -1824,8 +1863,8 @@ def run_daily() -> None:
         f"  max_positions={cfg.max_positions}  rebalance_step_days={cfg.rebalance_step_days}"
     )
 
-    if not _is_weekday(_today_kst()):
-        logger.info("[종료] 주말이므로 실행하지 않습니다.")
+    if not _is_trading_day(_today_kst()):
+        logger.info("[종료] 주말/공휴일이므로 실행하지 않습니다.")
         return
 
     if (
@@ -2367,6 +2406,7 @@ def run_daily() -> None:
         logger.info("[안전중단] 매도 주문이 전량 체결되지 않아 매수 주문을 제출하지 않습니다.")
 
     executed_orders = sell_results + sell_retry_results + buy_results + buy_retry_results
+    any_submitted = any(r.get("submitted") for r in executed_orders)
 
     if dry_run:
         run_status = "DONE_DRY_RUN"
@@ -2390,7 +2430,7 @@ def run_daily() -> None:
         "rebalance_due": plan["rebalance_due"],
         "target": plan["target"],
         "orders": executed_orders,
-        "last_rebalance_date": today if plan["rebalance_due"] else state.get("last_rebalance_date"),
+        "last_rebalance_date": today if (plan["rebalance_due"] and any_submitted) else state.get("last_rebalance_date"),
         **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
