@@ -185,6 +185,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `run_etf_backtest.py`: ETF 백테스트 메인 (CLI: `--start`, `--end`, `--mode`)
 - `etf_shared.py`: 공통 전략 상수/로직 (ETF_LIST, ranking, 주문 생성)
 - `etf_universe.py`: KRX 분류 기반 ETF 유니버스 자동 구축 (`build_universe()`, `config_from_env()`)
+- `pit_universe.py`: KRX 날짜별 ETF membership 정규화·검증
 - `config_utils.py`: 환경변수 파싱 유틸 (`parse_pct_env`, `parse_fraction_env`)
 - `pykrx_utils.py`: pykrx 호출 유틸 (FD 캡처, 캐시)
 - `live_trading/etf_daily_runner.py`: 데일리 주문 계획/실행 러너
@@ -220,6 +221,8 @@ uv run scripts/compare_filtered_vs_baseline.py           # 필터 vs 베이스�
 uv run scripts/extract_top_losses.py                     # 최대 손실 거래 추출
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
 uv run scripts/analyze_universe_selection_bias.py        # static 유니버스 선택 편향 민감도
+uv run scripts/build_point_in_time_universe.py           # 리밸런싱 시점별 ETF membership 구축
+uv run scripts/build_point_in_time_universe.py --offline # 캐시된 PIT membership 재검증
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증
