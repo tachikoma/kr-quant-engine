@@ -2,11 +2,49 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
-## 2026-07 — US_RISK_PROXY 분석: QQQ vs SPY 우위 원인 규명
+## 2026-07 — split 게이팅 구현 교정 및 채택 철회
+
+**문제:** `split` 모드가 문서상 국내=KOSPI, 해외=US 독립 게이팅이었지만,
+KOSPI risk-on 분기에서는 허용 그룹 필터가 생략되어 US risk-off에도 해외 ETF가 허용됨.
+
+**수정:**
+- 공유 `GatingDecision`으로 백테스트/실전의 허용 그룹·목표 후보·강제청산 대상을 일원화
+- 비허용 그룹만 `ETF_RISK_GATE_EXIT`로 선택적 청산
+- 후보 0개일 때 허용 그룹 보유분 보호
+- 캐치업 매수와 매도 후 재계산에도 동일 게이트 적용
+- `hybrid` 및 멀티 인덱스 비활성 모드의 기존 동작 보존
+
+**정확한 구현 재검증 (2016-01~2026-07-14):**
+
+| 지표 | Baseline | split+QQQ 120/20 | Δ |
+|---|---:|---:|---:|
+| CAGR | 25.05% | 24.02% | -1.03%p |
+| MDD | -31.75% | -31.72% | +0.03%p |
+| Sharpe | 1.137 | 1.093 | -3.9% |
+| Sortino | 1.701 | 1.628 | -4.3% |
+
+**워크포워드 OOS (6폴드, 2019-08~2025-08):**
+
+| 지표 | Baseline | split+QQQ 120/20 | Δ |
+|---|---:|---:|---:|
+| CAGR | 17.36% | 15.94% | -1.42%p |
+| MDD | -15.34% | -22.05% | -6.71%p |
+| Sharpe | 1.089 | 0.985 | -9.6% |
+| Sortino | 1.568 | 1.407 | -10.3% |
+
+**결론:** 기존 개선 수치는 불완전한 split 구현의 결과이므로 무효. 멀티 인덱스는
+`ENABLE_MULTI_INDEX_RISK=0`으로 기본 비활성화하고 실험 옵션으로만 보존.
+
+아래의 기존 QQQ/split 분석은 당시 구현에서 얻은 역사적 기록이며 현재 채택 근거로 사용하지 않음.
+
+## 2026-07 — US_RISK_PROXY 분석: QQQ vs SPY 우위 원인 규명 (교정 전·무효)
+
+> 아래 결과는 US risk-off가 KOSPI risk-on 분기에서 적용되지 않던 불완전한 구현을
+> 사용했으므로 현재 전략 판단에는 사용하지 않는다.
 
 **목표:** `US_RISK_PROXY=QQQ`가 SPY보다 더 좋은 결과를 내는 이유를 분석하고, 프록시-지수 매칭이 성과를 개선하는지 검증.
 
-**분석 결과:**
+**당시 분석 결과(무효):**
 - QQQ가 KOSPI risk_off 구간에서 52.44% risk_on (SPY 46.74% 대비 ~6%p 더 자 risk_on)
 - KOSPI off + US on 구간 수익률: QQQ 전략 24.03% vs SPY 전략 9.99% (+14%p)
 - 프록시-지수 매칭(SPY→S&P, QQQ→Nasdaq)은 오히려 성과를 떨어뜨림
@@ -24,7 +62,9 @@
 
 ---
 
-## 2026-07 — 멀티 인덱스 리스크 시그널 (Phase 1)
+## 2026-07 — 멀티 인덱스 리스크 시그널 (Phase 1, 교정 전·무효)
+
+> 아래 성과 수치와 채택 판단은 불완전한 split 구현에서 산출되어 폐기되었다.
 
 **목표:** KOSPI 단일 시그널 외에 미국 지수(QQQ)를 추가하여, KOSPI risk_off 구간에서 미국 ETF로 회전하는 레짐 디커플링을 구현.
 
@@ -43,7 +83,7 @@
 - `US_RISK_PROXY=QQQ` — 미국 리스크 프록시 심볼 (yfinance)
 - `US_MARKET_MA_DAYS=100`, `US_MARKET_SLOPE_DAYS=20` — 미국 시그널 윈도우
 
-**백테스트 결과 (single mode, 2016-01~2026-07):**
+**당시 백테스트 결과 (무효, single mode, 2016-01~2026-07):**
 
 | 지표 | Baseline | split+QQQ | Δ |
 |---|---|---|---|
@@ -52,7 +92,7 @@
 | Sortino | 2.058 | 2.138 | +3.9% |
 | MDD | -19.61% | -19.57% | +0.04% |
 
-**워크포워드 검증 (6폴드, 2019-08~2025-08):**
+**당시 워크포워드 검증 (무효, 6폴드, 2019-08~2025-08):**
 
 | 지표 | Baseline | split+QQQ | Δ |
 |---|---|---|---|
@@ -61,7 +101,8 @@
 | OOS Sortino | 1.568 | 1.758 | +12.1% |
 | OOS MDD | -15.34% | -13.02% | +2.32%p |
 
-스윕 결과 QQQ가 모든 MA/slope 조합에서 동일하게 우세 (100/20, 120/10, 120/20, 140/20 모두 동일 결과). SPY는 모든 조합에서 baseline 대비 열세. MDD 개선은 전 폴드에서 일관적.
+당시 불완전 구현의 스윕에서는 QQQ가 모든 MA/slope 조합에서 우세했으나,
+정확한 split 재검증에서 baseline보다 열세로 반전되어 이 결론도 폐기했다.
 
 **파일:** `etf_shared.py`, `run_etf_backtest.py`, `live_trading/etf_daily_runner.py`, `scripts/walk_forward_validation.py`, `scripts/run_phase1_ab_and_compare.py`, `scripts/compare_phase1_results.py`, `scripts/sweep_multi_index_split.py`, `pyproject.toml`, `.env.sample`
 

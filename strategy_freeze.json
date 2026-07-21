@@ -1,7 +1,8 @@
 {
-  "freeze_date": "2026-07-13",
-  "oos_start_date": "2026-07-14",
-  "note": "2026-07-13까지의 모든 데이터와 실험은 in-sample로 취급한다.",
+  "freeze_date": "2026-07-21",
+  "oos_start_date": "2026-07-22",
+  "note": "split 구현 교정 및 미채택 결정. 2026-07-21까지의 모든 데이터와 실험은 in-sample로 취급한다.",
+  "universe_mode": "static",
   "universe": [
     "069500",
     "091160",
@@ -51,6 +52,11 @@
     "rebalance_step_days": 20,
     "market_ma_days": 120,
     "market_slope_days": 20,
+    "enable_multi_index_risk": false,
+    "multi_index_gating_mode": "split",
+    "us_risk_proxy": "QQQ",
+    "us_market_ma_days": 120,
+    "us_market_slope_days": 20,
     "max_positions": 2,
     "sell_rank_buffer": 3,
     "use_market_filter": true
@@ -84,5 +90,5 @@
     "486290",
     "498400"
   ],
-  "sha256": "144fdd04a0da1d0f7856a6d99dba555ae4d3b38c7cb0b500dd510f3ad1f2a55e"
+  "sha256": "4902b181938ad2fccc65030ffe5b2bef8ea9b23606a3910963c07b25b48b51e7"
 }

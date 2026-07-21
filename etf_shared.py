@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import os
 import numpy as np
@@ -268,6 +269,63 @@ def get_allowed_groups(
 
 def is_ticker_allowed(ticker: str, allowed_groups: set[str]) -> bool:
     return get_etf_group(ticker) in allowed_groups
+
+
+@dataclass(frozen=True)
+class GatingDecision:
+    """리스크 게이트 적용 후의 매수 가능 순위와 강제청산 대상을 보관한다."""
+
+    allowed_groups: set[str]
+    eligible_ranked: list[str]
+    forced_exit_tickers: set[str]
+
+
+def build_gating_decision(
+    ranked_tickers: list[str],
+    current_holdings: dict[str, int],
+    *,
+    kospi_risk_on: bool,
+    us_risk_on: bool,
+    enable_multi_index_risk: bool,
+    gating_mode: str = "hybrid",
+    liquidate_on_risk_off: bool = True,
+) -> GatingDecision:
+    """백테스트와 실전에서 공통으로 사용할 그룹 게이팅 결정을 만든다.
+
+    허용 그룹의 후보만 신규 목표가 될 수 있다. 현재 보유분 중 비허용 그룹은
+    강제청산 대상으로 분리하되, ``LIQUIDATE_ON_RISK_OFF=0``인 KOSPI risk-off
+    구간에서는 기존 정책대로 모든 보유분을 유지한다.
+    """
+    if enable_multi_index_risk:
+        allowed_groups = get_allowed_groups(
+            kospi_risk_on,
+            us_risk_on,
+            gating_mode=gating_mode,
+        )
+    elif kospi_risk_on:
+        allowed_groups = {"domestic_equity", "foreign_investment", "commodity"}
+    else:
+        allowed_groups = set(GROUP_RISK_OVERRIDE)
+
+    ranked = [str(ticker) for ticker in ranked_tickers]
+    eligible_ranked = [
+        ticker for ticker in ranked if is_ticker_allowed(ticker, allowed_groups)
+    ]
+
+    preserve_all_holdings = not kospi_risk_on and not liquidate_on_risk_off
+    forced_exit_tickers = set()
+    if not preserve_all_holdings:
+        forced_exit_tickers = {
+            str(ticker)
+            for ticker in current_holdings
+            if not is_ticker_allowed(str(ticker), allowed_groups)
+        }
+
+    return GatingDecision(
+        allowed_groups=set(allowed_groups),
+        eligible_ranked=eligible_ranked,
+        forced_exit_tickers=forced_exit_tickers,
+    )
 
 
 def get_deviation_threshold(ticker: str) -> float:
@@ -762,6 +820,7 @@ def build_rebalance_orders(
     sell_tax_pct: float = ETF_SELL_TAX_PCT,
     taxable_tickers: set[str] | None = None,
     allow_empty_target_sell: bool = False,
+    forced_exit_tickers: set[str] | None = None,
     generate_orders: bool = True,
     max_asset_pct: float | None = None,
     ticker_names: dict[str, str] | None = None,
@@ -840,8 +899,13 @@ def build_rebalance_orders(
     )
     cost_basis_map = _to_float_dict(current_cost_basis)
 
-    # 대상 티커 목록을 문자열 리스트로 정리
-    targets: list[str] = [str(t) for t in target_tickers] if target_tickers else []
+    # 대상 티커와 리스크 게이트 강제청산 목록을 문자열로 정리
+    forced_exits = {str(ticker) for ticker in (forced_exit_tickers or set())}
+    targets: list[str] = (
+        [str(ticker) for ticker in target_tickers if str(ticker) not in forced_exits]
+        if target_tickers
+        else []
+    )
     target_rank = {ticker: idx + 1 for idx, ticker in enumerate(targets)}
 
     # generate_orders=False이면 주문 생성 건너뜀
@@ -849,19 +913,66 @@ def build_rebalance_orders(
         logger.info("[주문계산] generate_orders=False \u2014 리밸런싱 미실행으로 주문 생성 생략")
         return []
 
-    # 빈 타겟 보호 로직
+    # 리스크 게이트 강제청산은 빈 후보 보호보다 먼저 처리한다. 허용 그룹의
+    # 기존 보유분은 아래 일반 리밸런싱 규칙에서 그대로 보호된다.
+    for ticker in sorted(forced_exits):
+        qty_i = int(holdings.get(ticker, 0) or 0)
+        if qty_i <= 0:
+            continue
+        price = sell_prices.get(ticker)
+        if price is None or pd.isna(price) or price <= 0:
+            logger.info(
+                f"[주문계산][게이트매도스킵] {_dn(ticker)} 매도가격 없음/비정상 "
+                f"(sell_price={price})"
+            )
+            continue
+
+        cost_basis_per_share = cost_basis_map.get(ticker)
+        tax_rate = 0.0
+        if float(sell_tax_pct or 0.0) > 0:
+            if taxable_tickers is None or ticker in taxable_tickers:
+                tax_rate = float(sell_tax_pct)
+        estimated_value = apply_sell_value(
+            float(price),
+            qty_i,
+            tax_rate,
+            slippage,
+            cost_basis_per_share=cost_basis_per_share,
+        )
+        sell_price_adj = float(price) * (1 - slippage)
+        gross_proceeds_adj = qty_i * sell_price_adj
+        taxable_gain = 0.0
+        if cost_basis_per_share is not None:
+            taxable_gain = max(0.0, gross_proceeds_adj - qty_i * cost_basis_per_share)
+        estimated_tax = taxable_gain * max(tax_rate, 0.0)
+        cash += float(estimated_value)
+        holdings.pop(ticker, None)
+        orders.append(
+            {
+                "side": "SELL",
+                "ticker": ticker,
+                "display_name": _dn(ticker),
+                "qty": qty_i,
+                "reference_price": float(price),
+                "estimated_value": float(estimated_value),
+                "estimated_tax": estimated_tax,
+                "reason": "ETF_RISK_GATE_EXIT",
+            }
+        )
+
+    # 빈 타겟 보호 로직. 강제청산 주문은 유지하되 다른 보유분은 건드리지 않는다.
     if not targets and not allow_empty_target_sell:
         logger.info(
             "[주문계산] target이 비어있고 빈 target에서 매도 허용이 아니므로 주문 생성 생략"
         )
-        return []
+        return orders
 
     logger.info(
         f"[주문계산] 시작 | 보유={len(holdings)}개, 목표={len(targets)}개, max_positions={max_positions}, 예수금={cash:,.0f}"
     )
 
     if target_weight_rebalance:
-        return _build_target_weight_rebalance_orders(
+        return orders + _build_target_weight_rebalance_orders(
             holdings=holdings,
             targets=targets,
             target_rank=target_rank,

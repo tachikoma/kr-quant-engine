@@ -63,14 +63,13 @@ _load_dotenv()
 
 
 from etf_shared import (
+    build_gating_decision,
     build_rebalance_orders,
     get_strategy_config,
+    is_ticker_allowed,
     rank_etfs,
     ETF_TAXABLE_SELL_TAX_PCT,
     TAXABLE_ETF_TICKERS,
-    get_allowed_groups,
-    is_ticker_allowed,
-    is_ticker_risk_on,
     add_deviation_flag,
     add_liquidity_flag,
     add_listing_flag,
@@ -836,6 +835,7 @@ def _build_catchup_orders(
     latest_buy_prices: dict[str, float],
     latest_prices: dict[str, float],
     ticker_names: dict[str, str],
+    allowed_groups: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """state의 미체결 BUY 주문 정보를 읽어 catch-up 매수 주문을 생성한다.
 
@@ -857,6 +857,11 @@ def _build_catchup_orders(
         ticker = str(o.get("ticker", ""))
         remaining = int(o.get("remaining_qty", 0))
         if not ticker or remaining <= 0:
+            continue
+        if allowed_groups is not None and not is_ticker_allowed(ticker, allowed_groups):
+            logger.info(
+                f"[캐치업][게이트스킵] {ticker_names.get(ticker, ticker)}: 현재 비허용 그룹"
+            )
             continue
         ticker_remaining[ticker] += remaining
 
@@ -1180,12 +1185,14 @@ def _build_plan(
                 ma_days=config.us_market_ma_days,
                 slope_days=config.us_market_slope_days,
             )
-            allowed_groups = get_allowed_groups(kospi_risk_on=kospi_risk_on, us_risk_on=us_risk_on)
-            allowed_groups = get_allowed_groups(
+            allowed_groups = build_gating_decision(
+                [],
+                {},
                 kospi_risk_on=kospi_risk_on,
                 us_risk_on=us_risk_on,
+                enable_multi_index_risk=True,
                 gating_mode=config.multi_index_gating_mode,
-            )
+            ).allowed_groups
             logger.info(
                 "[시장필터] 멀티 인덱스 적용 | "
                 f"KOSPI={kospi_risk_on}, US({config.us_risk_proxy})={us_risk_on}, "
@@ -1221,28 +1228,48 @@ def _build_plan(
     if needs_catchup:
         logger.info("[캐치업] 전일 미체결 주문 감지 → 오늘 리밸런싱을 실행하여 포지션을 채웁니다.")
 
+    ranked_tickers = [str(ticker) for ticker in ranked.get("ticker", [])]
+    gating = build_gating_decision(
+        ranked_tickers,
+        holdings_for_rebalance,
+        kospi_risk_on=kospi_risk_on,
+        us_risk_on=us_risk_on,
+        enable_multi_index_risk=config.enable_multi_index_risk,
+        gating_mode=config.multi_index_gating_mode,
+        liquidate_on_risk_off=config.liquidate_on_risk_off,
+    )
+    allowed_groups = gating.allowed_groups
+    forced_exit_tickers: set[str] = set()
+    selective_empty_protection = (
+        config.enable_multi_index_risk
+        and str(config.multi_index_gating_mode).strip().lower() == "split"
+    )
+    allow_empty_target_sell = (
+        (not kospi_risk_on)
+        and config.liquidate_on_risk_off
+        and not selective_empty_protection
+    )
+
     # 5단계: 목표 티커 결정
     if not kospi_risk_on:
         if config.liquidate_on_risk_off:
-            # KOSPI risk_off: foreign/commodity만 buy target 유지, domestic은 매도
-            if not ranked.empty:
-                ticker_list = [str(t) for t in ranked["ticker"]]
-                if config.enable_multi_index_risk:
-                    target = [t for t in ticker_list if is_ticker_allowed(t, allowed_groups)]
-                else:
-                    target = [t for t in ticker_list if is_ticker_risk_on(t, False)]
-                target = target[: config.max_positions + config.sell_rank_buffer]
-            else:
-                target = []
+            # KOSPI risk_off 계획에서는 국내군을 강제청산 대상으로 분리한다.
+            target = gating.eligible_ranked[: config.max_positions + config.sell_rank_buffer]
+            forced_exit_tickers = gating.forced_exit_tickers
             if target:
                 logger.info(
                     "[계획수립] KOSPI risk_off 목표: "
                     f"{[ticker_names.get(t, t) for t in target]}"
                 )
             else:
-                logger.info(
-                    "[계획수립] KOSPI risk_off → 전량 매도 모드 (허용그룹 목표 없음)"
-                )
+                if selective_empty_protection:
+                    logger.info(
+                        "[계획수립] KOSPI risk_off → 비허용 그룹 청산, 허용 보유분 유지"
+                    )
+                else:
+                    logger.info(
+                        "[계획수립] KOSPI risk_off → 전량 매도 모드 (허용그룹 목표 없음)"
+                    )
         else:
             # LIQUIDATE_ON_RISK_OFF=0: 기존 보유 유지, 신규 매수 없음
             logger.info(
@@ -1257,11 +1284,8 @@ def _build_plan(
         )
         target = list(holdings_for_rebalance.keys())
     else:
-        target = (
-            ranked.head(config.max_positions + config.sell_rank_buffer)["ticker"].tolist()
-            if not ranked.empty
-            else []
-        )
+        target = gating.eligible_ranked[: config.max_positions + config.sell_rank_buffer]
+        forced_exit_tickers = gating.forced_exit_tickers
         label = "캐치업 목표" if needs_catchup else "목표"
         logger.info(f"[계획수립] {label} 티커 확정: {[ticker_names.get(t, t) for t in target]}")
 
@@ -1288,7 +1312,33 @@ def _build_plan(
                 logger.info(f"  {dn}: buy={buy_text}, sell={sell_text}")
 
     if needs_catchup and not rebalance_due:
-        orders = _build_catchup_orders(state, latest_buy_prices, latest_prices, ticker_names)
+        orders = build_rebalance_orders(
+            current_holdings=holdings_for_rebalance,
+            target_tickers=[],
+            latest_prices=latest_prices,
+            available_cash=cash,
+            latest_buy_prices=latest_buy_prices,
+            latest_sell_prices=latest_sell_prices,
+            current_cost_basis=None,
+            max_positions=config.max_positions,
+            sell_rank_buffer=config.sell_rank_buffer,
+            slippage=0.0,
+            sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
+            taxable_tickers=TAXABLE_ETF_TICKERS,
+            allow_empty_target_sell=False,
+            forced_exit_tickers=forced_exit_tickers,
+            generate_orders=True,
+            ticker_names=ticker_names,
+        )
+        orders.extend(
+            _build_catchup_orders(
+                state,
+                latest_buy_prices,
+                latest_prices,
+                ticker_names,
+                allowed_groups=allowed_groups,
+            )
+        )
     else:
         orders = build_rebalance_orders(
             current_holdings=holdings_for_rebalance,
@@ -1300,7 +1350,8 @@ def _build_plan(
             max_positions=config.max_positions,
             max_asset_pct=config.max_asset_pct,
             sell_rank_buffer=config.sell_rank_buffer,
-            allow_empty_target_sell=not risk_on if config.liquidate_on_risk_off else False,
+            allow_empty_target_sell=allow_empty_target_sell,
+            forced_exit_tickers=forced_exit_tickers,
             # 실전에서는 API의 실제 bid/ask를 신뢰하고 인위적 슬리피지를 적용하지 않는 것이 기본 정책입니다.
             # config.apply_slippage_in_live=True 인 경우에만 라이브 슬리피지를 적용합니다.
             slippage=(
@@ -1365,6 +1416,8 @@ def _build_plan(
         "us_risk_on": us_risk_on,
         "multi_index_gating_mode": config.multi_index_gating_mode,
         "allowed_groups": sorted(list(allowed_groups)),
+        "forced_exit_tickers": sorted(forced_exit_tickers),
+        "allow_empty_target_sell": allow_empty_target_sell,
         "rebalance_due": rebalance_due,
         "needs_catchup": needs_catchup,
         "holdings": holdings,
@@ -2207,7 +2260,8 @@ def run_daily() -> None:
                         )
                         else cfg.live_slippage_pct
                     ),
-                    allow_empty_target_sell=not plan.get("risk_on", True),
+                    allow_empty_target_sell=bool(plan.get("allow_empty_target_sell", False)),
+                    forced_exit_tickers=set(plan.get("forced_exit_tickers", [])),
                     sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                     taxable_tickers=TAXABLE_ETF_TICKERS,
                     generate_orders=True,

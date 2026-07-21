@@ -87,11 +87,9 @@ from etf_shared import (
     add_liquidity_flag,
     add_listing_flag,
     add_price_basis_columns,
+    build_gating_decision,
     get_valuation_price,
     get_strategy_config,
-    get_allowed_groups,
-    is_ticker_allowed,
-    is_ticker_risk_on,
     update_last_valid_prices,
 )
 
@@ -1110,39 +1108,46 @@ def run_etf_strategy(
             us_risk_on = (
                 is_us_risk_on(us_index_df, dt) if (use_market_filter and enable_multi_index_risk) else True
             )
-            allowed_groups = get_allowed_groups(
-                kospi_risk_on,
-                us_risk_on,
-                gating_mode=MULTI_INDEX_GATING_MODE,
-            )
             ranked = rank_etfs(today.reset_index())
-            # targets를 문자열 리스트로 통일
-            if not ranked.empty:
-                ticker_list = [str(t) for t in ranked["ticker"]]
-                if kospi_risk_on:
-                    targets = ticker_list[:max_positions + ETF_SELL_RANK_BUFFER]
-                elif risk_off_liquidate:
-                    # KOSPI risk_off + liquidate: foreign/commodity만 buy target
-                    # (domestic ETFs는 targets에서 제외되어 매도됨)
-                    if enable_multi_index_risk:
-                        targets = [t for t in ticker_list if is_ticker_allowed(t, allowed_groups)]
-                    else:
-                        targets = [t for t in ticker_list if is_ticker_risk_on(t, False)]
-                    targets = targets[:max_positions + ETF_SELL_RANK_BUFFER]
-                else:
-                    # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
-                    targets = []
-            else:
+            ticker_list = [str(t) for t in ranked.get("ticker", [])]
+            gating = build_gating_decision(
+                ticker_list,
+                holdings,
+                kospi_risk_on=kospi_risk_on,
+                us_risk_on=us_risk_on,
+                enable_multi_index_risk=enable_multi_index_risk,
+                gating_mode=MULTI_INDEX_GATING_MODE,
+                liquidate_on_risk_off=risk_off_liquidate,
+            )
+            allowed_groups = gating.allowed_groups
+            forced_exit_tickers = gating.forced_exit_tickers
+            if not kospi_risk_on and not risk_off_liquidate:
+                # KOSPI risk_off + hold: 기존 포지션 유지, 신규 매수 없음
                 targets = []
+            else:
+                targets = gating.eligible_ranked[: max_positions + ETF_SELL_RANK_BUFFER]
             if portfolio_stop_triggered:
                 targets = []
+                forced_exit_tickers = set()
             if stopped_tickers:
                 targets = [ticker for ticker in targets if ticker not in stopped_tickers]
 
-            allow_empty_target_sell = (
-                (not kospi_risk_on) if risk_off_liquidate else False
+            # split은 후보가 비어도 허용 그룹 보유분을 보호한다. hybrid와
+            # 멀티 인덱스 비활성 모드는 기존 risk-off 전량매도 동작을 보존한다.
+            selective_empty_protection = (
+                enable_multi_index_risk
+                and str(MULTI_INDEX_GATING_MODE).strip().lower() == "split"
             )
-            empty_target_protected = (not targets) and (not allow_empty_target_sell)
+            allow_empty_target_sell = (
+                (not kospi_risk_on)
+                and risk_off_liquidate
+                and not selective_empty_protection
+            )
+            empty_target_protected = (
+                (not targets)
+                and (not allow_empty_target_sell)
+                and (not forced_exit_tickers)
+            )
 
             pre_holdings_snapshot = dict(holdings)
             pre_cash = cash
@@ -1162,6 +1167,7 @@ def run_etf_strategy(
                     "multi_index_enabled": enable_multi_index_risk,
                     "multi_index_gating_mode": MULTI_INDEX_GATING_MODE,
                     "allowed_groups": sorted(list(allowed_groups)),
+                    "forced_exit_tickers": sorted(forced_exit_tickers),
                     "n_candidates": len(ranked),
                     "ranked_tickers": [str(t) for t in ranked.get("ticker", [])],
                     "targets": list(targets),
@@ -1223,6 +1229,7 @@ def run_etf_strategy(
                 sell_tax_pct=ETF_TAXABLE_SELL_TAX_PCT,
                 taxable_tickers=TAXABLE_ETF_TICKERS,
                 allow_empty_target_sell=allow_empty_target_sell,
+                forced_exit_tickers=forced_exit_tickers,
                 generate_orders=True,
                 max_asset_pct=effective_max_asset_pct,
                 ticker_names=ticker_names,

@@ -82,6 +82,18 @@ def current_strategy_payload() -> dict:
             "rebalance_step_days": cfg.get("rebalance_step_days", 10),
             "market_ma_days": MARKET_MA_DAYS,
             "market_slope_days": MARKET_SLOPE_DAYS,
+            "enable_multi_index_risk": os.environ.get("ENABLE_MULTI_INDEX_RISK", "0") == "1",
+            "multi_index_gating_mode": (
+                os.environ.get("MULTI_INDEX_GATING_MODE", "hybrid").strip().lower()
+                or "hybrid"
+            ),
+            "us_risk_proxy": os.environ.get("US_RISK_PROXY", "SPY").strip().upper() or "SPY",
+            "us_market_ma_days": int(
+                os.environ.get("US_MARKET_MA_DAYS", str(MARKET_MA_DAYS))
+            ),
+            "us_market_slope_days": int(
+                os.environ.get("US_MARKET_SLOPE_DAYS", str(MARKET_SLOPE_DAYS))
+            ),
             "max_positions": ETF_MAX_POSITIONS,
             "sell_rank_buffer": ETF_SELL_RANK_BUFFER,
             "use_market_filter": True,
