@@ -120,6 +120,58 @@ def normalize_krx_etf_snapshot(raw: pd.DataFrame, snapshot_date: str) -> pd.Data
     return snapshot.sort_values("ticker").reset_index(drop=True)
 
 
+def normalize_krx_etf_history(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """KRX 개별 ETF 기간 시세 응답을 일별 표준 스키마로 변환한다."""
+    if raw is None or raw.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trading_value",
+                "nav",
+                "base_index",
+            ]
+        )
+    mapping = {
+        "TRD_DD": "date",
+        "TDD_OPNPRC": "open",
+        "TDD_HGPRC": "high",
+        "TDD_LWPRC": "low",
+        "TDD_CLSPRC": "close",
+        "ACC_TRDVOL": "volume",
+        "ACC_TRDVAL": "trading_value",
+        "LST_NAV": "nav",
+        "OBJ_STKPRC_IDX": "base_index",
+    }
+    missing = {"TRD_DD", "TDD_OPNPRC", "TDD_CLSPRC"} - set(raw.columns)
+    if missing:
+        raise ValueError(f"KRX ETF 기간 시세 필수 컬럼 누락: {sorted(missing)}")
+    available = {key: value for key, value in mapping.items() if key in raw.columns}
+    history = raw[list(available)].rename(columns=available).copy()
+    history["date"] = pd.to_datetime(history["date"], errors="coerce")
+    history.insert(1, "ticker", str(ticker))
+    for column in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "trading_value",
+        "nav",
+        "base_index",
+    ):
+        if column not in history:
+            history[column] = None
+        history[column] = _parse_numeric(history[column])
+    history = history.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+    return history.sort_values("date").reset_index(drop=True)
+
+
 def membership_sha256(snapshot: pd.DataFrame) -> str:
     """Snapshot date와 티커 membership의 정규화 SHA-256을 반환한다."""
     pairs = snapshot[["snapshot_date", "ticker"]].copy()

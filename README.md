@@ -223,6 +223,7 @@ uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 
 uv run scripts/analyze_universe_selection_bias.py        # static 유니버스 선택 편향 민감도
 uv run scripts/build_point_in_time_universe.py           # 리밸런싱 시점별 ETF membership 구축
 uv run scripts/build_point_in_time_universe.py --offline # 캐시된 PIT membership 재검증
+uv run scripts/prefetch_pit_prices.py --scope unknown     # 과거 분류 누락 ETF OHLCV·NAV 수집
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증

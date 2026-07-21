@@ -16,6 +16,7 @@ from pit_universe import (
     build_membership_events,
     build_snapshot_dates,
     membership_sha256,
+    normalize_krx_etf_history,
     normalize_krx_etf_snapshot,
     validate_snapshot_panel,
 )
@@ -66,6 +67,21 @@ def main() -> None:
         ("000003", "ENTER"),
     }
     assert membership_sha256(panel) == membership_sha256(panel.sample(frac=1, random_state=7))
+
+    raw_history = pd.DataFrame(
+        [
+            {
+                "TRD_DD": "2020/01/03",
+                "TDD_OPNPRC": "1,000",
+                "TDD_CLSPRC": "1,100",
+                "ACC_TRDVOL": "2,000",
+            }
+        ]
+    )
+    history = normalize_krx_etf_history(raw_history, "000001")
+    assert history.iloc[0]["ticker"] == "000001"
+    assert history.iloc[0]["close"] == 1100
+    assert history.iloc[0]["volume"] == 2000
     print("point-in-time universe regression checks passed")
 
 
