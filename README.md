@@ -195,9 +195,10 @@ python live_trading/etf_daily_runner.py --force-live
 - `outputs_etf_only/`: 백테스트 결과물
 - `outputs_grid/`: 그리드 백테스트 결과물
 - `outputs_compare/`: 프록시 분석/비교 실험 결과 (`proxy_analysis/`, `proxy_match/`, gitignored)
+- `outputs_universe_bias/`: static 유니버스 선택 편향 민감도 결과 (gitignored)
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
-- `scripts/`: 분석/실험 스크립트 32개
+- `scripts/`: 분석/실험 스크립트
 - `DOCS/`: 추가 문서
 
 ## 분석/실험 스크립트 (`scripts/`)
@@ -218,6 +219,7 @@ uv run scripts/portfolio_stop_sensitivity.py             # 포트폴리오 stop 
 uv run scripts/compare_filtered_vs_baseline.py           # 필터 vs 베이스라인 비교
 uv run scripts/extract_top_losses.py                     # 최대 손실 거래 추출
 uv run scripts/retest_excluding_tickers.py               # 특정 티커 제외 재백테스트
+uv run scripts/analyze_universe_selection_bias.py        # static 유니버스 선택 편향 민감도
 uv run scripts/monitor_outputs.py                        # 출력 파일 모니터링
 uv run scripts/check_strategy_freeze.py                  # 동결 전략 변경 및 표본외 성과 점검
 uv run scripts/walk_forward_validation.py                # 롤링 walk-forward 검증
