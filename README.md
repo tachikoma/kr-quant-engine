@@ -231,12 +231,22 @@ uv run scripts/validate_proxy_stats.py                    # 통계적 검증 (bo
 
 ## 표본외 검증 기준
 
-- `strategy_freeze.json`은 2026-07-13 종료 시점의 후보군과 실전 파라미터를 동결합니다.
-- 2026-07-13까지의 데이터와 실험 결과는 모두 in-sample로 취급합니다.
-- 표본외(out-of-sample) 시작일은 다음 거래일인 2026-07-14입니다.
-- 후보군 또는 파라미터를 변경하면 기존 표본외 트랙과 섞지 말고 새 동결 버전을 만듭니다.
-- `uv run scripts/check_strategy_freeze.py`는 현재 `.env` 포함 유효 설정의 변경 여부를 확인하고,
-  `outputs_etf_only/etf_equity_curve.csv`에 표본외 관측치가 2개 이상이면 해당 성과를 출력합니다.
+동결 기준일은 단순히 최신 날짜로 덮어쓰지 않고, 전략 버전별로 구분합니다.
+
+| 버전 | 동결일 | OOS 시작일 | 상태 | 해석 |
+|---|---|---|---|---|
+| v1 | 2026-07-13 | 2026-07-14 | 역사적 트랙·현재 비활성 | v1 스냅샷과 실행 기록으로만 별도 평가 |
+| v2 | 2026-07-21 | 2026-07-22 | **현재 활성** | `strategy_freeze.json`이 가리키는 공식 트랙 |
+
+- v1은 2026-07-14에 OOS 관찰을 시작한 역사적 버전입니다. v1 성과를 계산할 때는 현재
+  v2 설정과 섞지 않고, Git 이력의 v1 스냅샷과 해당 기간의 실행 기록을 사용합니다.
+- split 게이팅 교정·재검토를 반영해 2026-07-21에 v2를 재동결했습니다. 2026-07-21까지의
+  데이터와 실험은 v2에서 in-sample로 취급합니다.
+- v2에서 멀티 인덱스 리스크 게이팅은 미채택·비활성(`ENABLE_MULTI_INDEX_RISK=0`)입니다.
+- 후보군, 파라미터 또는 실행 로직을 변경하면 기존 OOS 트랙과 섞지 말고 새 동결 버전을
+  만듭니다.
+- `uv run scripts/check_strategy_freeze.py`는 현재 활성화된 v2와 `.env` 포함 유효 설정을 비교하고,
+  `outputs_etf_only/etf_equity_curve.csv`에 v2 OOS 관측치가 2개 이상이면 해당 성과를 출력합니다.
 
 ### Walk-forward 검증
 
@@ -245,6 +255,11 @@ uv run scripts/validate_proxy_stats.py                    # 통계적 검증 (bo
 바로 다음 1년을 표본외로 평가합니다. 학습창은 1년씩 이동하며 결과는
 `outputs_walk_forward/`에 저장됩니다. 이 분석은 전략 연구용이며 `strategy_freeze.json`의 공식
 표본외 트랙을 대체하지 않습니다.
+
+현재 기본 결과는 6개 fold입니다. 또한 각 파라미터 조합의 전체 기간 곡선에서 fold별
+일별 수익률을 잘라 이어 붙이고 경계 비용을 차감하는 방식입니다. fold 전환 시의 실제 보유 종목,
+현금, 세금 원가 상태를 재현하는 완전한 nested walk-forward는 아니므로 연구용 근사 OOS로
+해석합니다.
 
 - `WF_REBALANCE_DAYS=10,20,30`
 - `WF_MAX_POSITIONS=1,2,3`
