@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -21,6 +23,11 @@ try:
     _REQUESTS_AVAILABLE = True
 except ImportError:
     _REQUESTS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+_TG_MAX_RETRIES = 3
+_TG_RETRY_BACKOFF = (1, 2, 4)
 
 
 class TelegramNotifier:
@@ -34,10 +41,10 @@ class TelegramNotifier:
 
         if not self.is_enabled:
             if not _REQUESTS_AVAILABLE:
-                print("[TelegramNotifier] requests 라이브러리가 없어 알림이 비활성화됩니다.")
+                logger.warning("requests 라이브러리가 없어 알림이 비활성화됩니다.")
             else:
-                print(
-                    "[TelegramNotifier] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정 — 알림 비활성화."
+                logger.warning(
+                    "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 미설정 — 알림 비활성화."
                 )
             return
 
@@ -49,20 +56,55 @@ class TelegramNotifier:
     # ──────────────────────────── 기본 발송 ────────────────────────────
 
     def send(self, message: str) -> bool:
-        """동기 방식으로 텔레그램 메시지를 발송합니다."""
+        """동기 방식으로 텔레그램 메시지를 발송합니다.
+
+        5xx/네트워크 에러 시 지수 백오프로 최대 3회 재시도합니다.
+        4xx (BadRequest 등)은 즉시 포기합니다.
+        """
         if not self.is_enabled:
             return False
-        try:
-            resp = _requests.post(
-                self._url,
-                json={"chat_id": self._chat_id, "text": message, "parse_mode": "HTML"},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception as exc:
-            print(f"[TelegramNotifier] 메시지 발송 실패: {exc}")
-            return False
+        last_exc: Exception | None = None
+        for attempt in range(_TG_MAX_RETRIES):
+            try:
+                resp = _requests.post(
+                    self._url,
+                    json={"chat_id": self._chat_id, "text": message, "parse_mode": "HTML"},
+                    timeout=5,
+                )
+                resp.raise_for_status()
+                return True
+            except _requests.exceptions.HTTPError as exc:
+                status = resp.status_code
+                body = resp.text[:500]
+                if 400 <= status < 500:
+                    logger.warning(
+                        "Telegram 4xx 에러 (재시도 불가): %d %s", status, body
+                    )
+                    return False
+                logger.error(
+                    "Telegram %d 에러 (attempt %d/%d): %s",
+                    status,
+                    attempt + 1,
+                    _TG_MAX_RETRIES,
+                    body,
+                )
+                last_exc = exc
+            except _requests.exceptions.RequestException as exc:
+                logger.error(
+                    "Telegram 네트워크 에러 (attempt %d/%d): %s",
+                    attempt + 1,
+                    _TG_MAX_RETRIES,
+                    exc,
+                )
+                last_exc = exc
+            if attempt < _TG_MAX_RETRIES - 1:
+                time.sleep(_TG_RETRY_BACKOFF[min(attempt, len(_TG_RETRY_BACKOFF) - 1)])
+        logger.error(
+            "Telegram 발송 최종 실패 (%d회 재시도 후): %s",
+            _TG_MAX_RETRIES,
+            last_exc,
+        )
+        return False
 
     def send_async(self, message: str) -> None:
         """백그라운드 스레드에서 비동기 발송합니다 (주문 처리 지연 없음)."""
