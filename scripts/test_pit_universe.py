@@ -20,6 +20,7 @@ from pit_universe import (
     normalize_krx_etf_snapshot,
     validate_snapshot_panel,
 )
+from run_etf_backtest import ensure_no_current_prefix_columns
 
 
 def main() -> None:
@@ -82,6 +83,21 @@ def main() -> None:
     assert history.iloc[0]["ticker"] == "000001"
     assert history.iloc[0]["close"] == 1100
     assert history.iloc[0]["volume"] == 2000
+
+    ensure_no_current_prefix_columns(
+        pd.DataFrame({"ticker": ["000001"], "close": [1100]}),
+        context="test",
+    )
+    try:
+        ensure_no_current_prefix_columns(
+            pd.DataFrame({"ticker": ["000001"], "current_list_dd": ["20200101"]}),
+            context="test",
+        )
+    except ValueError as exc:
+        assert "current_" in str(exc)
+    else:
+        raise AssertionError("current_ 컬럼 방어가 작동하지 않았습니다.")
+
     print("point-in-time universe regression checks passed")
 
 

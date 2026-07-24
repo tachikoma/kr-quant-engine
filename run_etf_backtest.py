@@ -1,5 +1,5 @@
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import json
 import logging
 import os
@@ -823,8 +823,19 @@ def safe_get(series: pd.Series, key: str):
     return float(value)
 
 
-def load_etf_price() -> pd.DataFrame:
-    """ETF_LIST 전 종목의 가격 데이터를 로드하고 전처리한다.
+def ensure_no_current_prefix_columns(price_data: pd.DataFrame | None, *, context: str) -> None:
+    """전략 입력에 PIT current_ 메타데이터가 섞이면 바로 실패한다."""
+    if price_data is None or price_data.empty:
+        return
+    current_columns = [column for column in price_data.columns if str(column).startswith("current_")]
+    if current_columns:
+        raise ValueError(
+            f"{context}에 PIT current_ 메타데이터가 포함되었습니다: {sorted(current_columns)}"
+        )
+
+
+def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame:
+    """주어진 ETF 유니버스의 가격 데이터를 로드하고 전처리한다.
 
     분배금 파일이 있으면 분배금 컬럼을 병합하고, ``ETF_RETURN_BASIS``에 따라
     ``close_adj``(랭킹 기준 수익률용), ``ret_60``, ``ret_120`` 등을 계산한다.
@@ -833,10 +844,11 @@ def load_etf_price() -> pd.DataFrame:
     failed = []
     empty = []
 
-    listing_dates = get_listing_dates(ticker_subset=set(map(str, ETF_LIST)))
+    universe = [str(ticker) for ticker in (ticker_universe if ticker_universe is not None else ETF_LIST)]
+    listing_dates = get_listing_dates(ticker_subset=set(universe))
 
-    total = len(ETF_LIST)
-    for idx, ticker in enumerate(ETF_LIST, start=1):
+    total = len(universe)
+    for idx, ticker in enumerate(universe, start=1):
         print(f"[데이터] {idx}/{total} 조회: {ticker}")
         try:
             df = get_price(ticker, listing_dates=listing_dates)
@@ -902,6 +914,7 @@ def run_etf_strategy(
     portfolio_trailing_stop_pct: float | None = None,
     us_index_df: pd.DataFrame | None = None,
     enable_multi_index_risk: bool = False,
+    universe_tickers: Sequence[str] | None = None,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
 ):
@@ -915,7 +928,9 @@ def run_etf_strategy(
         rebalance_observer: 선택적 콜백. 각 리밸런싱 전후 상태(의사결정, 주문, 체결)
            를 담은 dict를 전달한다. ``None``이면 기존 동작과 동일하다.
     """
-    price = price_data.copy() if price_data is not None else load_etf_price()
+    ensure_no_current_prefix_columns(price_data, context="run_etf_strategy(price_data)")
+    universe = [str(ticker) for ticker in (universe_tickers if universe_tickers is not None else ETF_LIST)]
+    price = price_data.copy() if price_data is not None else load_etf_price(universe)
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
 
     cash = float(initial_cash)
@@ -927,7 +942,7 @@ def run_etf_strategy(
     trades = []
     equity_rows = []
 
-    ticker_names: dict[str, str] = {t: get_ticker_name(t) for t in ETF_LIST}
+    ticker_names: dict[str, str] = {t: get_ticker_name(t) for t in universe}
     effective_exit_check_days = (
         int(exit_check_days)
         if exit_check_days is not None

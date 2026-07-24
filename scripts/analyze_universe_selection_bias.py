@@ -158,101 +158,96 @@ def run_analysis() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     print("[유니버스 편향] static 전체 가격 데이터 로드")
     index_df = rtb.get_index_data()
     common_dates = list(index_df["date"])
-    original_universe = list(rtb.ETF_LIST)
-    rtb.ETF_LIST = baseline
-    all_price = rtb.load_etf_price()
+    all_price = rtb.load_etf_price(baseline)
 
     summary_rows: list[dict] = []
     trade_rows: list[dict] = []
     membership_rows: list[dict] = []
-    try:
-        for scenario in scenarios:
-            tickers = list(scenario.tickers)
-            if not tickers:
-                raise RuntimeError(f"빈 유니버스 시나리오: {scenario.name}")
-            print(
-                f"[유니버스 편향] {scenario.name}: "
-                f"{len(tickers)}종목 백테스트"
-            )
-            rtb.ETF_LIST = tickers
-            scenario_price = all_price[all_price["ticker"].isin(tickers)].copy()
-            curve, trades = rtb.run_etf_strategy(
-                rtb.INITIAL_CASH,
-                common_dates,
-                index_df,
-                use_market_filter=rtb.USE_MARKET_FILTER,
-                max_positions=rtb.ETF_MAX_POSITIONS,
-                slippage=rtb.BASE_SLIPPAGE,
-                risk_off_liquidate=rtb.strategy_cfg.get("liquidate_on_risk_off", True),
-                price_data=scenario_price,
-                max_asset_pct=rtb.strategy_cfg.get("max_asset_pct"),
-                target_weight_rebalance=rtb.strategy_cfg.get("target_weight_rebalance"),
-                rebalance_band_pct=rtb.strategy_cfg.get("rebalance_band_pct"),
-                trim_overweight_positions=rtb.strategy_cfg.get("trim_overweight_positions"),
-                exit_check_days=rtb.strategy_cfg.get("exit_check_days"),
-                trailing_stop_pct=rtb.strategy_cfg.get("trailing_stop_pct"),
-                portfolio_trailing_stop_pct=rtb.strategy_cfg.get(
-                    "portfolio_trailing_stop_pct"
-                ),
-                enable_multi_index_risk=False,
-            )
-            curve["date"] = pd.to_datetime(curve["date"])
-            trades["date"] = pd.to_datetime(trades["date"])
+    for scenario in scenarios:
+        tickers = list(scenario.tickers)
+        if not tickers:
+            raise RuntimeError(f"빈 유니버스 시나리오: {scenario.name}")
+        print(
+            f"[유니버스 편향] {scenario.name}: "
+            f"{len(tickers)}종목 백테스트"
+        )
+        scenario_price = all_price[all_price["ticker"].isin(tickers)].copy()
+        curve, trades = rtb.run_etf_strategy(
+            rtb.INITIAL_CASH,
+            common_dates,
+            index_df,
+            use_market_filter=rtb.USE_MARKET_FILTER,
+            max_positions=rtb.ETF_MAX_POSITIONS,
+            slippage=rtb.BASE_SLIPPAGE,
+            risk_off_liquidate=rtb.strategy_cfg.get("liquidate_on_risk_off", True),
+            price_data=scenario_price,
+            max_asset_pct=rtb.strategy_cfg.get("max_asset_pct"),
+            target_weight_rebalance=rtb.strategy_cfg.get("target_weight_rebalance"),
+            rebalance_band_pct=rtb.strategy_cfg.get("rebalance_band_pct"),
+            trim_overweight_positions=rtb.strategy_cfg.get("trim_overweight_positions"),
+            exit_check_days=rtb.strategy_cfg.get("exit_check_days"),
+            trailing_stop_pct=rtb.strategy_cfg.get("trailing_stop_pct"),
+            portfolio_trailing_stop_pct=rtb.strategy_cfg.get(
+                "portfolio_trailing_stop_pct"
+            ),
+            enable_multi_index_risk=False,
+            universe_tickers=tickers,
+        )
+        curve["date"] = pd.to_datetime(curve["date"])
+        trades["date"] = pd.to_datetime(trades["date"])
 
-            for ticker in tickers:
-                membership_rows.append({"scenario": scenario.name, "ticker": ticker})
+        for ticker in tickers:
+            membership_rows.append({"scenario": scenario.name, "ticker": ticker})
 
-            if not trades.empty:
-                grouped_trades = trades.groupby("ticker", dropna=False)
-                for ticker, ticker_trades in grouped_trades:
-                    trade_rows.append(
-                        {
-                            "scenario": scenario.name,
-                            "ticker": str(ticker),
-                            "trade_count": int(len(ticker_trades)),
-                            "buy_count": int((ticker_trades["side"] == "BUY").sum()),
-                            "sell_count": int((ticker_trades["side"] == "SELL").sum()),
-                            "first_trade_date": str(ticker_trades["date"].min().date()),
-                            "last_trade_date": str(ticker_trades["date"].max().date()),
-                        }
-                    )
-
-            for period, start in EVALUATION_STARTS.items():
-                evaluation = _evaluation_curve(curve, common_dates, start)
-                if len(evaluation) < 2:
-                    continue
-                stats = rtb.calc_stats(evaluation, "equity")
-                period_trades = trades if start is None else trades[trades["date"] >= start]
-                aligned_curve = curve[curve["date"].isin(evaluation["date"])].copy()
-                invested_ratio = (
-                    aligned_curve["market_value"] / aligned_curve["equity"]
-                    if not aligned_curve.empty
-                    else pd.Series(dtype=float)
-                )
-                summary_rows.append(
+        if not trades.empty:
+            grouped_trades = trades.groupby("ticker", dropna=False)
+            for ticker, ticker_trades in grouped_trades:
+                trade_rows.append(
                     {
                         "scenario": scenario.name,
-                        "description": scenario.description,
-                        "period": period,
-                        "evaluation_start": str(evaluation["date"].iloc[0].date()),
-                        "evaluation_end": str(evaluation["date"].iloc[-1].date()),
-                        "universe_size": len(tickers),
-                        "initial": float(stats["initial"]),
-                        "final": float(stats["final"]),
-                        "total_return": float(stats["total_return"]),
-                        "cagr": float(stats["cagr"]),
-                        "mdd": float(stats["mdd"]),
-                        "sharpe": _serialize_number(stats["sharpe"]),
-                        "sortino": _serialize_number(stats["sortino"]),
-                        "avg_invested_ratio": (
-                            float(invested_ratio.mean()) if not invested_ratio.empty else None
-                        ),
-                        "trade_count": int(len(period_trades)),
-                        "unique_traded_tickers": int(period_trades["ticker"].nunique()),
+                        "ticker": str(ticker),
+                        "trade_count": int(len(ticker_trades)),
+                        "buy_count": int((ticker_trades["side"] == "BUY").sum()),
+                        "sell_count": int((ticker_trades["side"] == "SELL").sum()),
+                        "first_trade_date": str(ticker_trades["date"].min().date()),
+                        "last_trade_date": str(ticker_trades["date"].max().date()),
                     }
                 )
-    finally:
-        rtb.ETF_LIST = original_universe
+
+        for period, start in EVALUATION_STARTS.items():
+            evaluation = _evaluation_curve(curve, common_dates, start)
+            if len(evaluation) < 2:
+                continue
+            stats = rtb.calc_stats(evaluation, "equity")
+            period_trades = trades if start is None else trades[trades["date"] >= start]
+            aligned_curve = curve[curve["date"].isin(evaluation["date"])]
+            invested_ratio = (
+                aligned_curve["market_value"] / aligned_curve["equity"]
+                if not aligned_curve.empty
+                else pd.Series(dtype=float)
+            )
+            summary_rows.append(
+                {
+                    "scenario": scenario.name,
+                    "description": scenario.description,
+                    "period": period,
+                    "evaluation_start": str(evaluation["date"].iloc[0].date()),
+                    "evaluation_end": str(evaluation["date"].iloc[-1].date()),
+                    "universe_size": len(tickers),
+                    "initial": float(stats["initial"]),
+                    "final": float(stats["final"]),
+                    "total_return": float(stats["total_return"]),
+                    "cagr": float(stats["cagr"]),
+                    "mdd": float(stats["mdd"]),
+                    "sharpe": _serialize_number(stats["sharpe"]),
+                    "sortino": _serialize_number(stats["sortino"]),
+                    "avg_invested_ratio": (
+                        float(invested_ratio.mean()) if not invested_ratio.empty else None
+                    ),
+                    "trade_count": int(len(period_trades)),
+                    "unique_traded_tickers": int(period_trades["ticker"].nunique()),
+                }
+            )
 
     summary = pd.DataFrame(summary_rows)
     baseline_metrics = summary[summary["scenario"] == BASELINE_SCENARIO][
