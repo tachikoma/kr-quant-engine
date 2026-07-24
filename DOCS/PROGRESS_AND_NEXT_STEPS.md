@@ -85,10 +85,25 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
   공식 백테스트에 미연결
 - 상세: `DOCS/POINT_IN_TIME_UNIVERSE.md`
 
-위 작업 흐름은 다음 작업 1번의 선행 작업입니다. split 게이팅을 먼저 바로잡아
-기준 전략을 재동결했고, static 유니버스의 사후 선택 편향을 정리한 뒤,
-membership와 과거 가격 수집 경로를 만들어야만 시점별 유니버스와 가격을 함께
-붙이는 PIT 백테스트를 안정적으로 시작할 수 있습니다.
+위 작업 흐름은 다음 작업 1번의 선행 조건입니다. split 게이팅을 먼저 바로잡아
+기준 전략을 재동결했고, static 유니버스의 사후 선택 편향을 정리했으며,
+membership와 과거 가격 수집 경로를 마련해야 시점별 유니버스와 가격을 결합한
+PIT 백테스트를 안정적으로 시작할 수 있습니다.
+
+### 2026-07 작업 흐름 요약
+
+- `1f5dd19a`: `build_gating_decision()`으로 백테스트/실전 게이팅을 통합하고,
+   비허용 보유분은 `forced_exit_tickers`로 분리해 `ETF_RISK_GATE_EXIT`로 청산
+- `38a0db3`: `check_strategy_freeze.py`가 동결 설정과 현재 설정을 비교해
+   `universe_mode`, 멀티 인덱스 파라미터, 분배금/슬리피지 차이를 검증
+- `af194e11`: 선택 편향 분석을 전역 `ETF_LIST` 변조 없이 실행하도록 바꾸고,
+   시나리오별로 `run_etf_strategy(..., universe_tickers=...)`를 직접 호출
+- `7f4324bc`: `build_snapshot_dates()`와 `normalize_krx_etf_snapshot()`로 날짜별
+   membership를 복원하고, 스냅샷 패널을 검증해 `pit_universe`를 구축
+- `103e29c8`: `normalize_krx_etf_history()`와 `prefetch_pit_prices.py`로 역사적
+   티커의 상장 기간 OHLCV·NAV를 티커별로 누적 저장
+- `0f89961e`: membership와 가격 수집 완료 상태를 문서에 고정하고, 아직 남은
+   과제(과거 분류 복원, 나머지 가격 보강)를 명시
 
 ### 성과 리포트 교정 (2026-07)
 - MDD 고점/저점/회복일/진행 여부 및 현재 낙폭 추가
