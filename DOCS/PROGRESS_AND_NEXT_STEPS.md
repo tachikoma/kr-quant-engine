@@ -176,6 +176,15 @@ PIT 백테스트를 안정적으로 시작할 수 있습니다.
    - momentum_60_30: CAGR 28.3%(+2.8%p) but MDD -52.9%(악화)
    - momentum_60_100: CAGR 21.1%(−4.4%p)
 
+0.8. **복수 벤치마크·비용 비교 (구현 완료 2026-08-05):** `scripts/benchmark_comparison.py`가
+   전략 커브를 KR(KODEX200), US(TIGER 미국S&P500선물(H)), Gold(ACE KRX금현물),
+   현금, 그리고 KR/US/Gold 정책 포트폴리오(33/33/33, 50/30/20, 60/40)와 비교합니다.
+   주문 크기 구간별 분포를 `outputs_benchmark/market_impact.csv`로 산출합니다.
+   결과(전략: CAGR 24.0%, MDD -51.2%, Sharpe 0.99):
+   - KR: CAGR 14.9%, MDD -40.8% | US: CAGR 12.2%, MDD -35.0% | Gold: CAGR 23.6%, MDD -32.1%, Sharpe 1.13
+   - **policy 33/33/33: MDD -23.2%(최소), Sharpe 1.09, Calmar 0.83(최대) — 분산 효과 최대**
+   - policy 60/40: CAGR 13.9%, MDD -33.7%
+
 1. **PIT 일별 가격·과거 분류 확장:** 이미 수집한 역사적 227종목에 이어 남은
    1,143종목의 상장 기간 OHLCV·NAV를 수집하고, 현재 분류에 없는 227종목의 과거
    자산군·복제방법·시장 분류를 복원.

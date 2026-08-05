@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (45 files — 44 스크립트 + 공용 헬퍼 `_proxy_utils.py`). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `track_oos_performance.py`, `factorial_ablation.py`, `restore_pit_classification.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`, `build_point_in_time_universe.py`, `prefetch_pit_prices.py`, `analyze_universe_selection_bias.py`, `sweep_multi_index_split.py`, `test_split_gating.py`.
+- Analysis scripts: `scripts/` (46 files — 45 스크립트 + 공용 헬퍼 `_proxy_utils.py`). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `track_oos_performance.py`, `factorial_ablation.py`, `restore_pit_classification.py`, `benchmark_comparison.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`, `build_point_in_time_universe.py`, `prefetch_pit_prices.py`, `analyze_universe_selection_bias.py`, `sweep_multi_index_split.py`, `test_split_gating.py`.
 
 ## Commands
 
@@ -33,6 +33,7 @@ uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS pe
 uv run scripts/track_oos_performance.py         # v2 live OOS equity tracking (broker-only by default)
 uv run scripts/factorial_ablation.py            # factor-wise isolated effect (CAGR/MDD/Sharpe deltas)
 uv run scripts/restore_pit_classification.py    # PIT delisted ETF 227 historical classification restore
+uv run scripts/benchmark_comparison.py          # multi-benchmark (KR/US/Gold/policy/cash) + market impact
 uv run scripts/analyze_filter_frequency.py       # risk_on + 후보 0개 빈도 분석
 uv run scripts/analyze_zero_candidate_impact.py  # 후보 0개 사건 포트폴리오 영향 분석
 uv run scripts/analyze_current_drawdown.py       # 현재 MDD 기여도·리밸런싱 이력
@@ -120,6 +121,8 @@ Full list in `README.md` and `.env.sample`.
 - `outputs_walk_forward_compare/` — walk-forward 비교 결과 (target_weight, legacy 등 시나리오별). gitignored
 - `outputs_compare/` — 프록시 분석/비교 실험 결과: `proxy_analysis/` (시그널·포트폴리오·레짐 비교), `proxy_match/` (매칭 실험·통계 검증). gitignored
 - `outputs_universe_bias/` — 유니버스 선택 편향(selection bias) 분석 결과
+- `outputs_ablation/` — factorial ablation 결과 (gitignored)
+- `outputs_benchmark/` — 복수 벤치마크·시장 충격 비교 결과 (gitignored)
 - `data_cache/` — pykrx OHLCV parquet cache (gitignored)
 - `runtime_state/` — daily runner state: `etf_daily_state.json`, `oos_equity_history.json` (gitignored)
 
