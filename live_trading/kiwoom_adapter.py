@@ -50,6 +50,7 @@ ETF 드라이런/라이브 실행용 키움 REST 어댑터.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,8 @@ from typing import Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger(__name__)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -147,9 +150,12 @@ class KiwoomAdapter:
                 if attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
                     if self.http_debug_response:
-                        print(
-                            f"[HTTP][재시도] 네트워크 오류 ({type(e).__name__}) "
-                            f"-> {delay:.1f}초 대기 후 재시도 (attempt {attempt+1}/{self.http_max_retries})"
+                        logger.debug(
+                            "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
+                            type(e).__name__,
+                            delay,
+                            attempt + 1,
+                            self.http_max_retries,
                         )
                     time.sleep(delay)
                     continue
@@ -158,12 +164,15 @@ class KiwoomAdapter:
                 self._last_request_ts = time.monotonic()
 
             if self.http_debug_response:
-                print(
-                    f"[HTTP] POST {token_endpoint} api-id={token_api_id} status={response.status_code}"
+                logger.debug(
+                    "[HTTP] POST %s api-id=%s status=%s",
+                    token_endpoint,
+                    token_api_id,
+                    response.status_code,
                 )
                 if self.http_debug_body:
                     body_text = response.text[: max(self.http_debug_body_limit, 0)]
-                    print(f"[HTTP] response(body): {body_text}")
+                    logger.debug("[HTTP] response(body): %s", body_text)
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
@@ -189,7 +198,7 @@ class KiwoomAdapter:
             if self._is_api_rate_limited(data) and not token_rate_limited:
                 token_rate_limited = True
                 if self.http_debug_response:
-                    print("[HTTP][재시도] 토큰 발급 rate-limit 감지, 60초 대기 후 재시도...")
+                    logger.debug("[HTTP][재시도] 토큰 발급 rate-limit 감지, 60초 대기 후 재시도...")
                 time.sleep(60)
                 continue
 
@@ -204,7 +213,9 @@ class KiwoomAdapter:
             expires_in = data.get("expires_in")
             if expires_in is None:
                 expires_in = 86400
-                print(f"[WARN] expires_in not found in token response, defaulting to {expires_in}")
+                logger.warning(
+                    "[WARN] expires_in not found in token response, defaulting to %s", expires_in
+                )
             else:
                 expires_in = int(expires_in)
 
@@ -328,9 +339,12 @@ class KiwoomAdapter:
                 if attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
                     if self.http_debug_response:
-                        print(
-                            f"[HTTP][재시도] 네트워크 오류 ({type(e).__name__}) "
-                            f"-> {delay:.1f}초 대기 후 재시도 (attempt {attempt+1}/{self.http_max_retries})"
+                        logger.debug(
+                            "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
+                            type(e).__name__,
+                            delay,
+                            attempt + 1,
+                            self.http_max_retries,
                         )
                     time.sleep(delay)
                     # retry delay counts toward throttle interval (no separate timestamp update)
@@ -341,13 +355,16 @@ class KiwoomAdapter:
                 self._last_request_ts = time.monotonic()
 
             if self.http_debug_response:
-                print(
-                    f"[HTTP] POST {endpoint} api-id={api_id or ''} status={response.status_code} "
-                    f"request={payload}"
+                logger.debug(
+                    "[HTTP] POST %s api-id=%s status=%s request=%s",
+                    endpoint,
+                    api_id or "",
+                    response.status_code,
+                    payload,
                 )
                 if self.http_debug_body:
                     body_text = response.text[: max(self.http_debug_body_limit, 0)]
-                    print(f"[HTTP] response(body): {body_text}")
+                    logger.debug("[HTTP] response(body): %s", body_text)
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
@@ -358,7 +375,7 @@ class KiwoomAdapter:
             if response.status_code == 401 and not auth_retried:
                 auth_retried = True
                 if self.http_debug_response:
-                    print("[HTTP][재시도] 인증 실패 (401), 토큰 재발급 후 재시도...")
+                    logger.debug("[HTTP][재시도] 인증 실패 (401), 토큰 재발급 후 재시도...")
                 self.invalidate_token()
                 self._ensure_token_valid()
                 continue
@@ -375,9 +392,11 @@ class KiwoomAdapter:
                 if self.http_debug_response:
                     code = data.get("return_code")
                     msg = str(data.get("return_msg", "")).strip()
-                    print(
-                        f"[HTTP][재시도] API 제한 감지(return_code={code}, return_msg={msg}) "
-                        f"-> {wait_sec:.1f}초 대기 후 재시도"
+                    logger.debug(
+                        "[HTTP][재시도] API 제한 감지(return_code=%s, return_msg=%s) -> %.1f초 대기 후 재시도",
+                        code,
+                        msg,
+                        wait_sec,
                     )
                 time.sleep(wait_sec)
                 # retry delay counts toward throttle interval (no separate timestamp update)

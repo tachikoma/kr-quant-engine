@@ -10,11 +10,14 @@ KiwoomAdapter와 동일한 7개 메서드 인터페이스를 제공:
   KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO, KIS_ACCOUNT_PROD_CD
 """
 
+import logging
 import os
 from datetime import datetime
 from typing import Any
 
-from live_trading.kis import KisApiClient, KisAuthManager, KisApiError
+from live_trading.kis import KisApiClient, KisApiError, KisAuthManager
+
+logger = logging.getLogger(__name__)
 
 _ORDER_TYPE_MAP = {
     "MARKET": "01",
@@ -81,7 +84,7 @@ class KisAdapter:
         """특정 종목 기준 매수 가능 정보(ord_psbl_cash, nrcvb_buy_qty 등)를 반환한다."""
         price_str = str(price) if price else ""
         output = self._api.get_buyable_cash(self._cano, self._acnt_prdt_cd, ticker, price_str)
-        print(f"[DEBUG] get_buyable_info({ticker}, price={price}): {output}")
+        logger.debug("get_buyable_info(%s, price=%s): %s", ticker, price, output)
         return output or {}
 
     def get_holdings(self) -> dict[str, int]:

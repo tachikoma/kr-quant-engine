@@ -8,6 +8,7 @@ pandas.DataFrame 대신 dict / list[dict] 를 반환합니다.
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -17,6 +18,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from ._kis_auth_manager import KisAuthManager
+
+logger = logging.getLogger(__name__)
 
 
 class KisApiError(Exception):
@@ -113,19 +116,23 @@ class KisApiClient:
                     e.http_status == 401 or e.msg_cd in {"EGW00121", "EGW00122", "EGW00123"}
                 ):
                     auth_retried = True
-                    print(
-                        f"[KIS] 인증 실패 감지 (msg_cd={e.msg_cd}, http_status={e.http_status}), "
-                        f"토큰 재발급 후 재시도..."
+                    logger.warning(
+                        "[KIS] 인증 실패 감지 (msg_cd=%s, http_status=%s), 토큰 재발급 후 재시도...",
+                        e.msg_cd,
+                        e.http_status,
                     )
                     self._auth.invalidate_token()
                     self._auth.get_access_token()
                     continue
                 if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
-                    print(
-                        f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
-                        f"http_status={e.http_status}, "
-                        f"attempt={attempt+1}/{self._max_retries}). "
-                        f"Retrying in {self._retry_delay}s."
+                    logger.warning(
+                        "[KIS] Rate-limit hit (msg_cd=%s, http_status=%s, attempt=%s/%s). "
+                        "Retrying in %ss.",
+                        e.msg_cd,
+                        e.http_status,
+                        attempt + 1,
+                        self._max_retries,
+                        self._retry_delay,
                     )
                     time.sleep(self._retry_delay)
                     continue
@@ -153,19 +160,23 @@ class KisApiClient:
                     e.http_status == 401 or e.msg_cd in {"EGW00121", "EGW00122", "EGW00123"}
                 ):
                     auth_retried = True
-                    print(
-                        f"[KIS] 인증 실패 감지 (msg_cd={e.msg_cd}, http_status={e.http_status}), "
-                        f"토큰 재발급 후 재시도..."
+                    logger.warning(
+                        "[KIS] 인증 실패 감지 (msg_cd=%s, http_status=%s), 토큰 재발급 후 재시도...",
+                        e.msg_cd,
+                        e.http_status,
                     )
                     self._auth.invalidate_token()
                     self._auth.get_access_token()
                     continue
                 if attempt < self._max_retries and e.msg_cd in {"EGW00201", "EGW00215"}:
-                    print(
-                        f"[KIS] Rate-limit hit (msg_cd={e.msg_cd}, "
-                        f"http_status={e.http_status}, "
-                        f"attempt={attempt+1}/{self._max_retries}). "
-                        f"Retrying in {self._retry_delay}s."
+                    logger.warning(
+                        "[KIS] Rate-limit hit (msg_cd=%s, http_status=%s, attempt=%s/%s). "
+                        "Retrying in %ss.",
+                        e.msg_cd,
+                        e.http_status,
+                        attempt + 1,
+                        self._max_retries,
+                        self._retry_delay,
                     )
                     time.sleep(self._retry_delay)
                     continue
