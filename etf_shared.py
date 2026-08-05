@@ -6,7 +6,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from config_utils import parse_pct_env
+from config_utils import parse_fraction_env, parse_pct_env
 from etf_distributions import add_total_return_price
 
 logger = logging.getLogger(__name__)
@@ -588,6 +588,11 @@ def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df["score"] = 0.55 * zscore(df["ret_60"]) + 0.45 * zscore(df["ret_120"])
+    momentum_weight_60 = parse_fraction_env("ETF_MOMENTUM_WEIGHT_60", 0.55)
+    df["score"] = (
+        momentum_weight_60 * zscore(df["ret_60"])
+        + (1 - momentum_weight_60) * zscore(df["ret_120"])
+    )
     return df.sort_values("score", ascending=False).reset_index(drop=True)
 
 

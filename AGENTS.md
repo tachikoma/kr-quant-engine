@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (43 files — 42 스크립트 + 공용 헬퍼 `_proxy_utils.py`). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `track_oos_performance.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`, `build_point_in_time_universe.py`, `prefetch_pit_prices.py`, `analyze_universe_selection_bias.py`, `sweep_multi_index_split.py`, `test_split_gating.py`.
+- Analysis scripts: `scripts/` (45 files — 44 스크립트 + 공용 헬퍼 `_proxy_utils.py`). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `track_oos_performance.py`, `factorial_ablation.py`, `restore_pit_classification.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`, `build_point_in_time_universe.py`, `prefetch_pit_prices.py`, `analyze_universe_selection_bias.py`, `sweep_multi_index_split.py`, `test_split_gating.py`.
 
 ## Commands
 
@@ -31,6 +31,8 @@ uv run scripts/parameter_stability.py           # parameter neighborhood sensiti
 uv run scripts/trade_performance_attribution.py # FIFO trade P&L attribution (cost-aware)
 uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS performance
 uv run scripts/track_oos_performance.py         # v2 live OOS equity tracking (broker-only by default)
+uv run scripts/factorial_ablation.py            # factor-wise isolated effect (CAGR/MDD/Sharpe deltas)
+uv run scripts/restore_pit_classification.py    # PIT delisted ETF 227 historical classification restore
 uv run scripts/analyze_filter_frequency.py       # risk_on + 후보 0개 빈도 분석
 uv run scripts/analyze_zero_candidate_impact.py  # 후보 0개 사건 포트폴리오 영향 분석
 uv run scripts/analyze_current_drawdown.py       # 현재 MDD 기여도·리밸런싱 이력
@@ -70,6 +72,7 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `LIQUIDATE_ON_RISK_OFF` | `1` | risk_off 시 전량 매도(1) vs 보유 유지(0) |
 | `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
 | `ETF_RETURN_BASIS` | `price` | `nav` uses NAV as ranking basis for total-return approximation |
+| `ETF_MOMENTUM_WEIGHT_60` | `0.55` | Momentum score weight for `ret_60` (ret_120 gets `1 - weight`). Used by factorial ablation |
 | `MIN_LISTING_DAYS` | `60` | Exclude ETFs younger than this many trading days when listing date is known |
 | `MAX_PREMIUM_DISCOUNT` | `0.02` | Default absolute price/NAV deviation threshold (fallback when group/ticker thresholds don't apply) |
 | `ETF_DEVIATION_THRESHOLD_BY_GROUP` | `domestic_equity=0.02,foreign_investment=0.02,commodity=0.02` | Group-specific price/NAV deviation thresholds |
@@ -139,6 +142,8 @@ Full list in `README.md` and `.env.sample`.
 - `run_etf_strategy()` accepts an optional `rebalance_observer` keyword-only callback. When provided, it is called at each rebalance with a dict containing pre/post portfolio state, risk flags, targets, and order results. The callback does not affect backtest logic; observer errors are logged and re-raised.
 - `run_etf_strategy()` also supports `initial_state` (seed `cash`/`holdings`/`holding_cost_basis`/`holding_peak_closes`/`portfolio_peak_equity`/`last_valid_closes`/`rebalance_phase_offset`/`exit_phase_offset`) and `return_final_state=True` (returns the ending state as a third value). Used by state-based walk-forward for genuine fold-boundary state handoff. When `initial_state` is set, `warmup_days` becomes 0 and rebalance/exit phase is aligned via the phase offsets.
 - State-based walk-forward (`WF_STATE_BASED=1`, default): `walk_forward_validation.py` runs each fold's test segment starting from the previous fold's actual end state (holdings/cash/tax basis), instead of slicing a pre-run full-period curve and applying a flat `boundary_cost_pct`. Fold 1 runs continuously from period start to its test_end. `WF_STATE_BASED=0` preserves the legacy slicing path.
+- `rank_etfs()` momentum score weight: `ETF_MOMENTUM_WEIGHT_60` env (default `0.55`) controls the `ret_60` vs `ret_120` z-score split (weight for ret_60; ret_120 gets `1 - weight`). Used by factorial ablation (`scripts/factorial_ablation.py`) to isolate momentum weighting effects.
+- Factorial ablation: `scripts/factorial_ablation.py` runs baseline + one-at-a-time factor removals (KOSPI filter, group override, multi-index, MA/SLOPE window, momentum weight) and reports isolated CAGR/MDD/Sharpe deltas to `outputs_ablation/`. MA/SLOPE variants recompute rolling columns from cached KOSPI closes (no network).
 - Exit-only trailing overlay (`ETF_EXIT_CHECK_DAYS` / `ETF_TRAILING_STOP_PCT`): backtest only, not applied in live runner. Tracks per-ticker peak close and sells at next-day open when drop exceeds threshold. Stopped tickers are excluded from same-day rebalance targets. Default inactive (both `0`).
 - Live risk monitoring (`_calculate_risk_snapshot()` in `etf_daily_runner.py`): computes per-position weights and drawdown from peak equity before order placement. Alerts logged and sent to Telegram summary; does not affect orders. Peak equity persisted in `runtime_state/etf_daily_state.json`. Mock accounts (no API) do not overwrite peak equity. Missing prices block drawdown calculation to prevent false alerts.
 - Holiday detection (`_is_trading_day()` in `etf_daily_runner.py`): replaces legacy `_is_weekday()` with a check against `_KRX_HOLIDAYS` (hardcoded 2026 KRX public holidays). Runs at `run_daily()` entry before any API calls. `_KRX_HOLIDAYS` must be updated annually **and again when 임시공휴일 are announced mid-year** (e.g. 선거일, 임시 지정 공휴일 — 2026 지방선거 6/3, 제헌절 복원 7/17). Weekday closures include 대체공휴일(주말 겹침 국경일) and 근로자의 날/연말 휴장일(12/31).

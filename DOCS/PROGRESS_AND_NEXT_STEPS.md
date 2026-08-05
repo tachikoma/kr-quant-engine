@@ -164,6 +164,18 @@ PIT 백테스트를 안정적으로 시작할 수 있습니다.
    폴드 1은 기간 시작부터 fold test_end까지 연속 실행하며, 재조정 위상은
    `rebalance_phase_offset`으로 전체 기간 스케줄과 정렬됩니다.
 
+0.75. **factorial ablation (구현 완료 2026-08-05):** `scripts/factorial_ablation.py`가
+   KOSPI 필터, 그룹 override, 멀티 인덱스, MA/SLOPE 기간, 모멘텀 가중치의 단독 효과와
+   상호작용을 분리합니다. `ETF_MOMENTUM_WEIGHT_60` env로 모멘텀 스코어 가중치를
+   파라미터화했습니다. 기준(CAGR 25.5%, MDD -51.2%, Sharpe 1.02) 대비:
+   - no_kospi_filter: CAGR 24.2%(−1.3%p) → KOSPI 필터 기여 확인
+   - no_group_override: CAGR 24.0%(−1.5%p) → 그룹 override 기여 확인
+   - enable_multi_index: CAGR 27.6%(+2.2%p)
+   - **ma_90: CAGR 26.2%(+0.7%p), MDD -31.8%(개선 +19.4%p) — 짧은 MA가 낙폭을 크게 줄임**
+   - ma_180: CAGR 19.5%(−5.9%p)
+   - momentum_60_30: CAGR 28.3%(+2.8%p) but MDD -52.9%(악화)
+   - momentum_60_100: CAGR 21.1%(−4.4%p)
+
 1. **PIT 일별 가격·과거 분류 확장:** 이미 수집한 역사적 227종목에 이어 남은
    1,143종목의 상장 기간 OHLCV·NAV를 수집하고, 현재 분류에 없는 227종목의 과거
    자산군·복제방법·시장 분류를 복원.
