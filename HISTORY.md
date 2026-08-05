@@ -2,6 +2,25 @@
 
 주요 완료 작업 요약. 자세한 내용은 개별 커밋 참조.
 
+## 2026-08 — PIT/검증 도구 묶음
+
+- v2 OOS 실전 추적: 데일리 러너가 일별 평가액을 `runtime_state/oos_equity_history.json`에
+  기록하고, `scripts/track_oos_performance.py`가 v2 OOS(2026-07-22~) 실전 성과를 리포트
+  (기본 broker 평가액만, `--include-mock`으로 드라이런 포함 가능, v1 트랙과 미혼합)
+- 상장폐지 ETF 227종목 과거 분류 복원: `scripts/restore_pit_classification.py`가
+  `index_name`/`name` 키워드 규칙으로 자산군·시장·복제방법 추정. 현재 KRX 분류 기준
+  검증 정확도 자산군 96.1%, 시장 91.6%. 복제방법 저신뢰 61종목은 검토 CSV로 분리
+- 상태 기반 walk-forward 교정: `run_etf_strategy()`에 `initial_state`/`return_final_state`
+  추가, 폴드 경계에서 실제 보유·현금·세금 원가 이월(`WF_STATE_BASED=1` 기본).
+  인공 `boundary_cost_pct` 제거, 재조정 위상은 `rebalance_phase_offset`으로 정렬
+- factorial ablation: `scripts/factorial_ablation.py`가 KOSPI 필터·그룹 override·
+  멀티 인덱스·MA/SLOPE·모멘텀 가중치의 단독 효과 분리. `ETF_MOMENTUM_WEIGHT_60` 파라미터화.
+  **발견: MA 90일이 MDD -51.2%→-31.8%로 크게 개선 (CAGR +0.7%p)**
+- 복수 벤치마크·시장 충격 비교: `scripts/benchmark_comparison.py`가 전략을 KR/US/Gold/
+  정책 포트폴리오(33/33/33, 50/30/20, 60/40)/현금과 비교. **발견: 33/33/33 정책이
+  MDD -23.2%(최소)·Calmar 0.83(최대)로 분산 효과 확인**
+- 유지보수: 2026 KRX 휴장일 보완, live_trading print→logging 통일, KIWOOM_HTTP_DEBUG_* 제거
+
 ## 2026-07 — PIT 선행 작업 묶음
 
 - split 게이팅을 공용 `GatingDecision`으로 통합하고, 비허용 보유분은 `ETF_RISK_GATE_EXIT`로 선택적 청산

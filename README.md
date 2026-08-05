@@ -233,6 +233,10 @@ uv run scripts/trade_performance_attribution.py           # 비용 포함 거래
 uv run scripts/analyze_proxy_signal.py                    # SPY vs QQQ 시그널/포트폴리오/레짐 비교 분석
 uv run scripts/sweep_proxy_match.py                       # 프록시-지수 매칭 실험 (6 시나리오)
 uv run scripts/validate_proxy_stats.py                    # 통계적 검증 (bootstrap CI, 레짐 분석)
+uv run scripts/track_oos_performance.py                   # v2 실전 OOS 평가액 추적 리포트
+uv run scripts/factorial_ablation.py                      # 전략 팩터별 단독 효과 분리
+uv run scripts/restore_pit_classification.py              # 상장폐지 ETF 227종목 과거 분류 복원
+uv run scripts/benchmark_comparison.py                    # 복수 벤치마크·시장 충격 비교
 ```
 
 ## 표본외 검증 기준
@@ -273,7 +277,9 @@ uv run scripts/validate_proxy_stats.py                    # 통계적 검증 (bo
 - `WF_TEST_YEARS=1`
 - `WF_STEP_YEARS=1`
 - `WF_ANCHORED=0`: `0`은 rolling window, `1`은 expanding window
-- `WF_BOUNDARY_COST_PCT=0.0015`: 각 테스트 폴드 시작 시 전량 교체를 가정한 비용
+- `WF_STATE_BASED=1`: 폴드 경계에서 이전 폴드의 실제 보유/현금/세금 원가를 이월하는
+  상태 기반 실행. `0`이면 인공 `WF_BOUNDARY_COST_PCT`를 적용한 기존 슬라이싱 경로 사용
+- `WF_BOUNDARY_COST_PCT=0.0015`: (state_based=0일 때만) 테스트 폴드 시작 시 전량 교체 비용
 - `WF_TARGET_WEIGHT_REBALANCE=0|1`: walk-forward 시 목표비중 주문 방식 사용 여부
 - `WF_TRIM_OVERWEIGHT_POSITIONS=0|1`: 기존 방식에서 비중 상한 초과분 trim 여부
 - `WF_MAX_ASSET_PCT=0.50`: walk-forward 전용 종목 비중 상한

@@ -101,6 +101,8 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `WF_TARGET_WEIGHT_REBALANCE` | (env 기본값) | walk-forward 시 목표비중 방식 사용 여부 |
 | `WF_TRIM_OVERWEIGHT_POSITIONS` | (env 기본값) | walk-forward 시 비대칭 하드캡 trim 사용 여부 |
 | `WF_EXIT_CHECK_DAYS` | `0` | walk-forward trailing exit 점검 주기 |
+| `WF_STATE_BASED` | `1` | 폴드 경계에서 실제 보유/현금/원가 이월. `0`이면 기존 슬라이싱+경계비용 경로 |
+| `WF_BOUNDARY_COST_PCT` | `0.0015` | `WF_STATE_BASED=0`일 때만 적용되는 폴드 경계 전량 교체 비용 |
 | `WF_TRAILING_STOP_PCT` | `0` | walk-forward trailing stop 비율 |
 | `WF_PORTFOLIO_TRAILING_STOP_PCT` | `0` | walk-forward 포트폴리오 trailing stop 비율 |
 | `WF_MAX_ASSET_PCT` | `0.50` | walk-forward 전용 종목 비중 상한 |
