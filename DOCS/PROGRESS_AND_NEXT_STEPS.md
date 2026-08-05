@@ -73,7 +73,7 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
 - 상장폐지를 포함한 point-in-time 유니버스는 아니므로 전부 in-sample 진단으로 취급
 - 상세: `DOCS/UNIVERSE_SELECTION_BIAS.md`
 
-### Point-in-time ETF membership 구축 (2026-07-21)
+### Point-in-time ETF membership 구축 (2026-07-21, 파이프라인 완성 2026-08-05)
 
 - KRX 리밸런싱 시점별 ETF 전종목 스냅샷 124개 수집
 - 74,129행, 고유 티커 1,370종목, 누락 스냅샷 0
@@ -81,8 +81,10 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
 - 과거에 관찰됐지만 마지막 스냅샷에 없는 티커 220종목
 - 현재 분류 캐시에 없는 역사적 티커 227종목
 - 역사적 티커 227종목 OHLCV·NAV 수집 완료: 227개 파일, 184,985행, 빈 파일·중복 0
-- membership와 역사적 티커 가격은 복원됐으나 과거 분류·나머지 1,143종목 가격 보강 전에는
-  공식 백테스트에 미연결
+- **2026-08-05 완료:** 나머지 1,143종목 가격 수집(`prefetch_pit_prices.py --scope all`,
+  1,370종목 모두 수집), 227종목 과거 분류 복원(`restore_pit_classification.py`),
+  시점별 적격성 필터(`pit_membership_ok`)+그룹 매핑(`build_pit_ticker_groups`),
+  PIT 백테스트(`pit_backtest.py`) 연결 완료 — 아래 0.9 참조
 - 상세: `DOCS/POINT_IN_TIME_UNIVERSE.md`
 
 위 작업 흐름은 다음 작업 1번의 선행 조건입니다. split 게이팅을 먼저 바로잡아

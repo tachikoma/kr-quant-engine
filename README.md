@@ -197,6 +197,9 @@ python live_trading/etf_daily_runner.py --force-live
 - `outputs_grid/`: 그리드 백테스트 결과물
 - `outputs_compare/`: 프록시 분석/비교 실험 결과 (`proxy_analysis/`, `proxy_match/`, gitignored)
 - `outputs_universe_bias/`: static 유니버스 선택 편향 민감도 결과 (gitignored)
+- `outputs_ablation/`: factorial ablation 결과 (gitignored)
+- `outputs_benchmark/`: 복수 벤치마크·시장 충격 비교 결과 (gitignored)
+- `outputs_pit/`: PIT 유니버스 백테스트 결과 (gitignored)
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
 - `scripts/`: 분석/실험 스크립트
