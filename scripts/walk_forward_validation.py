@@ -218,9 +218,20 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     if not folds:
         raise RuntimeError("조건을 만족하는 walk-forward 폴드가 없습니다.")
 
+    state_based = os.environ.get("WF_STATE_BASED", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    full_dates = list(pd.to_datetime(common_dates))
+    warmup_full = max(120, rtb.MARKET_MA_DAYS + rtb.MARKET_SLOPE_DAYS)
+
     fold_rows = []
     stitched_rows = []
     stitched_equity = float(rtb.INITIAL_CASH)
+    carry_state: dict | None = None
     for fold in folds:
         candidates = []
         for (rebalance, positions), curve in scenario_curves.items():
@@ -242,31 +253,126 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             continue
         selected = max(candidates, key=selection_key)
         selected_key = (selected["rebalance_step_days"], selected["max_positions"])
-        selected_curve = scenario_curves[selected_key].copy()
-        selected_curve["daily_return"] = selected_curve["equity"].pct_change()
-        test = selected_curve[
-            (selected_curve["date"] >= fold["test_start"])
-            & (selected_curve["date"] <= fold["test_end"])
-        ].dropna(subset=["daily_return"])
+        rtb.REBALANCE_STEP_DAYS = selected_key[0]
+
+        if state_based:
+            test_start_ts = pd.Timestamp(fold["test_start"])
+            test_end_ts = pd.Timestamp(fold["test_end"])
+            start_index = next(
+                (i for i, d in enumerate(full_dates) if d >= test_start_ts),
+                0,
+            )
+            if carry_state is None:
+                # 첫 폴드: 기간 시작부터 fold의 test_end까지 연속 실행
+                segment_dates = [d for d in full_dates if d <= test_end_ts]
+                run_state = None
+            else:
+                segment_dates = [d for d in full_dates if test_start_ts <= d <= test_end_ts]
+                run_state = dict(carry_state)
+                run_state["rebalance_phase_offset"] = (
+                    (start_index - warmup_full) % selected_key[0]
+                )
+                if exit_check_days > 0:
+                    run_state["exit_phase_offset"] = (
+                        (start_index - warmup_full) % exit_check_days
+                    )
+            curve, _, end_state = rtb.run_etf_strategy(
+                rtb.INITIAL_CASH,
+                segment_dates,
+                index_df,
+                use_market_filter=True,
+                max_positions=selected_key[1],
+                slippage=rtb.BASE_SLIPPAGE,
+                risk_off_liquidate=risk_off_liquidate,
+                price_data=price_data,
+                max_asset_pct=max_asset_pct,
+                target_weight_rebalance=target_weight_rebalance,
+                rebalance_band_pct=rebalance_band_pct,
+                trim_overweight_positions=trim_overweight_positions,
+                exit_check_days=exit_check_days,
+                trailing_stop_pct=trailing_stop_pct,
+                portfolio_trailing_stop_pct=portfolio_trailing_stop_pct,
+                us_index_df=us_index_df,
+                enable_multi_index_risk=enable_multi_index_risk,
+                initial_state=run_state,
+                return_final_state=True,
+            )
+            curve["date"] = pd.to_datetime(curve["date"])
+            test = curve[
+                (curve["date"] >= test_start_ts) & (curve["date"] <= test_end_ts)
+            ].copy()
+            carry_state = end_state
+        else:
+            selected_curve = scenario_curves[selected_key].copy()
+            selected_curve["daily_return"] = selected_curve["equity"].pct_change()
+            test = selected_curve[
+                (selected_curve["date"] >= fold["test_start"])
+                & (selected_curve["date"] <= fold["test_end"])
+            ].dropna(subset=["daily_return"])
         if test.empty:
             continue
 
         fold_initial = stitched_equity
-        for row_number, row in enumerate(test.itertuples(index=False)):
-            daily_return = float(row.daily_return)
-            if row_number == 0:
-                daily_return = (1 + daily_return) * (1 - boundary_cost_pct) - 1
-            stitched_equity *= 1 + daily_return
-            stitched_rows.append(
-                {
-                    "date": row.date,
-                    "equity": stitched_equity,
-                    "daily_return": daily_return,
-                    "fold": fold["fold"],
-                    "rebalance_step_days": selected_key[0],
-                    "max_positions": selected_key[1],
-                }
+        if state_based:
+            # 상태 기반 세그먼트 실행의 일간 수익률을 스티치 에쿼티에 적용한다.
+            # 세그먼트 절대 평가액(INITIAL_CASH 기반)과 스티치 레벨은 다르므로
+            # 수익률만 이전 스티치 레벨에 합성한다. 첫 행은 폴드 경계(직전
+            # 실행 종료) 시점의 수익률로 계산해 경계 전환 수익률을 보존한다.
+            seg_equity = pd.Series(
+                [float(row.equity) for row in test.itertuples(index=False)], dtype=float
             )
+            if carry_state is None:
+                # 폴드 1: 전체 curve에서 test_start 직전 행을 앵커로 삼아 경계 수익률 유지
+                full_curve_sorted = curve.sort_values("date").reset_index(drop=True)
+                anchor_rows = full_curve_sorted[
+                    full_curve_sorted["date"] < test_start_ts
+                ]
+                if not anchor_rows.empty:
+                    anchor_equity = float(anchor_rows["equity"].iloc[-1])
+                    seg_returns = (
+                        seg_equity / anchor_equity
+                    ).tolist()  # anchor→각 행의 누적, 이후 pct로 변환
+                    seg_returns = [
+                        seg_returns[0] - 1,
+                        *[
+                            seg_returns[i] / seg_returns[i - 1] - 1
+                            for i in range(1, len(seg_returns))
+                        ],
+                    ]
+                else:
+                    seg_returns = seg_equity.pct_change().fillna(0.0).tolist()
+            else:
+                seg_returns = seg_equity.pct_change().fillna(0.0).tolist()
+            for (row, seg_return) in zip(
+                test.itertuples(index=False), seg_returns, strict=False
+            ):
+                stitched_equity *= 1 + float(seg_return)
+                stitched_rows.append(
+                    {
+                        "date": row.date,
+                        "equity": stitched_equity,
+                        "daily_return": float(seg_return),
+                        "fold": fold["fold"],
+                        "rebalance_step_days": selected_key[0],
+                        "max_positions": selected_key[1],
+                    }
+                )
+        else:
+            for row_number, row in enumerate(test.itertuples(index=False)):
+                daily_return = float(row.daily_return)
+                if row_number == 0:
+                    daily_return = (1 + daily_return) * (1 - boundary_cost_pct) - 1
+                stitched_equity *= 1 + daily_return
+                stitched_rows.append(
+                    {
+                        "date": row.date,
+                        "equity": stitched_equity,
+                        "daily_return": daily_return,
+                        "fold": fold["fold"],
+                        "rebalance_step_days": selected_key[0],
+                        "max_positions": selected_key[1],
+                    }
+                )
         fold_curve = pd.DataFrame(
             [
                 {"date": fold["train_end"], "equity": fold_initial},
@@ -303,10 +409,9 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     summary = {
         "method": "rolling" if not anchored else "anchored",
         "selection_metric": "train_sharpe_then_cagr_then_mdd",
-        "train_years": train_years,
-        "test_years": test_years,
-        "step_years": step_years,
+        "state_based": state_based,
         "boundary_cost_pct": boundary_cost_pct,
+        "train_years": train_years,
         "target_weight_rebalance": target_weight_rebalance,
         "trim_overweight_positions": trim_overweight_positions,
         "max_asset_pct": max_asset_pct,

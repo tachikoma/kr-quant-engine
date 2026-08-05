@@ -1,5 +1,6 @@
 from pathlib import Path
 from collections.abc import Callable, Sequence
+from typing import Any
 import json
 import logging
 import os
@@ -917,6 +918,8 @@ def run_etf_strategy(
     universe_tickers: Sequence[str] | None = None,
     *,
     rebalance_observer: Callable[[dict], None] | None = None,
+    initial_state: dict[str, Any] | None = None,
+    return_final_state: bool = False,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
@@ -939,6 +942,27 @@ def run_etf_strategy(
     holding_peak_closes: dict[str, float] = {}
     portfolio_peak_equity: float | None = None
     last_valid_closes: dict[str, float] = {}
+    rebalance_phase_offset = 0
+    exit_phase_offset = 0
+    if initial_state:
+        cash = float(initial_state.get("cash", cash))
+        holdings = {str(t): int(q) for t, q in dict(initial_state.get("holdings", {})).items()}
+        holding_cost_basis = {
+            str(t): float(b)
+            for t, b in dict(initial_state.get("holding_cost_basis", {})).items()
+        }
+        holding_peak_closes = {
+            str(t): float(p)
+            for t, p in dict(initial_state.get("holding_peak_closes", {})).items()
+        }
+        peak = initial_state.get("portfolio_peak_equity")
+        portfolio_peak_equity = float(peak) if peak is not None else None
+        last_valid_closes = {
+            str(t): float(p)
+            for t, p in dict(initial_state.get("last_valid_closes", {})).items()
+        }
+        rebalance_phase_offset = int(initial_state.get("rebalance_phase_offset", 0))
+        exit_phase_offset = int(initial_state.get("exit_phase_offset", rebalance_phase_offset))
     trades = []
     equity_rows = []
 
@@ -1015,7 +1039,7 @@ def run_etf_strategy(
         )
         return True
 
-    warmup_days = max(120, MARKET_MA_DAYS + MARKET_SLOPE_DAYS)
+    warmup_days = 0 if initial_state else max(120, MARKET_MA_DAYS + MARKET_SLOPE_DAYS)
     for i, dt in enumerate(common_dates[:-1]):
         if i < warmup_days:
             continue
@@ -1035,7 +1059,7 @@ def run_etf_strategy(
             parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
         )
         update_last_valid_prices(last_valid_closes, today.get("close"))
-        should_rebalance = (i - warmup_days) % REBALANCE_STEP_DAYS == 0
+        should_rebalance = (i - warmup_days + rebalance_phase_offset) % REBALANCE_STEP_DAYS == 0
         rebalance_order_count = 0
         exit_order_count = 0
         stopped_tickers: set[str] = set()
@@ -1069,7 +1093,7 @@ def run_etf_strategy(
                 effective_trailing_stop_pct > 0
                 or effective_portfolio_trailing_stop_pct > 0
             )
-            and (i - warmup_days) % effective_exit_check_days == 0
+            and (i - warmup_days + exit_phase_offset) % effective_exit_check_days == 0
         )
         should_stop_portfolio = (
             should_check_exit
@@ -1370,7 +1394,20 @@ def run_etf_strategy(
                 logger.exception("rebalance_observer 실행 실패")
                 raise
 
-    return pd.DataFrame(equity_rows), pd.DataFrame(trades)
+    result = (pd.DataFrame(equity_rows), pd.DataFrame(trades))
+    if return_final_state:
+        final_state = {
+            "cash": cash,
+            "holdings": holdings,
+            "holding_cost_basis": holding_cost_basis,
+            "holding_peak_closes": holding_peak_closes,
+            "portfolio_peak_equity": portfolio_peak_equity,
+            "last_valid_closes": last_valid_closes,
+            "rebalance_phase_offset": rebalance_phase_offset,
+            "exit_phase_offset": exit_phase_offset,
+        }
+        return (*result, final_state)
+    return result
 
 
 def run_kodex200_buy_and_hold(initial_cash: float, common_dates: list[pd.Timestamp]) -> pd.DataFrame:
