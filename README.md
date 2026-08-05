@@ -237,6 +237,7 @@ uv run scripts/track_oos_performance.py                   # v2 실전 OOS 평가
 uv run scripts/factorial_ablation.py                      # 전략 팩터별 단독 효과 분리
 uv run scripts/restore_pit_classification.py              # 상장폐지 ETF 227종목 과거 분류 복원
 uv run scripts/benchmark_comparison.py                    # 복수 벤치마크·시장 충격 비교
+uv run scripts/pit_backtest.py                            # PIT 유니버스 백테스트 (생존편향 제거) vs static
 ```
 
 ## 표본외 검증 기준

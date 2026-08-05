@@ -93,6 +93,7 @@ from etf_shared import (
     get_strategy_config,
     update_last_valid_prices,
 )
+import etf_shared as _etf_shared
 
 strategy_cfg = get_strategy_config()
 REBALANCE_STEP_DAYS = strategy_cfg["rebalance_step_days"]  # env override 반영 (기본 10)
@@ -920,6 +921,7 @@ def run_etf_strategy(
     rebalance_observer: Callable[[dict], None] | None = None,
     initial_state: dict[str, Any] | None = None,
     return_final_state: bool = False,
+    ticker_groups: dict[str, str] | None = None,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
@@ -935,6 +937,11 @@ def run_etf_strategy(
     universe = [str(ticker) for ticker in (universe_tickers if universe_tickers is not None else ETF_LIST)]
     price = price_data.copy() if price_data is not None else load_etf_price(universe)
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
+
+    original_ticker_groups = None
+    if ticker_groups is not None:
+        original_ticker_groups = _etf_shared.ETF_TICKER_GROUPS
+        _etf_shared.ETF_TICKER_GROUPS = dict(ticker_groups)
 
     cash = float(initial_cash)
     holdings = {}
@@ -1395,6 +1402,8 @@ def run_etf_strategy(
                 raise
 
     result = (pd.DataFrame(equity_rows), pd.DataFrame(trades))
+    if original_ticker_groups is not None:
+        _etf_shared.ETF_TICKER_GROUPS = original_ticker_groups
     if return_final_state:
         final_state = {
             "cash": cash,

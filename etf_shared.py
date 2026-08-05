@@ -546,6 +546,15 @@ def rank_etfs(snapshot: pd.DataFrame) -> pd.DataFrame:
     n = len(df)
     steps: list[str] = []
 
+    if "pit_membership_ok" in df.columns:
+        n_before = len(df)
+        dropped = sorted(df.loc[~df["pit_membership_ok"], "ticker"].tolist())
+        df = df[df["pit_membership_ok"]].copy()
+        logger.debug(f"  [필터] pit_membership: {n_before}\u2192{len(df)}")
+        if dropped:
+            logger.debug(f"    탈락: {dropped}")
+        steps.append(f"pit_membership: {n_before}\u2192{len(df)}")
+
     if "liquidity_ok" in df.columns:
         n_before = len(df)
         dropped = sorted(df.loc[~df["liquidity_ok"], "ticker"].tolist())

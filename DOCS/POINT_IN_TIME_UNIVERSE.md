@@ -62,33 +62,46 @@
 - ENTER 1,150건(최초 스냅샷 제외), EXIT 220건
 - 캐시 오프라인 재구축 결과와 membership hash 일치
 
-## 남은 한계
+## PIT 백테스트 연결 (완료 2026-08-05)
 
-Membership과 과거 분류가 point-in-time으로 복원됐습니다. 전략 백테스트에 연결하려면
-다음이 추가로 필요합니다.
+전체 PIT 파이프라인이 연결됐습니다.
 
-1. 전체 1,370종목 중 남은 1,143종목의 일별 OHLCV·NAV를 상장 기간에 맞춰 수집 (진행 중)
-2. ~~사라진 227종목의 과거 자산군·복제방법·시장 분류 복원~~ → **완료 (2026-08-05)**
-3. 현재 분류와 과거 분류를 구분한 시점별 적격성 필터
-4. 리밸런싱 날짜별 membership를 `rank_etfs()` 입력에 적용하는 백테스트 연결
+1. **전체 1,370종목 일별 OHLCV·NAV 수집 완료 (2026-08-05):**
+   `scripts/prefetch_pit_prices.py --scope all`로 1,370종목 모두 수집, 오류·빈파일 0건.
+   `data_cache/pit_prices/<ticker>.parquet`에 종목별 저장.
+2. **사라진 227종목의 과거 자산군·복제방법·시장 분류 복원 완료 (2026-08-05):**
+   `scripts/restore_pit_classification.py` (자세한 내용은 아래).
+3. **시점별 적격성 필터 완료:** `pit_universe.add_pit_membership_flag()`가
+   `pit_membership_ok` 컬럼을 추가하고, `rank_etfs()`가 이를 첫 필터로 적용.
+   `build_pit_ticker_groups()`가 현재 KRX 분류(1,143종목) + 복원 분류(227종목)를
+   결합해 1,370종목의 티커→그룹 매핑을 구축하고, `run_etf_strategy(ticker_groups=...)`
+   로 전달해 risk-off 그룹 게이팅에 반영.
+4. **백테스트 연결 완료:** `scripts/pit_backtest.py`가 전체 유니버스로 PIT 백테스트를
+   실행하고 static 유니버스와 비교합니다. 출력: `outputs_pit/`.
 
-일별 가격은 `scripts/prefetch_pit_prices.py`로 수집합니다. ISIN을 사용하므로 현재
-상장 목록에서 사라진 종목도 조회할 수 있고, `data_cache/pit_prices/<ticker>.parquet`에
-종목별로 즉시 저장하므로 중단 후 재개할 수 있습니다. 2026-07-21 기준 과거 분류
-누락 ETF 227종목의 상장 기간 OHLCV·NAV 수집을 완료했습니다. 결과는 227개 파일,
-184,985행이며 빈 파일·필수 컬럼 누락·날짜/티커 중복은 모두 0건입니다. 오프라인
-재검증에서도 227종목이 모두 `OK`로 확인됐습니다. 남은 1,143종목의 수집은
-`scripts/prefetch_pit_prices.py --scope all`로 진행 중이며, 이미 수집된 파일은
-건너뛰므로 재개가 안전합니다.
+### PIT 백테스트 결과 (2016-08-01~2026-07-21)
 
-과거 분류 복원은 `scripts/restore_pit_classification.py`가 수행합니다. PIT 스냅샷의
-`index_name`(기초지수명)과 `name`(종목명) 키워드 기반 규칙으로 자산군(주식/채권/
-원자재/부동산/통화/기타), 시장(국내/해외), 레버리지, 복제방법을 추정하며, 현재
-KRX 분류(1,143종목)로 검증 시 자산군 96.1%, 시장 91.6% 정확도를 보였습니다.
-결과는 `data_cache/pit_universe/pit_classification_restored.parquet`에 저장되고,
+| 지표 | PIT (1,370종목) | static (16종목) |
+|---|---:|---:|
+| CAGR | 31.77% | 24.66% |
+| MDD | -59.14% | -36.65% |
+| Sharpe | 0.83 | 1.08 |
+| 최종자산 | 13,175,955 | 7,882,627 |
+
+PIT 유니버스가 CAGR은 높지만(+7.1%p) MDD는 크게 깊어지고(-22.5%p) Sharpe가
+낮아집니다. 이는 과거 존재했던 고모멘텀/고변동 테마 ETF가 후보에 포함되면서
+상승은 키우지만 하락 방어는 약해지는 특성 때문입니다. static 유니버스의
+선택 편향(생존 편향)이 부분적으로는 '성과 하향 보수'로 작용했음을 시사합니다.
+거래 내역 검증 결과 모든 거래가 해당 티커의 PIT membership 구간 내에서 발생해
+look-ahead 바이어스가 없음을 확인했습니다.
+
+### 과거 분류 복원 상세
+
+`scripts/restore_pit_classification.py`가 PIT 스냅샷의 `index_name`(기초지수명)과
+`name`(종목명) 키워드 기반 규칙으로 자산군(주식/채권/원자재/부동산/통화/기타),
+시장(국내/해외), 레버리지, 복제방법을 추정합니다. 현재 KRX 분류(1,143종목)로
+검증 시 자산군 96.1%, 시장 91.6% 정확도를 보였습니다. 결과는
+`data_cache/pit_universe/pit_classification_restored.parquet`에 저장되고,
 복제방법 신뢰도가 낮은 61종목은 `outputs_universe_bias/pit_classification_review.csv`
 로 분리되어 수동 검토를 기다립니다. 자동 분류는 복제방법(실물/합성)을 지수명만으로
-단정할 수 없으므로, 공식 백테스트 연결 전에 검토 CSV를 확정해야 합니다.
-
-나머지 1,143종목의 가격이 완료되기 전에 현재 분류에 매칭되는 생존 종목만으로
-백테스트하면 다시 생존 편향이 들어가므로 공식 point-in-time 결과로 취급하지 않습니다.
+단정할 수 없으므로, 공식 채택 전에 검토 CSV를 확정하는 것을 권장합니다.

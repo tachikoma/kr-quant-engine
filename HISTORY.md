@@ -4,6 +4,12 @@
 
 ## 2026-08 — PIT/검증 도구 묶음
 
+- **PIT 백테스트 연결 (2026-08-05):** 전체 1,370종목 가격 수집 완료,
+  `pit_universe.add_pit_membership_flag()`(시점별 적격성 필터)와
+  `build_pit_ticker_groups()`(현재+복원 분류 결합 그룹 매핑) 추가, `rank_etfs()`가
+  `pit_membership_ok`를 첫 필터로 적용. `scripts/pit_backtest.py`가 생존편향 없는
+  PIT 백테스트를 실행. 결과: PIT CAGR 31.77%/MDD -59.14% vs static CAGR 24.66%/MDD -36.65%
+  (PIT가 CAGR +7.1%p지만 MDD -22.5%p 악화). 거래 membership 위반 0건 검증.
 - v2 OOS 실전 추적: 데일리 러너가 일별 평가액을 `runtime_state/oos_equity_history.json`에
   기록하고, `scripts/track_oos_performance.py`가 v2 OOS(2026-07-22~) 실전 성과를 리포트
   (기본 broker 평가액만, `--include-mock`으로 드라이런 포함 가능, v1 트랙과 미혼합)

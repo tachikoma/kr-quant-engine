@@ -282,3 +282,109 @@ def load_cached_snapshot_files(paths: list[Path]) -> pd.DataFrame:
     panel = pd.concat(frames, ignore_index=True)
     panel["snapshot_date"] = pd.to_datetime(panel["snapshot_date"])
     return panel.sort_values(["snapshot_date", "ticker"]).reset_index(drop=True)
+
+
+def build_membership_intervals(panel: pd.DataFrame) -> pd.DataFrame:
+    """PIT membership을 ticker별 관찰 기간 구간으로 변환한다.
+
+    각 ticker가 스냅샷에 처음 나타난 날(first_observed)부터 마지막으로 나타난
+    날(last_observed)까지를 membership 구간으로 본다. 스냅샷은 리밸런싱 시점이므로
+    구간 안의 모든 날짜에 해당 ticker가 후보로 존재했던 것으로 해석한다.
+
+    Returns
+    -------
+    pd.DataFrame
+        ``ticker``, ``first_observed``, ``last_observed`` 컬럼.
+    """
+    work = panel[["snapshot_date", "ticker"]].copy()
+    work["snapshot_date"] = pd.to_datetime(work["snapshot_date"])
+    work["ticker"] = work["ticker"].astype(str)
+    intervals = (
+        work.groupby("ticker")["snapshot_date"]
+        .agg(first_observed="min", last_observed="max")
+        .reset_index()
+    )
+    return intervals.sort_values("first_observed")
+
+
+def build_pit_ticker_groups(
+    current_classification_path: Path | None = None,
+    restored_classification_path: Path | None = None,
+) -> dict[str, str]:
+    """PIT 유니버스 전체(1,370종목)의 티커→그룹 매핑을 구축한다.
+
+    - 현재 상장 종목: `data_cache/etf_tax_classification.parquet`의 `IDX_MKT_CLSS_NM`
+    - 상장폐지 종목: `pit_classification_restored.parquet`의 `market` (복원값)
+
+    매핑: 국내 → domestic_equity, 해외/국내&해외 → foreign_investment, 원자재 → commodity.
+    """
+    groups: dict[str, str] = {}
+
+    if current_classification_path is not None and current_classification_path.exists():
+        current = pd.read_parquet(current_classification_path)
+        for _, row in current.iterrows():
+            ticker = str(row.get("ISU_SRT_CD", "")).strip()
+            market = str(row.get("IDX_MKT_CLSS_NM", "")).strip()
+            asset_cls = str(row.get("IDX_ASST_CLSS_NM", "")).strip()
+            if not ticker:
+                continue
+            groups[ticker] = market_to_group(market, asset_cls)
+
+    if restored_classification_path is not None and restored_classification_path.exists():
+        restored = pd.read_parquet(restored_classification_path)
+        for _, row in restored.iterrows():
+            ticker = str(row.get("ticker", "")).strip()
+            market = str(row.get("market", "")).strip()
+            asset_cls = str(row.get("asset_class", "")).strip()
+            if not ticker:
+                continue
+            if ticker in groups:
+                continue
+            groups[ticker] = market_to_group(market, asset_cls)
+
+    return groups
+
+
+def market_to_group(market: str, asset_cls: str = "") -> str:
+    """KRX 시장/자산군 분류를 전략 그룹으로 매핑한다."""
+    if asset_cls == "원자재":
+        return "commodity"
+    if market == "국내":
+        return "domestic_equity"
+    return "foreign_investment"
+
+
+def add_pit_membership_flag(
+    price: pd.DataFrame, panel: pd.DataFrame
+) -> pd.DataFrame:
+    """가격 데이터에 as-of PIT membership 플래그 ``pit_membership_ok``를 추가한다.
+
+    가격 데이터의 각 (date, ticker) 행이 해당 시점에 리밸런싱 후보로 존재했는지를
+    PIT 스냅샷의 ticker별 관찰 구간(first_observed~last_observed)으로 판정한다.
+    """
+    price = price.copy()
+    work = price[["date", "ticker"]].copy()
+    work["date"] = pd.to_datetime(work["date"])
+    work["ticker"] = work["ticker"].astype(str)
+
+    intervals = build_membership_intervals(panel)
+    if intervals.empty:
+        price["pit_membership_ok"] = True
+        return price
+
+    intervals["first_observed"] = pd.to_datetime(intervals["first_observed"])
+    intervals["last_observed"] = pd.to_datetime(intervals["last_observed"])
+
+    merged = work.merge(
+        intervals, on="ticker", how="left"
+    )
+    merged["first_observed"] = pd.to_datetime(merged["first_observed"])
+    merged["last_observed"] = pd.to_datetime(merged["last_observed"])
+    in_interval = (
+        merged["first_observed"].notna()
+        & merged["last_observed"].notna()
+        & (merged["date"] >= merged["first_observed"])
+        & (merged["date"] <= merged["last_observed"])
+    )
+    price["pit_membership_ok"] = in_interval.fillna(False).astype(bool)
+    return price

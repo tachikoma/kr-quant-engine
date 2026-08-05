@@ -183,11 +183,20 @@ PIT 백테스트를 안정적으로 시작할 수 있습니다.
    결과(전략: CAGR 24.0%, MDD -51.2%, Sharpe 0.99):
    - KR: CAGR 14.9%, MDD -40.8% | US: CAGR 12.2%, MDD -35.0% | Gold: CAGR 23.6%, MDD -32.1%, Sharpe 1.13
    - **policy 33/33/33: MDD -23.2%(최소), Sharpe 1.09, Calmar 0.83(최대) — 분산 효과 최대**
-   - policy 60/40: CAGR 13.9%, MDD -33.7%
+    - policy 60/40: CAGR 13.9%, MDD -33.7%
 
-1. **PIT 일별 가격·과거 분류 확장:** 이미 수집한 역사적 227종목에 이어 남은
-   1,143종목의 상장 기간 OHLCV·NAV를 수집하고, 현재 분류에 없는 227종목의 과거
-   자산군·복제방법·시장 분류를 복원.
+0.9. **PIT 일별 가격·과거 분류 확장 + 백테스트 연결 (구현 완료 2026-08-05):**
+   `scripts/prefetch_pit_prices.py --scope all`로 전체 1,370종목 OHLCV·NAV 수집 완료.
+   `pit_universe.add_pit_membership_flag()`(시점별 적격성 필터)와
+   `build_pit_ticker_groups()`(현재+복원 분류 결합, 1,370종목 그룹 매핑)를 추가하고,
+   `rank_etfs()`가 `pit_membership_ok`를 첫 필터로 적용. `scripts/pit_backtest.py`가
+   PIT 백테스트를 실행·검증. 결과(2016-08-01~2026-07-21):
+   - **PIT: CAGR 31.77%, MDD -59.14%, Sharpe 0.83** vs **static: CAGR 24.66%, MDD -36.65%, Sharpe 1.08**
+   - PIT 유니버스가 CAGR +7.1%p이지만 MDD -22.5%p 악화, Sharpe 하락
+   - 거래 내역 검증: membership 위반 0건 (look-ahead 바이어스 없음)
+
+1. **~~PIT 일별 가격·과거 분류 확장~~ (완료 — 위 0.9 참조):** 남은 후보는
+   복제방법(실물/합성) 저신뢰 61종목의 수동 검토 CSV 확정.
 2. **상태 기반 walk-forward 교정:** fold 경계에서 선택된 파라미터의 실제 보유 종목·현금·세금
    원가를 전환하여 다음 테스트 구간을 실행. 이후 fold 확대와 embargo를 검토.
 3. **교정된 기반의 factorial ablation:** 유니버스, KOSPI 필터, 그룹 override, 멀티 인덱스,
