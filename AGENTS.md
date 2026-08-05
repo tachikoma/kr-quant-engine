@@ -6,7 +6,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 
 ## Key entrypoints
 
-- `run_etf_backtest.py` — primary backtest (1800+ lines, procedural). Config via env vars. CLI: `--start`, `--end`, `--mode`. `run_etf_strategy()` supports optional `rebalance_observer` callback for diagnostics.
+- `run_etf_backtest.py` — primary backtest (2400+ lines, procedural). Config via env vars. CLI: `--start`, `--end`, `--mode`. `run_etf_strategy()` supports optional `rebalance_observer` callback for diagnostics.
 - `live_trading/etf_daily_runner.py` — daily live order runner (default: safe mode, no real orders). CLI: `--force-live`.
 - `live_trading/kiwoom_adapter.py` — Kiwoom REST API adapter for live brokerage.
 - `live_trading/kis_adapter.py` — Korea Investment & Securities (KIS) REST API adapter.
@@ -15,7 +15,7 @@ Korean ETF rotation backtest + daily live runner. Python 3.11, single-module lay
 - Shared strategy logic: `etf_shared.py` (ETF_LIST, fees, ranking, order building).
 - `etf_distributions.py` — ETF 현금분배금 CSV 로드 및 total-return 수익률 계산.
 - `strategy_freeze.py` — 전략 동결 스냅샷 생성/검증 유틸리티. `strategy_freeze.json`과 함께 사용.
-- Analysis scripts: `scripts/` (32 scripts). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`.
+- Analysis scripts: `scripts/` (43 files — 42 스크립트 + 공용 헬퍼 `_proxy_utils.py`). Key: `grid_backtest.py`, `correlation_analysis.py`, `apply_cap_and_retest.py`, `walk_forward_validation.py`, `parameter_stability.py`, `trade_performance_attribution.py`, `check_strategy_freeze.py`, `track_oos_performance.py`, `analyze_current_drawdown.py`, `analyze_proxy_signal.py`, `sweep_proxy_match.py`, `validate_proxy_stats.py`, `build_point_in_time_universe.py`, `prefetch_pit_prices.py`, `analyze_universe_selection_bias.py`, `sweep_multi_index_split.py`, `test_split_gating.py`.
 
 ## Commands
 
@@ -30,6 +30,7 @@ uv run scripts/walk_forward_validation.py       # rolling walk-forward parameter
 uv run scripts/parameter_stability.py           # parameter neighborhood sensitivity check
 uv run scripts/trade_performance_attribution.py # FIFO trade P&L attribution (cost-aware)
 uv run scripts/check_strategy_freeze.py         # strategy freeze drift + OOS performance
+uv run scripts/track_oos_performance.py         # v2 live OOS equity tracking (broker-only by default)
 uv run scripts/analyze_filter_frequency.py       # risk_on + 후보 0개 빈도 분석
 uv run scripts/analyze_zero_candidate_impact.py  # 후보 0개 사건 포트폴리오 영향 분석
 uv run scripts/analyze_current_drawdown.py       # 현재 MDD 기여도·리밸런싱 이력
@@ -115,8 +116,9 @@ Full list in `README.md` and `.env.sample`.
 - `outputs_walk_forward/` — walk-forward validation results
 - `outputs_walk_forward_compare/` — walk-forward 비교 결과 (target_weight, legacy 등 시나리오별). gitignored
 - `outputs_compare/` — 프록시 분석/비교 실험 결과: `proxy_analysis/` (시그널·포트폴리오·레짐 비교), `proxy_match/` (매칭 실험·통계 검증). gitignored
+- `outputs_universe_bias/` — 유니버스 선택 편향(selection bias) 분석 결과
 - `data_cache/` — pykrx OHLCV parquet cache (gitignored)
-- `runtime_state/` — daily runner state: `etf_daily_state.json` (gitignored)
+- `runtime_state/` — daily runner state: `etf_daily_state.json`, `oos_equity_history.json` (gitignored)
 
 ## Architecture notes
 
@@ -140,6 +142,7 @@ Full list in `README.md` and `.env.sample`.
 - Holiday detection (`_is_trading_day()` in `etf_daily_runner.py`): replaces legacy `_is_weekday()` with a check against `_KRX_HOLIDAYS` (hardcoded 2026 KRX public holidays). Runs at `run_daily()` entry before any API calls. `_KRX_HOLIDAYS` must be updated annually **and again when 임시공휴일 are announced mid-year** (e.g. 선거일, 임시 지정 공휴일 — 2026 지방선거 6/3, 제헌절 복원 7/17). Weekday closures include 대체공휴일(주말 겹침 국경일) and 근로자의 날/연말 휴장일(12/31).
 - Poisoned-state recovery (`_should_rebalance()` in `etf_daily_runner.py`): when `last_rebalance_date` is not in the pykrx trading calendar (e.g. set to a holiday by a prior bug), the function logs a warning and returns `True` (allow immediate rebalance) instead of blocking for `step_days`. `run_daily()` also validates and resets `last_rebalance_date` on startup if it falls on a non-trading day.
 - `last_rebalance_date` update guard (`etf_daily_runner.py`): `last_rebalance_date` is only advanced when at least one order was successfully submitted (`any_submitted`). Prevents state poisoning when all orders fail (e.g. on a holiday not caught by the static set).
+- v2 OOS live tracking: `_record_oos_equity_history()` in `etf_daily_runner.py` appends a per-day equity record (from `plan["risk_snapshot"]`) to `runtime_state/oos_equity_history.json` at every run — both the NO_ACTION and the order-execution paths. Same-date reruns overwrite that day's record. `scripts/track_oos_performance.py` reads the history, filters `date >= strategy_freeze.json["oos_start_date"]` (v2 = 2026-07-22), and reports total return/CAGR/MDD/Sharpe. Default `source_filter=broker` (mock/dry-run equity excluded); `--include-mock` adds mock records. v1 track (2026-07-14 start) is not mixed in.
 - Lint: `ruff check .` — see `[tool.ruff]` in `pyproject.toml`. No type checker, no test framework.
 - `.env` is gitignored; copy `.env.sample` to create one.
 - KIS adapter (`live_trading/kis/` package) shares a 7-method interface with KiwoomAdapter: `get_cash()`, `get_holdings()`, `get_prices()`, `get_bid_ask_prices()`, `place_order()`, `get_order_status()`, `cancel_order()`.

@@ -150,6 +150,12 @@ PIT 백테스트를 안정적으로 시작할 수 있습니다.
 
 ## 권장되는 다음 작업
 
+0. **v2 OOS 추적 (구현 완료 2026-08-05):** `live_trading/etf_daily_runner.py`의
+   `_record_oos_equity_history()`가 매 실행마다 일별 평가액을
+   `runtime_state/oos_equity_history.json`에 기록하고, `scripts/track_oos_performance.py`가
+   v2 OOS 시작일(2026-07-22) 이후 실전 성과를 계산합니다. 기본은 broker 평가액만
+   사용하며 `--include-mock`으로 드라이런 평가액 포함이 가능합니다. v1 트랙과는 섞지 않습니다.
+
 1. **PIT 일별 가격·과거 분류 확장:** 이미 수집한 역사적 227종목에 이어 남은
    1,143종목의 상장 기간 OHLCV·NAV를 수집하고, 현재 분류에 없는 227종목의 과거
    자산군·복제방법·시장 분류를 복원.

@@ -1097,6 +1097,77 @@ def _risk_state_fields(
     }
 
 
+OOS_EQUITY_HISTORY_PATH = STATE_DIR / "oos_equity_history.json"
+
+
+def _record_oos_equity_history(
+    trading_date: str, plan: dict[str, Any], run_status: str, run_id: str
+) -> None:
+    """실전(v2 OOS) 추적용 일별 평가액 이력을 기록한다.
+
+    `plan["risk_snapshot"]`은 매 실행마다 재계산된 평가 스냅샷이다(소스는 broker/mock).
+    같은 거래일을 재실행하면 해당 일자의 레코드를 최신 실행 결과로 덮어쓴다.
+    """
+    risk = plan.get("risk_snapshot") or {}
+    if risk.get("current_equity") is None:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    history: dict[str, Any] = {}
+    if OOS_EQUITY_HISTORY_PATH.exists():
+        try:
+            history = json.loads(OOS_EQUITY_HISTORY_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            history = {}
+    if not isinstance(history, dict):
+        history = {}
+
+    positions = []
+    for row in risk.get("positions") or []:
+        positions.append(
+            {
+                "ticker": row.get("ticker", ""),
+                "name": row.get("name", ""),
+                "qty": int(row.get("qty", 0) or 0),
+                "price": float(row.get("price", 0.0) or 0.0),
+                "market_value": float(row.get("market_value", 0.0) or 0.0),
+                "weight": float(row.get("weight", 0.0) or 0.0),
+            }
+        )
+
+    history[trading_date] = {
+        "date": trading_date,
+        "run_id": run_id,
+        "status": run_status,
+        "source": risk.get("source", ""),
+        "risk_on": plan.get("risk_on"),
+        "rebalance_due": plan.get("rebalance_due"),
+        "current_equity": float(risk["current_equity"]),
+        "peak_equity": (
+            float(risk["peak_equity"])
+            if risk.get("peak_equity") is not None
+            else None
+        ),
+        "current_drawdown": (
+            float(risk["current_drawdown"])
+            if risk.get("current_drawdown") is not None
+            else None
+        ),
+        "cash": float(risk.get("cash", 0.0) or 0.0),
+        "cash_weight": (
+            float(risk["cash_weight"])
+            if risk.get("cash_weight") is not None
+            else None
+        ),
+        "positions": positions,
+    }
+    try:
+        OOS_EQUITY_HISTORY_PATH.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.info(f"⚠️ OOS 평가 이력 저장 실패: {exc}")
+
+
 def _build_plan(
     config: RunnerConfig,
     api: Any | None,
@@ -2058,6 +2129,7 @@ def run_daily() -> None:
             **_risk_state_fields(plan, state),
         }
         _save_state(new_state)
+        _record_oos_equity_history(today, plan, "NO_ACTION", run_id)
         logger.info("[완료] 오늘은 실행할 주문이 없습니다.")
         if cfg.enable_live_order and api is not None and TelegramNotifier is not None:
             try:
@@ -2496,6 +2568,10 @@ def run_daily() -> None:
         **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
+    try:
+        _record_oos_equity_history(today, plan, run_status, run_id)
+    except Exception as exc:
+        logger.info(f"⚠️ OOS 평가 이력 기록 중 오류: {exc}")
     try:
         _append_execution_log(executed_orders, run_id, today)
     except Exception as exc:
