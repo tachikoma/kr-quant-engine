@@ -88,21 +88,6 @@ class KiwoomAdapter:
         self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", str(_default_interval)))
         # Retry delay unified with throttle interval (same value)
         self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))
-        self.http_debug_response = os.environ.get("KIWOOM_HTTP_DEBUG_RESPONSE", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        }
-        self.http_debug_body = os.environ.get("KIWOOM_HTTP_DEBUG_BODY", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        }
-        self.http_debug_body_limit = int(os.environ.get("KIWOOM_HTTP_DEBUG_BODY_LIMIT", "800"))
         # 스레드 간 호출 간격 예약/동기화를 위한 락과 마지막 예약 타임스탬프
         self._throttle_lock = threading.Lock()
         self._last_request_ts = 0.0
@@ -149,30 +134,26 @@ class KiwoomAdapter:
             except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
-                    if self.http_debug_response:
-                        logger.debug(
-                            "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
-                            type(e).__name__,
-                            delay,
-                            attempt + 1,
-                            self.http_max_retries,
-                        )
+                    logger.debug(
+                        "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
+                        type(e).__name__,
+                        delay,
+                        attempt + 1,
+                        self.http_max_retries,
+                    )
                     time.sleep(delay)
                     continue
                 raise RuntimeError(f"HTTP request failed (network error): {token_url}") from e
             with self._throttle_lock:
                 self._last_request_ts = time.monotonic()
 
-            if self.http_debug_response:
-                logger.debug(
-                    "[HTTP] POST %s api-id=%s status=%s",
-                    token_endpoint,
-                    token_api_id,
-                    response.status_code,
-                )
-                if self.http_debug_body:
-                    body_text = response.text[: max(self.http_debug_body_limit, 0)]
-                    logger.debug("[HTTP] response(body): %s", body_text)
+            logger.debug(
+                "[HTTP] POST %s api-id=%s status=%s",
+                token_endpoint,
+                token_api_id,
+                response.status_code,
+            )
+            logger.debug("[HTTP] response(body): %s", response.text)
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
@@ -197,8 +178,7 @@ class KiwoomAdapter:
             # 토큰 발급 rate-limit 감지 (body-level) — 60초 대기 후 1회 retry
             if self._is_api_rate_limited(data) and not token_rate_limited:
                 token_rate_limited = True
-                if self.http_debug_response:
-                    logger.debug("[HTTP][재시도] 토큰 발급 rate-limit 감지, 60초 대기 후 재시도...")
+                logger.debug("[HTTP][재시도] 토큰 발급 rate-limit 감지, 60초 대기 후 재시도...")
                 time.sleep(60)
                 continue
 
@@ -338,14 +318,13 @@ class KiwoomAdapter:
             except (requests.ConnectionError, requests.Timeout) as e:
                 if attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
-                    if self.http_debug_response:
-                        logger.debug(
-                            "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
-                            type(e).__name__,
-                            delay,
-                            attempt + 1,
-                            self.http_max_retries,
-                        )
+                    logger.debug(
+                        "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
+                        type(e).__name__,
+                        delay,
+                        attempt + 1,
+                        self.http_max_retries,
+                    )
                     time.sleep(delay)
                     # retry delay counts toward throttle interval (no separate timestamp update)
                     continue
@@ -354,17 +333,14 @@ class KiwoomAdapter:
             with self._throttle_lock:
                 self._last_request_ts = time.monotonic()
 
-            if self.http_debug_response:
-                logger.debug(
-                    "[HTTP] POST %s api-id=%s status=%s request=%s",
-                    endpoint,
-                    api_id or "",
-                    response.status_code,
-                    payload,
-                )
-                if self.http_debug_body:
-                    body_text = response.text[: max(self.http_debug_body_limit, 0)]
-                    logger.debug("[HTTP] response(body): %s", body_text)
+            logger.debug(
+                "[HTTP] POST %s api-id=%s status=%s request=%s",
+                endpoint,
+                api_id or "",
+                response.status_code,
+                payload,
+            )
+            logger.debug("[HTTP] response(body): %s", response.text)
 
             if response.status_code == 429 and attempt < self.http_max_retries:
                 time.sleep(self._retry_delay(response))
@@ -374,8 +350,7 @@ class KiwoomAdapter:
             # 401 auth-failure — invalidate + re-issue + retry once
             if response.status_code == 401 and not auth_retried:
                 auth_retried = True
-                if self.http_debug_response:
-                    logger.debug("[HTTP][재시도] 인증 실패 (401), 토큰 재발급 후 재시도...")
+                logger.debug("[HTTP][재시도] 인증 실패 (401), 토큰 재발급 후 재시도...")
                 self.invalidate_token()
                 self._ensure_token_valid()
                 continue
@@ -389,15 +364,14 @@ class KiwoomAdapter:
             # 키움은 HTTP 200이어도 return_code로 API 제한(예: 5)을 내려줄 수 있다.
             if self._is_api_rate_limited(data) and attempt < self.http_max_retries:
                 wait_sec = max(0.0, self.http_retry_delay)
-                if self.http_debug_response:
-                    code = data.get("return_code")
-                    msg = str(data.get("return_msg", "")).strip()
-                    logger.debug(
-                        "[HTTP][재시도] API 제한 감지(return_code=%s, return_msg=%s) -> %.1f초 대기 후 재시도",
-                        code,
-                        msg,
-                        wait_sec,
-                    )
+                code = data.get("return_code")
+                msg = str(data.get("return_msg", "")).strip()
+                logger.debug(
+                    "[HTTP][재시도] API 제한 감지(return_code=%s, return_msg=%s) -> %.1f초 대기 후 재시도",
+                    code,
+                    msg,
+                    wait_sec,
+                )
                 time.sleep(wait_sec)
                 # retry delay counts toward throttle interval (no separate timestamp update)
                 continue
