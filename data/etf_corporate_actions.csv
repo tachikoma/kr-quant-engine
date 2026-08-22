@@ -1,0 +1,1 @@
+event_id,ticker,event_type,event_date,record_date,ex_date,payment_date,settlement_date,ratio_num,ratio_den,cash_amount,currency,source_document_id,source_document,source_url,source_sha256,notes

@@ -32,12 +32,12 @@ def load_dotenv() -> None:
 
 load_dotenv()
 
+import etf_shared
 from config_utils import parse_fraction_env, parse_pct_env
 from etf_distributions import distributions_file_sha256, distributions_path
 from etf_shared import (
     ETF_DEVIATION_THRESHOLD_BY_GROUP,
     ETF_DEVIATION_THRESHOLD_BY_TICKER,
-    ETF_LIST,
     ETF_MAX_POSITIONS,
     ETF_SELL_RANK_BUFFER,
     ETF_TICKER_GROUPS,
@@ -45,18 +45,17 @@ from etf_shared import (
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     TAXABLE_ETF_TICKERS,
-    UNIVERSE_MODE,
-    _UNIVERSE_BUILD_RESULT,
     get_strategy_config,
 )
 from strategy_freeze import canonical_payload, diff_payloads, load_frozen_strategy
 
 
 def current_strategy_payload() -> dict:
+    etf_shared.ensure_universe_initialized()
     cfg = get_strategy_config()
     payload: dict = {
-        "universe_mode": UNIVERSE_MODE,
-        "universe": list(ETF_LIST),
+        "universe_mode": etf_shared.UNIVERSE_MODE,
+        "universe": list(etf_shared.ETF_LIST),
         "parameters": {
             "return_basis": cfg.get("return_basis", "price"),
             "distributions_file": str(distributions_path()),
@@ -102,9 +101,10 @@ def current_strategy_payload() -> dict:
         "group_risk_override": sorted(GROUP_RISK_OVERRIDE),
         "taxable_tickers": sorted(TAXABLE_ETF_TICKERS),
     }
-    if UNIVERSE_MODE == "auto" and _UNIVERSE_BUILD_RESULT is not None:
-        payload["universe_config"] = _UNIVERSE_BUILD_RESULT.config.to_dict()
-        payload["universe_sha256"] = _UNIVERSE_BUILD_RESULT.universe_sha256
+    universe_result = etf_shared._UNIVERSE_BUILD_RESULT
+    if etf_shared.UNIVERSE_MODE == "auto" and universe_result is not None:
+        payload["universe_config"] = universe_result.config.to_dict()
+        payload["universe_sha256"] = universe_result.universe_sha256
     return payload
 
 

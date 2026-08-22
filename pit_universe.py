@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pandas as pd
-
 
 RAW_COLUMN_MAP = {
     "ISU_SRT_CD": "ticker",
@@ -216,15 +216,15 @@ def validate_snapshot_panel(
     last_tickers = set(normalized.loc[normalized["snapshot_date"] == last_date, "ticker"])
     all_tickers = set(normalized["ticker"])
     return {
-        "snapshot_count": int(len(counts)),
-        "row_count": int(len(normalized)),
-        "unique_ticker_count": int(len(all_tickers)),
+        "snapshot_count": len(counts),
+        "row_count": len(normalized),
+        "unique_ticker_count": len(all_tickers),
         "first_snapshot_date": str(first_date.date()),
         "last_snapshot_date": str(last_date.date()),
-        "first_snapshot_ticker_count": int(len(first_tickers)),
-        "last_snapshot_ticker_count": int(len(last_tickers)),
-        "observed_then_absent_count": int(len(all_tickers - last_tickers)),
-        "entered_after_first_count": int(len(all_tickers - first_tickers)),
+        "first_snapshot_ticker_count": len(first_tickers),
+        "last_snapshot_ticker_count": len(last_tickers),
+        "observed_then_absent_count": len(all_tickers - last_tickers),
+        "entered_after_first_count": len(all_tickers - first_tickers),
         "min_snapshot_ticker_count": int(counts.min()),
         "max_snapshot_ticker_count": int(counts.max()),
         "missing_dates": missing_dates,
@@ -285,11 +285,10 @@ def load_cached_snapshot_files(paths: list[Path]) -> pd.DataFrame:
 
 
 def build_membership_intervals(panel: pd.DataFrame) -> pd.DataFrame:
-    """PIT membership을 ticker별 관찰 기간 구간으로 변환한다.
+    """Legacy diagnostic interval view; never use this for PIT eligibility.
 
-    각 ticker가 스냅샷에 처음 나타난 날(first_observed)부터 마지막으로 나타난
-    날(last_observed)까지를 membership 구간으로 본다. 스냅샷은 리밸런싱 시점이므로
-    구간 안의 모든 날짜에 해당 ticker가 후보로 존재했던 것으로 해석한다.
+    This preserves a descriptive compatibility helper while the eligibility path
+    uses :func:`latest_snapshot_as_of` exclusively.
 
     Returns
     -------
@@ -305,6 +304,234 @@ def build_membership_intervals(panel: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     return intervals.sort_values("first_observed")
+
+
+def _normalize_membership_rows(panel: pd.DataFrame) -> pd.DataFrame:
+    required = {"snapshot_date", "ticker"}
+    if panel.empty:
+        return pd.DataFrame(columns=["snapshot_date", "ticker"])
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"PIT membership 필수 컬럼 누락: {sorted(missing)}")
+    work = panel[["snapshot_date", "ticker"]].copy()
+    work["snapshot_date"] = pd.to_datetime(work["snapshot_date"], errors="coerce")
+    work["ticker"] = work["ticker"].astype(str).str.strip()
+    if work["snapshot_date"].isna().any() or work["ticker"].eq("").any():
+        raise ValueError("PIT membership에 유효하지 않은 snapshot_date 또는 ticker가 있습니다.")
+    return work.sort_values(["snapshot_date", "ticker"]).reset_index(drop=True)
+
+
+def latest_snapshot_as_of(panel: pd.DataFrame, as_of_date: str | pd.Timestamp) -> pd.DataFrame:
+    """``as_of_date`` 이전 또는 당일의 최신 snapshot 행만 반환한다.
+
+    첫 snapshot 이전에는 빈 DataFrame을 반환해 PIT eligibility를 fail-closed 한다.
+    이후 snapshot의 membership은 현재 날짜로 소급하지 않으며, 미래 snapshot 행은
+    membership 선택에 사용하지 않는다.
+    """
+    normalized = _normalize_membership_rows(panel)
+    as_of = pd.Timestamp(as_of_date)
+    if normalized.empty:
+        return normalized
+    eligible_dates = normalized.loc[normalized["snapshot_date"] <= as_of, "snapshot_date"]
+    if eligible_dates.empty:
+        return normalized.iloc[0:0].copy()
+    latest_date = eligible_dates.max()
+    return normalized[normalized["snapshot_date"] == latest_date].reset_index(drop=True)
+
+
+def membership_as_of(
+    panel: pd.DataFrame, as_of_date: str | pd.Timestamp
+) -> set[str]:
+    """Return the ticker membership from the latest snapshot available as of a date."""
+    return set(latest_snapshot_as_of(panel, as_of_date)["ticker"].astype(str))
+
+
+def _preflight_diagnostic(
+    category: str,
+    *,
+    date: pd.Timestamp | None = None,
+    ticker: str | None = None,
+    detail: str,
+) -> dict[str, str | None]:
+    return {
+        "category": category,
+        "date": None if date is None else date.strftime("%Y-%m-%d"),
+        "ticker": ticker,
+        "detail": detail,
+    }
+
+
+def _raise_preflight_failure(diagnostics: list[dict[str, str | None]]) -> None:
+    lines = ["PIT strict preflight failed:"]
+    for item in diagnostics:
+        lines.append(
+            "  [{category}] date={date} ticker={ticker}: {detail}".format(**item)
+        )
+    raise ValueError("\n".join(lines))
+
+
+def validate_pit_preflight(
+    panel: pd.DataFrame,
+    price: pd.DataFrame,
+    trading_dates: Sequence[str | pd.Timestamp],
+    ticker_groups: Mapping[str, str] | None,
+    *,
+    decision_dates: Sequence[str | pd.Timestamp] | None = None,
+    max_snapshot_age_trading_dates: int = 25,
+    allowed_groups: set[str] | None = None,
+    historical_classification_tax_verified: bool = False,
+) -> dict[str, object]:
+    """Run strict PIT-only membership, price, group, and history preflight.
+
+    ``historical_classification_tax_verified`` is intentionally false by default:
+    current or inferred-restored labels are not evidence of historical validity.
+    It is an explicit seam for future effective-dated source validation and for
+    deterministic synthetic coverage tests; the production PIT caller leaves it
+    false until that source exists.
+    """
+    if max_snapshot_age_trading_dates < 0:
+        raise ValueError("max_snapshot_age_trading_dates는 0 이상이어야 합니다.")
+    allowed = allowed_groups if allowed_groups is not None else {
+        "domestic_equity",
+        "foreign_investment",
+        "commodity",
+    }
+    calendar = pd.Index(pd.to_datetime(list(trading_dates), errors="coerce"))
+    calendar = pd.Index(calendar.dropna().drop_duplicates().sort_values())
+    dates = decision_dates if decision_dates is not None else price.get("date", [])
+    decision_index = pd.Index(pd.to_datetime(list(dates), errors="coerce"))
+    decision_index = pd.Index(decision_index.dropna().drop_duplicates().sort_values())
+    if calendar.empty:
+        raise ValueError("PIT strict preflight에 거래일 calendar가 없습니다.")
+
+    price_required = {"date", "ticker", "close"}
+    missing_price_columns = price_required - set(price.columns)
+    if missing_price_columns:
+        raise ValueError(f"PIT price coverage 필수 컬럼 누락: {sorted(missing_price_columns)}")
+    price_work = price[["date", "ticker", "close"]].copy()
+    price_work["date"] = pd.to_datetime(price_work["date"], errors="coerce")
+    price_work["ticker"] = price_work["ticker"].astype(str).str.strip()
+    close = pd.to_numeric(price_work["close"], errors="coerce")
+    usable = close.notna() & close.gt(0) & ~close.isin([float("inf"), float("-inf")])
+    price_work = price_work.loc[usable]
+    price_by_date = {
+        date: set(group["ticker"])
+        for date, group in price_work.groupby("date", sort=True)
+    }
+
+    diagnostics: list[dict[str, str | None]] = []
+    if not historical_classification_tax_verified:
+        diagnostics.append(
+            _preflight_diagnostic(
+                "historical classification/tax coverage unverified",
+                detail=(
+                    "effective-dated historical classification and tax source is required; "
+                    "current/restored labels cannot approve PIT"
+                ),
+            )
+        )
+
+    normalized_panel = _normalize_membership_rows(panel)
+    snapshot_dates = pd.Index(normalized_panel["snapshot_date"].drop_duplicates().sort_values())
+    groups = {str(ticker): str(group) for ticker, group in (ticker_groups or {}).items()}
+    snapshot_report: dict[str, str] = {}
+    for date in decision_index:
+        if date not in calendar:
+            diagnostics.append(
+                _preflight_diagnostic(
+                    "decision date missing from trading calendar",
+                    date=date,
+                    detail="supply the complete sorted trading-date calendar",
+                )
+            )
+            continue
+        prior = snapshot_dates[snapshot_dates <= date]
+        if prior.empty:
+            diagnostics.append(
+                _preflight_diagnostic(
+                    "missing snapshot",
+                    date=date,
+                    detail=(
+                        "no snapshot_date <= decision date; eligibility is empty before "
+                        "the first snapshot"
+                    ),
+                )
+            )
+            continue
+        latest_date = pd.Timestamp(prior.max())
+        snapshot_report[date.strftime("%Y-%m-%d")] = latest_date.strftime("%Y-%m-%d")
+        if latest_date not in calendar:
+            diagnostics.append(
+                _preflight_diagnostic(
+                    "snapshot date missing from trading calendar",
+                    date=date,
+                    detail=(
+                        f"latest snapshot={latest_date.date()} is not an exact member "
+                        "of the supplied trading-date calendar"
+                    ),
+                )
+            )
+            continue
+        decision_position = int(calendar.get_loc(date))
+        snapshot_position = int(calendar.get_loc(latest_date))
+        age = decision_position - snapshot_position
+        if age > max_snapshot_age_trading_dates:
+            diagnostics.append(
+                _preflight_diagnostic(
+                    "snapshot age exceeds limit",
+                    date=date,
+                    detail=(
+                        f"latest snapshot={latest_date.date()}, age={age} trading dates, "
+                        f"limit={max_snapshot_age_trading_dates}"
+                    ),
+                )
+            )
+
+        expected = set(
+            normalized_panel.loc[normalized_panel["snapshot_date"] == latest_date, "ticker"]
+        )
+        usable_tickers = price_by_date.get(date, set())
+        for ticker in sorted(expected - usable_tickers):
+            diagnostics.append(
+                _preflight_diagnostic(
+                    "missing usable price coverage",
+                    date=date,
+                    ticker=ticker,
+                    detail="expected as-of eligible ticker has no positive finite close",
+                )
+            )
+        for ticker in sorted(expected):
+            group = groups.get(ticker)
+            if not group:
+                diagnostics.append(
+                    _preflight_diagnostic(
+                        "missing group coverage",
+                        date=date,
+                        ticker=ticker,
+                        detail="ticker is absent from the PIT group mapping",
+                    )
+                )
+            elif group not in allowed:
+                diagnostics.append(
+                    _preflight_diagnostic(
+                        "unknown group coverage",
+                        date=date,
+                        ticker=ticker,
+                        detail=f"group={group!r}, allowed={sorted(allowed)}",
+                    )
+                )
+
+    if diagnostics:
+        _raise_preflight_failure(diagnostics)
+    return {
+        "status": "passed",
+        "decision_date_count": len(decision_index),
+        "max_snapshot_age_trading_dates": int(max_snapshot_age_trading_dates),
+        "as_of_snapshot_dates": snapshot_report,
+        "historical_classification_tax_verified": bool(
+            historical_classification_tax_verified
+        ),
+    }
 
 
 def build_pit_ticker_groups(
@@ -359,32 +586,28 @@ def add_pit_membership_flag(
 ) -> pd.DataFrame:
     """가격 데이터에 as-of PIT membership 플래그 ``pit_membership_ok``를 추가한다.
 
-    가격 데이터의 각 (date, ticker) 행이 해당 시점에 리밸런싱 후보로 존재했는지를
-    PIT 스냅샷의 ticker별 관찰 구간(first_observed~last_observed)으로 판정한다.
+    각 가격일에는 해당 날짜 이전의 최신 snapshot membership만 적용한다. 첫
+    snapshot 이전과 빈 panel은 fail-closed로 ``False``를 반환한다.
     """
     price = price.copy()
     work = price[["date", "ticker"]].copy()
-    work["date"] = pd.to_datetime(work["date"])
-    work["ticker"] = work["ticker"].astype(str)
-
-    intervals = build_membership_intervals(panel)
-    if intervals.empty:
-        price["pit_membership_ok"] = True
-        return price
-
-    intervals["first_observed"] = pd.to_datetime(intervals["first_observed"])
-    intervals["last_observed"] = pd.to_datetime(intervals["last_observed"])
-
-    merged = work.merge(
-        intervals, on="ticker", how="left"
-    )
-    merged["first_observed"] = pd.to_datetime(merged["first_observed"])
-    merged["last_observed"] = pd.to_datetime(merged["last_observed"])
-    in_interval = (
-        merged["first_observed"].notna()
-        & merged["last_observed"].notna()
-        & (merged["date"] >= merged["first_observed"])
-        & (merged["date"] <= merged["last_observed"])
-    )
-    price["pit_membership_ok"] = in_interval.fillna(False).astype(bool)
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["ticker"] = work["ticker"].astype(str).str.strip()
+    normalized = _normalize_membership_rows(panel)
+    snapshot_dates = pd.Index(normalized["snapshot_date"].drop_duplicates().sort_values())
+    memberships = {
+        date: set(group["ticker"])
+        for date, group in normalized.groupby("snapshot_date", sort=True)
+    }
+    flags = []
+    for row in work.itertuples(index=False):
+        if pd.isna(row.date):
+            flags.append(False)
+            continue
+        prior = snapshot_dates[snapshot_dates <= row.date]
+        if prior.empty:
+            flags.append(False)
+            continue
+        flags.append(row.ticker in memberships[pd.Timestamp(prior.max())])
+    price["pit_membership_ok"] = pd.Series(flags, index=price.index, dtype=bool)
     return price

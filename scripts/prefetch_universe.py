@@ -121,22 +121,26 @@ def main() -> None:
 
     _load_env()
 
-    from etf_shared import ETF_LIST, UNIVERSE_MODE
+    import etf_shared
     from pykrx_utils import get_listing_dates
 
-    print(f"[prefetch] UNIVERSE_MODE={UNIVERSE_MODE}")
-    print(f"[prefetch] ETF_LIST: {len(ETF_LIST)}종목")
+    if etf_shared.UNIVERSE_MODE == "auto":
+        etf_shared.ensure_universe_initialized()
+    universe = list(etf_shared.ETF_LIST)
+
+    print(f"[prefetch] UNIVERSE_MODE={etf_shared.UNIVERSE_MODE}")
+    print(f"[prefetch] ETF_LIST: {len(universe)}종목")
 
     # 캐시 현황 파악
     cache_dir = _ROOT / "data_cache"
     cached_tickers = set()
     if cache_dir.exists():
-        universe_set = set(ETF_LIST)
+        universe_set = set(universe)
         for f in cache_dir.glob("*.parquet"):
             if f.stem in universe_set:
                 cached_tickers.add(f.stem)
 
-    to_fetch = [t for t in ETF_LIST if t not in cached_tickers]
+    to_fetch = [t for t in universe if t not in cached_tickers]
     print(f"[prefetch] 캐시 보유: {len(cached_tickers)}종목, 미수집: {len(to_fetch)}종목")
 
     if args.dry_run:
@@ -149,7 +153,7 @@ def main() -> None:
 
     # 상장일 조회
     print("[prefetch] 상장일 데이터 로드 중...")
-    listing_dates = get_listing_dates(ticker_subset=set(ETF_LIST))
+    listing_dates = get_listing_dates(ticker_subset=set(universe))
     print(f"[prefetch] 상장일 로드 완료: {len(listing_dates)}종목")
 
     # multiprocessing 인자 준비

@@ -4,6 +4,9 @@
 
 현재 운영 기준은 ETF 전용 시나리오이며, 실행 기준 스크립트는 run_etf_backtest.py 입니다.
 
+구현된 무결성 보호장치와 승인 전 blocker의 canonical 상태는
+[`DOCS/BACKTEST_INTEGRITY.md`](DOCS/BACKTEST_INTEGRITY.md)를 참고하세요.
+
 ## 현재 운영 방향
 
 - 주 실행 경로: run_etf_backtest.py
@@ -31,6 +34,44 @@ CLI 인자:
 - `--start`, `-s`: 백테스트 시작일 (기본: 20160101)
 - `--end`, `-e`: 백테스트 종료일 (기본: 오늘)
 - `--mode`, `-m`: 실행 모드 (기본: single, env `ETF_BACKTEST_MODE`보다 우선)
+
+OHLCV capacity는 기본 legacy 경로와 분리된 진단 전용 시나리오입니다. AUM별로
+독립 실행하며 `outputs_execution/` 아래에만 산출물을 기록합니다.
+
+```bash
+uv run python run_etf_backtest.py --mode single \
+  --execution-mode ohlcv_capacity \
+  --execution-participation-rate 0.05 \
+  --execution-aum 10000000,100000000,1000000000 \
+  --execution-output-dir outputs_execution
+```
+
+`execution_summary.csv`, `execution_diagnostics.csv`, `execution_trades.csv`,
+`execution_reconciliation.csv`, `execution_metadata.json`이 생성됩니다. 이는
+실제 체결이나 주문 제출의 증거가 아니며, order book을 사용하지 않는 OHLCV
+capacity 민감도 분석입니다. summary는 요청/용량/가정 filled 수량, diagnostics는
+capacity·carry·취소 사유, trades는 scenario 회계 반영 trade, reconciliation은
+현금·보유수량 검산을 담습니다. metadata는 `diagnostic_only=true`,
+`executable_fill_claim=false`, `orderbook_used=false`를 표시합니다. 출력은 staging
+후 directory swap/rollback으로 교체되어 실패 시 기존 리포트를 보존합니다.
+`outputs_etf_only/` 및 `outputs_approval/`과 겹치는 출력 경로는 거부되며,
+`--approval-strict`와 함께 사용할 수 없습니다. 한계와 승인 경계는
+[`DOCS/EXECUTION_CAPACITY.md`](DOCS/EXECUTION_CAPACITY.md) 및
+[`DOCS/BACKTEST_INTEGRITY.md`](DOCS/BACKTEST_INTEGRITY.md)를 참고하세요.
+
+승인용 corporate-action strict 실행은 별도 산출물 경로를 사용합니다.
+체크인된 ledger/manifest는 의도적으로 불완전하므로 실행이 차단됩니다.
+
+```bash
+uv run python run_etf_backtest.py --approval-strict --mode single \
+  --corporate-actions-ledger data/etf_corporate_actions.csv \
+  --corporate-actions-manifest data/etf_corporate_actions_manifest.json \
+  --approval-output-dir outputs_approval
+```
+
+차단 시 `outputs_approval/`에는 승인 리포트, blocker CSV, 재현성 메타데이터만
+기록되며 `outputs_etf_only/`는 변경하지 않습니다. 자세한 ledger 계약은
+[`DOCS/CORPORATE_ACTIONS.md`](DOCS/CORPORATE_ACTIONS.md)를 참고하세요.
 
 1. ETF 하루 1회 실행 러너(기본 안전모드)
 
