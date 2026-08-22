@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
 import run_etf_backtest as rtb
 from config_utils import parse_fraction_env, parse_pct_env
 
-
 OUTPUT_DIR = ROOT / "outputs_walk_forward"
 
 
@@ -58,12 +57,40 @@ def parse_int_list(name: str, default: list[int]) -> list[int]:
 
 
 def slice_stats(curve: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict | None:
-    sample = curve[(curve["date"] >= start) & (curve["date"] <= end)][
-        ["date", "equity"]
-    ]
+    sample = curve[(curve["date"] >= start) & (curve["date"] <= end)][["date", "equity"]]
     if len(sample) < 2:
         return None
     return rtb.calc_stats(sample, "equity")
+
+
+def phase_offset(start_index: int, warmup_days: int, step_days: int) -> int:
+    """Return the phase needed to continue a full-period schedule."""
+    if step_days <= 0:
+        raise ValueError("step_days must be positive")
+    return (int(start_index) - int(warmup_days)) % int(step_days)
+
+
+def stitch_state_based_segment(
+    segment_equity: pd.Series | list[float],
+    *,
+    prior_end_equity: float | None = None,
+    first_segment_anchor_equity: float | None = None,
+) -> list[float]:
+    """Convert an absolute state-based segment into returns for stitching."""
+    values = pd.Series(segment_equity, dtype=float).reset_index(drop=True)
+    if values.empty:
+        return []
+    if prior_end_equity is not None:
+        anchor_equity = float(prior_end_equity)
+    elif first_segment_anchor_equity is not None:
+        anchor_equity = float(first_segment_anchor_equity)
+    else:
+        return values.pct_change().fillna(0.0).tolist()
+    if not np.isfinite(anchor_equity) or anchor_equity <= 0:
+        raise ValueError("segment equity anchor must be finite and positive")
+    returns = [float(values.iloc[0] / anchor_equity - 1.0)]
+    returns.extend(float(values.iloc[i] / values.iloc[i - 1] - 1.0) for i in range(1, len(values)))
+    return returns
 
 
 def build_folds(
@@ -158,9 +185,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     )
     exit_check_days = int(os.environ.get("WF_EXIT_CHECK_DAYS", "0"))
     trailing_stop_pct = parse_fraction_env("WF_TRAILING_STOP_PCT", 0.0)
-    portfolio_trailing_stop_pct = parse_fraction_env(
-        "WF_PORTFOLIO_TRAILING_STOP_PCT", 0.0
-    )
+    portfolio_trailing_stop_pct = parse_fraction_env("WF_PORTFOLIO_TRAILING_STOP_PCT", 0.0)
     if exit_check_days < 0:
         raise ValueError("WF_EXIT_CHECK_DAYS는 0 이상이어야 합니다.")
     if min(train_years, test_years, step_years) <= 0:
@@ -232,6 +257,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     stitched_rows = []
     stitched_equity = float(rtb.INITIAL_CASH)
     carry_state: dict | None = None
+    previous_segment_final_equity: float | None = None
     for fold in folds:
         candidates = []
         for (rebalance, positions), curve in scenario_curves.items():
@@ -256,6 +282,14 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         rtb.REBALANCE_STEP_DAYS = selected_key[0]
 
         if state_based:
+            prior_carry_state = carry_state
+            prior_end_equity: float | None = None
+            if prior_carry_state is not None:
+                candidate_equity = prior_carry_state.get("final_equity")
+                if candidate_equity is not None and np.isfinite(float(candidate_equity)):
+                    prior_end_equity = float(candidate_equity)
+                else:
+                    prior_end_equity = previous_segment_final_equity
             test_start_ts = pd.Timestamp(fold["test_start"])
             test_end_ts = pd.Timestamp(fold["test_end"])
             start_index = next(
@@ -269,12 +303,12 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             else:
                 segment_dates = [d for d in full_dates if test_start_ts <= d <= test_end_ts]
                 run_state = dict(carry_state)
-                run_state["rebalance_phase_offset"] = (
-                    (start_index - warmup_full) % selected_key[0]
+                run_state["rebalance_phase_offset"] = phase_offset(
+                    start_index, warmup_full, selected_key[0]
                 )
                 if exit_check_days > 0:
-                    run_state["exit_phase_offset"] = (
-                        (start_index - warmup_full) % exit_check_days
+                    run_state["exit_phase_offset"] = phase_offset(
+                        start_index, warmup_full, exit_check_days
                     )
             curve, _, end_state = rtb.run_etf_strategy(
                 rtb.INITIAL_CASH,
@@ -298,10 +332,18 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                 return_final_state=True,
             )
             curve["date"] = pd.to_datetime(curve["date"])
-            test = curve[
-                (curve["date"] >= test_start_ts) & (curve["date"] <= test_end_ts)
-            ].copy()
+            test = curve[(curve["date"] >= test_start_ts) & (curve["date"] <= test_end_ts)].copy()
             carry_state = end_state
+            final_equity = end_state.get("final_equity")
+            if (
+                (final_equity is None or not np.isfinite(float(final_equity)))
+                and not curve.empty
+                and "equity" in curve.columns
+            ):
+                final_equity = float(curve["equity"].iloc[-1])
+            previous_segment_final_equity = (
+                float(final_equity) if final_equity is not None else None
+            )
         else:
             selected_curve = scenario_curves[selected_key].copy()
             selected_curve["daily_return"] = selected_curve["equity"].pct_change()
@@ -321,31 +363,22 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             seg_equity = pd.Series(
                 [float(row.equity) for row in test.itertuples(index=False)], dtype=float
             )
-            if carry_state is None:
+            if prior_carry_state is None:
                 # 폴드 1: 전체 curve에서 test_start 직전 행을 앵커로 삼아 경계 수익률 유지
                 full_curve_sorted = curve.sort_values("date").reset_index(drop=True)
-                anchor_rows = full_curve_sorted[
-                    full_curve_sorted["date"] < test_start_ts
-                ]
+                anchor_rows = full_curve_sorted[full_curve_sorted["date"] < test_start_ts]
                 if not anchor_rows.empty:
                     anchor_equity = float(anchor_rows["equity"].iloc[-1])
-                    seg_returns = (
-                        seg_equity / anchor_equity
-                    ).tolist()  # anchor→각 행의 누적, 이후 pct로 변환
-                    seg_returns = [
-                        seg_returns[0] - 1,
-                        *[
-                            seg_returns[i] / seg_returns[i - 1] - 1
-                            for i in range(1, len(seg_returns))
-                        ],
-                    ]
+                    seg_returns = stitch_state_based_segment(
+                        seg_equity, first_segment_anchor_equity=anchor_equity
+                    )
                 else:
-                    seg_returns = seg_equity.pct_change().fillna(0.0).tolist()
+                    seg_returns = stitch_state_based_segment(seg_equity)
             else:
-                seg_returns = seg_equity.pct_change().fillna(0.0).tolist()
-            for (row, seg_return) in zip(
-                test.itertuples(index=False), seg_returns, strict=False
-            ):
+                seg_returns = stitch_state_based_segment(
+                    seg_equity, prior_end_equity=prior_end_equity
+                )
+            for row, seg_return in zip(test.itertuples(index=False), seg_returns, strict=False):
                 stitched_equity *= 1 + float(seg_return)
                 stitched_rows.append(
                     {
@@ -386,7 +419,10 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         test_stats = rtb.calc_stats(fold_curve, "equity")
         fold_rows.append(
             {
-                **{key: str(value.date()) if isinstance(value, pd.Timestamp) else value for key, value in fold.items()},
+                **{
+                    key: str(value.date()) if isinstance(value, pd.Timestamp) else value
+                    for key, value in fold.items()
+                },
                 **selected,
                 "test_total_return": float(test_stats["total_return"]),
                 "test_cagr": float(test_stats["cagr"]),
@@ -401,9 +437,7 @@ def run_validation() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     stitched_df = pd.DataFrame(stitched_rows)
     if stitched_df.empty:
         raise RuntimeError("walk-forward 표본외 수익률을 생성하지 못했습니다.")
-    baseline = pd.DataFrame(
-        [{"date": folds[0]["train_end"], "equity": float(rtb.INITIAL_CASH)}]
-    )
+    baseline = pd.DataFrame([{"date": folds[0]["train_end"], "equity": float(rtb.INITIAL_CASH)}])
     overall_curve = pd.concat([baseline, stitched_df[["date", "equity"]]], ignore_index=True)
     overall_stats = rtb.calc_stats(overall_curve, "equity")
     summary = {
@@ -441,9 +475,7 @@ def main() -> None:
     if not output_dir.is_absolute():
         output_dir = ROOT / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    folds_df.to_csv(
-        output_dir / "walk_forward_folds.csv", index=False, encoding="utf-8-sig"
-    )
+    folds_df.to_csv(output_dir / "walk_forward_folds.csv", index=False, encoding="utf-8-sig")
     stitched_df.to_csv(
         output_dir / "walk_forward_equity_curve.csv", index=False, encoding="utf-8-sig"
     )

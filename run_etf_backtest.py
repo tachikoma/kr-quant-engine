@@ -2394,6 +2394,11 @@ def run_etf_strategy(
     if original_ticker_groups is not None:
         _etf_shared.ETF_TICKER_GROUPS = original_ticker_groups
     if return_final_state or approval_strict or execution_mode == "ohlcv_capacity":
+        final_equity = None
+        if not result[0].empty and "equity" in result[0].columns:
+            candidate_final_equity = float(result[0]["equity"].iloc[-1])
+            if np.isfinite(candidate_final_equity) and candidate_final_equity > 0:
+                final_equity = candidate_final_equity
         final_state = {
             "cash": cash,
             "holdings": holdings,
@@ -2403,6 +2408,7 @@ def run_etf_strategy(
             "last_valid_closes": last_valid_closes,
             "rebalance_phase_offset": rebalance_phase_offset,
             "exit_phase_offset": exit_phase_offset,
+            "final_equity": final_equity,
         }
         if approval_strict:
             final_state.update(
