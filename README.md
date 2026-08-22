@@ -311,10 +311,17 @@ uv run scripts/pit_backtest.py                            # PIT 유니버스 백
 `outputs_walk_forward/`에 저장됩니다. 이 분석은 전략 연구용이며 `strategy_freeze.json`의 공식
 표본외 트랙을 대체하지 않습니다.
 
-현재 기본 결과는 6개 fold입니다. 또한 각 파라미터 조합의 전체 기간 곡선에서 fold별
-일별 수익률을 잘라 이어 붙이고 경계 비용을 차감하는 방식입니다. fold 전환 시의 실제 보유 종목,
-현금, 세금 원가 상태를 재현하는 완전한 nested walk-forward는 아니므로 연구용 근사 OOS로
-해석합니다.
+기본 `WF_STATE_BASED=1` 경로는 폴드 경계에서 이전 폴드의 실제 보유/현금/세금 원가를
+이월하고, 각 폴드 첫 수익률을 직전 폴드 종료 equity로 앵커링해 경계 전환 수익률을
+보존합니다. `0`이면 각 파라미터 조합의 전체 기간 곡선에서 fold별 일별 수익률을 잘라
+이어 붙이고 인공 경계 비용을 차감하는 기존 슬라이싱 경로를 사용합니다. 두 방식 모두
+연구용 근사 OOS로 해석합니다.
+
+adaptive(폴드별 재선택) 결과와 frozen(`strategy_freeze.json` 고정 파라미터) OOS는
+절대 하나의 지표로 합치지 않습니다. adaptive 요약은 `policy_type=adaptive_fold_selected`,
+고정 정책 결과는 `fixed_policy_oos_equity_curve.csv`/`fixed_policy_oos_summary.json`
+(`policy_type=frozen_fixed`)으로 분리 저장됩니다. `WF_FIXED_POLICY_OOS=0`이면 고정
+정책 실행을 생략합니다.
 
 - `WF_REBALANCE_DAYS=10,20,30`
 - `WF_MAX_POSITIONS=1,2,3`
@@ -333,6 +340,8 @@ uv run scripts/pit_backtest.py                            # PIT 유니버스 백
 - `WF_EXIT_CHECK_DAYS=0`: OOS trailing exit 점검 주기
 - `WF_TRAILING_STOP_PCT=0`: OOS trailing stop 비율
 - `WF_PORTFOLIO_TRAILING_STOP_PCT=0`: OOS 포트폴리오 trailing stop 비율
+- `WF_FIXED_POLICY_OOS=1`: 실행 말미에 `strategy_freeze.json` 고정 파라미터 전 기간
+  연속 실행 후 OOS 구간만 별도 산출물로 저장. 동결 스냅샷 누락·위조 시 fail-closed
 
 ### 파라미터 주변값 안정성
 

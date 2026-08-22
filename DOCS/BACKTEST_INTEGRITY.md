@@ -14,6 +14,7 @@
 | Phase 1 | 최신 snapshot-as-of PIT membership, 미래 snapshot 차단, 거래일 기반 coverage preflight | static 경로와 분리; historical source 미검증 시 승인 차단 |
 | Phase 2 | manifest-bound 기업행위 ledger, payment-date receivable, split/reverse split, suspension/delisting/settlement lifecycle, strict 출력 격리 | strict 모드에서 blocker가 있으면 성과 산출 안 함 |
 | Phase 3 | OHLCV 참여율, partial/one-day carry, zero-volume·missing-open·suspension·possible-lock 진단, AUM 시나리오, reconciliation, 원자적 출력 교체 | **OHLCV capacity scenario**이며 실제 역사적 체결이 아님 |
+| Phase 4 | state-based 폴드 경계 수익률 앵커링(직전 폴드 종료 equity), frozen 고정 정책 OOS와 adaptive fold-selected OOS 분리 보고(`policy_type` 마커, 별도 산출물) | 구현·오프라인 검증 완료. 실데이터 전 기간 실행 결과는 별도 evidence |
 
 기본 `execution_mode=legacy`와 static 연구 경로는 유지된다. strict/PIT/capacity
 경로는 명시적 opt-in이며 서로의 산출물을 덮어쓰지 않는다.
@@ -99,6 +100,7 @@ uv run python scripts/test_corporate_actions.py
 uv run python scripts/test_execution_realism.py
 uv run python scripts/test_execution_integration.py
 uv run python scripts/test_execution_outputs.py
+uv run python scripts/test_walk_forward_validation.py
 ```
 
 결과 경로는 legacy `outputs_etf_only/`, strict `outputs_approval/`, capacity
@@ -111,8 +113,10 @@ uv run python scripts/test_execution_outputs.py
    `total_return` 및 분배금 포함 성과를 승인 근거로 사용하지 않는다.
 2. 공식 과거 기업행위, effective-dated tax/classification, 상장폐지·정산 원천과
    manifest coverage가 없다. strict corporate-action/PIT은 이를 대체 추정하지 않는다.
-3. WFA는 state-based 경로가 있어도 boundary return 교정과 frozen-policy/adaptive-policy
-   분리 검증이 승인 수준으로 수리되지 않았다. WFA를 공식 OOS/live 확대 근거로 쓰지 않는다.
+3. WFA boundary return 교정과 frozen-policy/adaptive-policy 분리는 구현·게이트
+   승인되었다(`walk_forward_validation.py`, `fixed_policy_oos_*.csv/json`). 다만
+   실데이터 전 기간 실행 결과가 남아 있지 않아, 실행 산출물 확정 전까지 WFA를 공식
+   OOS/live 확대 근거로 쓰지 않는다.
 4. 기존 repository-wide Ruff debt가 남아 있다. 전체 lint 실패를 green으로 보고하지 않는다.
 
 성과 주장·동결 갱신·live 확대 전에는 다음 evidence가 필요하다.
@@ -121,7 +125,9 @@ uv run python scripts/test_execution_outputs.py
 - 모든 기업행위의 공식 document ID/URL/SHA, payment/settlement coverage,
   strict approval blocker 0건의 report
 - Phase 0~3 fixture fresh 결과와 실행 기간, row count, input/config/freeze hash, commit
-- WFA boundary correction 및 frozen/adaptive OOS 정책의 별도 승인
+- WFA boundary correction 및 frozen/adaptive OOS 정책의 별도 승인과 실데이터 실행 산출물
+  (`walk_forward_summary.json`의 `policy_type=adaptive_fold_selected`,
+  `fixed_policy_oos_summary.json`의 `policy_type=frozen_fixed`) 확보
 - 실체결을 주장할 경우 timestamped order book/브로커 주문·체결·취소 기록과
   matching/queue/impact 가정
 
