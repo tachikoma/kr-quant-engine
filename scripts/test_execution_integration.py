@@ -213,6 +213,45 @@ def check_capacity_no_fill() -> None:
     assert state["holdings"] == {}
 
 
+def check_cash_limited_rebalance_buy() -> None:
+    """capacity 승인 매수가 가용 현금을 초과하면 잔량이 취소된다(유령 자본 방지)."""
+    original_build = backtest.build_rebalance_orders
+
+    def inflate_buy_qty(*args, **kwargs):
+        orders = original_build(*args, **kwargs)
+        return [
+            {**order, "qty": int(order["qty"]) * 3} if str(order.get("side")) == "BUY" else order
+            for order in orders
+        ]
+
+    try:
+        backtest.build_rebalance_orders = inflate_buy_qty
+        prices = build_prices([1_000_000.0] * len(DAYS))
+        _, trades, state = run_fixture(prices, execution_mode="ohlcv_capacity")
+    finally:
+        backtest.build_rebalance_orders = original_build
+    buys = trades[trades["side"] == "BUY"]
+    assert not buys.empty
+    limited = [
+        row for row in state["execution_diagnostics"] if row.get("decision") == "CASH_LIMITED"
+    ]
+    assert limited, "cash-limited rebalance BUY must be diagnosed"
+    assert all("CASH_LIMITED_FILL_CANCEL" in row["diagnostic_labels"] for row in limited)
+    # 어떤 주문도 현금을 초과해 체결되지 않는다.
+    total_cost = float(buys["net_value"].sum())
+    assert isclose(state["cash"], 1_000.0 - total_cost, rel_tol=1e-12, abs_tol=1e-9)
+    assert state["cash"] >= 0
+    # diagnostic/trade 수량이 주문 ID 기준으로 일치한다.
+    diag_qty: dict[str, int] = {}
+    for row in state["execution_diagnostics"]:
+        order_id = str(row["execution_order_id"])
+        diag_qty[order_id] = diag_qty.get(order_id, 0) + int(row.get("filled_qty", 0) or 0)
+    for row in trades.to_dict("records"):
+        order_id = str(row.get("execution_order_id"))
+        assert diag_qty.get(order_id, 0) == int(row["qty"]), order_id
+    assert all(float(value) >= 0 for value in trades["cash_after"])
+
+
 def check_full_sell() -> None:
     original_risk = backtest.is_risk_on
     try:
@@ -372,6 +411,7 @@ def main() -> None:
         check_partial_carry_and_repricing()
         check_sufficient_cash_carry()
         check_capacity_no_fill()
+        check_cash_limited_rebalance_buy()
         check_full_sell()
         check_partial_exit_reconciliation()
         check_lifecycle_cancels_carry()

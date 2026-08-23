@@ -1498,6 +1498,29 @@ def run_etf_strategy(
             }
         )
 
+    def _record_cash_limited_buy(
+        order: dict,
+        *,
+        affordable_qty: int,
+        reason: str,
+    ) -> None:
+        execution_order_id = str(order.get("execution_order_id", ""))
+        diagnostic = execution_diagnostic_index.get(execution_order_id)
+        if diagnostic is not None:
+            diagnostic.update(
+                {
+                    "decision": "CASH_LIMITED",
+                    "filled_qty": affordable_qty,
+                    "remaining_qty": max(int(order.get("qty", 0) or 0) - affordable_qty, 0),
+                    "reason": reason,
+                    "diagnostic_labels": [
+                        *diagnostic.get("diagnostic_labels", []),
+                        "CASH_LIMITED_FILL_CANCEL",
+                    ],
+                    "next_carry": None,
+                }
+            )
+
     def _cancel_pending_execution_carries(
         ticker: str,
         *,
@@ -2261,6 +2284,27 @@ def run_etf_strategy(
 
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)
             for o in execution_orders:
+                if execution_mode == "ohlcv_capacity" and str(o.get("side")) == "BUY":
+                    # capacity 승인 수량이라도 실행 시점 가용 현금을 초과하면
+                    # 남은 수량을 취소한다(캐리 경로와 동일한 보수 정책).
+                    # 미적용 시 max(0, cash-cost) 클램프가 자본을 유령 생성한다.
+                    buy_qty = int(o.get("qty", 0) or 0)
+                    unit_cost = (
+                        float(o.get("estimated_value", 0.0)) / buy_qty if buy_qty > 0 else 0.0
+                    )
+                    affordable_qty = (
+                        min(buy_qty, max(0, int(cash // unit_cost))) if unit_cost > 0 else 0
+                    )
+                    if affordable_qty < buy_qty:
+                        _record_cash_limited_buy(
+                            o,
+                            affordable_qty=affordable_qty,
+                            reason="capacity BUY exceeds current cash; remainder cancelled",
+                        )
+                    if affordable_qty <= 0:
+                        continue
+                    if affordable_qty < buy_qty:
+                        o = _reprice_execution_order(o, affordable_qty)
                 _apply_filled_order(o, next_dt)
 
         if not approval_strict:
