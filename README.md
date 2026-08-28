@@ -186,6 +186,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `TELEGRAM_CHAT_ID`: 수신 채팅/채널 ID
 - 토큰/채팅ID 미설정 시 조용히 비활성화됨
 - 실전 실행 요약에 주문 전 전략 평가액, 최대 종목 비중, 누적 고점 대비 낙폭 경고 포함
+- 시작 실패(pykrx import 단계 KRX 로그인 불가)와 런타임 미처리 예외에도 텔레그램으로 실패 알림을 동기 발송 후 종료 (exit 1)
 - 실계좌 고점은 `runtime_state/etf_daily_state.json`에 누적되며 최초 실행 시 현재 평가액으로 초기화
 - 증권사 API가 없는 모의 잔고는 저장된 실계좌 고점과 위험 스냅샷을 갱신하지 않음
 - 계좌 입출금은 수익이 아니어도 낙폭에 영향을 줄 수 있으므로 큰 현금 이동 후 고점 기준 확인 필요
