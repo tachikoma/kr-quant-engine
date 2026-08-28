@@ -102,7 +102,27 @@ except Exception:
     TelegramNotifier = None
 
 import pandas as pd
-from pykrx import stock
+
+try:
+    from pykrx import stock
+except Exception as _pykrx_import_exc:
+    # pykrx >= 1.2 는 import 시점에 KRX 로그인을 수행한다 (webio 모듈 레벨).
+    # 로그인 엔드포인트가 빈/비JSON 응답을 반환하면 (IP 차단·레이트리밋·일시 장애)
+    # JSONDecodeError로 import 자체가 실패한다. 텔레그램으로 알리고 명확한 오류와 함께 종료한다.
+    logging.getLogger(__name__).error(
+        "pykrx import 실패 (KRX 로그인 불가): %s", _pykrx_import_exc
+    )
+    if TelegramNotifier is not None:
+        try:
+            TelegramNotifier().send(
+                "⚠️ <b>시작 실패</b> [pykrx import — KRX 로그인 불가]\n"
+                f"{_pykrx_import_exc}\n"
+                "KRX 로그인 엔드포인트 차단/일시 장애 가능. 재실행 또는 자격증명 확인 필요."
+            )
+        except Exception:
+            pass
+    sys.exit(1)
+
 try:
     import yfinance as yf
 except Exception:
@@ -2613,7 +2633,7 @@ def run_daily() -> None:
         )
 
 
-if __name__ == "__main__":
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="ETF 하루 1회 실행 러너")
@@ -2632,4 +2652,21 @@ if __name__ == "__main__":
         os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
         logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
 
-    run_daily()
+    try:
+        run_daily()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # 미처리 예외로 프로세스가 죽을 때 텔레그램으로 알린다 (동기 발송 — 종료 전 전달 보장).
+        logger.exception("실행 중 예외 발생: %s", exc)
+        if TelegramNotifier is not None:
+            try:
+                notifier = TelegramNotifier()
+                notifier.send(f"⚠️ <b>실행 실패</b>\n{exc}")
+            except Exception:
+                pass
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
