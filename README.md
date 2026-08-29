@@ -245,7 +245,8 @@ python live_trading/etf_daily_runner.py --force-live
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
 - `scripts/`: 분석/실험 스크립트
-- `DOCS/`: 추가 문서
+- `docs/`: 추가 문서
+- `docs/verification_2026-08-29.md`: 검증 종합 (백테스트-실전 정합성, trailing/PIT 간극, 검증 이력, 동결 상태)
 
 ## 분석/실험 스크립트 (`scripts/`)
 
