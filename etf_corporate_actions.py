@@ -21,7 +21,7 @@ from pathlib import Path
 DEFAULT_LEDGER_PATH = Path("data/etf_corporate_actions.csv")
 DEFAULT_MANIFEST_PATH = Path("data/etf_corporate_actions_manifest.json")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-TICKER_RE = re.compile(r"^[0-9]{6}$")
+TICKER_RE = re.compile(r"^[0-9A-Z]{6}$")
 
 CSV_COLUMNS = (
     "event_id",
@@ -281,10 +281,10 @@ def _text(value: object) -> str | None:
 
 
 def _ticker(value: object) -> str:
-    ticker = str(value).strip()
+    ticker = str(value)
     if not TICKER_RE.fullmatch(ticker):
         raise CorporateActionValidationError(
-            f"ticker must be a six-digit string, got {ticker!r}"
+            f"ticker must be exactly six ASCII uppercase alphanumeric characters, got {ticker!r}"
         )
     return ticker
 

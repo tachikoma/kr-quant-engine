@@ -19,13 +19,19 @@ incomplete coverage is an approval blocker, not evidence that no events exist.
 
 | Column | Meaning |
 |---|---|
-| `event_id`, `ticker`, `event_type`, `event_date` | Common required fields; ticker is exactly six digits |
+| `event_id`, `ticker`, `event_type`, `event_date` | Common required fields; ticker is exactly six ASCII uppercase alphanumeric characters (`[0-9A-Z]{6}`) |
 | `record_date`, `ex_date`, `payment_date` | Cash-distribution dates |
 | `settlement_date` | Settlement/redemption cash availability date |
 | `ratio_num`, `ratio_den` | Explicit positive split ratio (`2:1`, `1:2`, etc.) |
 | `cash_amount`, `currency` | Explicit positive KRW amount |
 | `source_document_id`, `source_document`, `source_url`, `source_sha256` | Manifest-bound source provenance |
 | `notes` | Human review context; never used to infer values |
+
+Ticker values are validated exactly as supplied: six ASCII uppercase
+alphanumeric characters (`[0-9A-Z]{6}`). For example, `0101N0` is accepted and
+its leading zero is preserved. Values are not trimmed, uppercased, or
+zero-padded; lowercase, hyphenated, whitespace-containing, and wrong-length
+values are rejected.
 
 Supported event types are `CASH_DISTRIBUTION`, `SPLIT`, `REVERSE_SPLIT`,
 `SUSPENSION_START`, `SUSPENSION_END`, `DELISTING`, `CASH_SETTLEMENT`, and
@@ -40,7 +46,7 @@ must exactly match that manifest document. If the optional legacy
 `source_document` field is present, it must equal the document ID. Unknown
 document IDs, duplicate manifest IDs, blank URLs, and URL/SHA mismatches are
 rejected. The manifest must list the verification period,
-covered six-digit tickers, every source document and hash, `coverage_status`,
+covered ticker values, every source document and hash, `coverage_status`,
 and the canonical ledger SHA-256. The canonical hash is computed from sorted,
 normalized event records, so event lookup/order is deterministic.
 

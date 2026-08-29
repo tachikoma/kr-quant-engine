@@ -58,7 +58,7 @@ def _parse_threshold_dict_env(name: str, default: dict[str, float]) -> dict[str,
 
 # 현재 전략에서 매매차익 과세를 반영할 기타 ETF 후보입니다.
 TAXABLE_ETF_TICKERS = {
-    "143850",  # KODEX 미국S&P500선물(H)
+    "143850",  # TIGER 미국S&P500선물(H)
     "360200",  # ACE 미국S&P500
     "360750",  # TIGER 미국S&P500
     "133690",  # TIGER 미국나스닥100
