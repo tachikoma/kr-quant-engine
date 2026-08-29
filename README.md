@@ -5,7 +5,7 @@
 현재 운영 기준은 ETF 전용 시나리오이며, 실행 기준 스크립트는 run_etf_backtest.py 입니다.
 
 구현된 무결성 보호장치와 승인 전 blocker의 canonical 상태는
-[`DOCS/BACKTEST_INTEGRITY.md`](DOCS/BACKTEST_INTEGRITY.md)를 참고하세요.
+[`docs/backtest-integrity.md`](docs/backtest-integrity.md)를 참고하세요.
 
 ## 현재 운영 방향
 
@@ -56,8 +56,8 @@ capacity·carry·취소 사유, trades는 scenario 회계 반영 trade, reconcil
 후 directory swap/rollback으로 교체되어 실패 시 기존 리포트를 보존합니다.
 `outputs_etf_only/` 및 `outputs_approval/`과 겹치는 출력 경로는 거부되며,
 `--approval-strict`와 함께 사용할 수 없습니다. 한계와 승인 경계는
-[`DOCS/EXECUTION_CAPACITY.md`](DOCS/EXECUTION_CAPACITY.md) 및
-[`DOCS/BACKTEST_INTEGRITY.md`](DOCS/BACKTEST_INTEGRITY.md)를 참고하세요.
+[`docs/execution-capacity.md`](docs/execution-capacity.md) 및
+[`docs/backtest-integrity.md`](docs/backtest-integrity.md)를 참고하세요.
 
 승인용 corporate-action strict 실행은 별도 산출물 경로를 사용합니다.
 체크인된 ledger/manifest는 의도적으로 불완전하므로 실행이 차단됩니다.
@@ -71,7 +71,7 @@ uv run python run_etf_backtest.py --approval-strict --mode single \
 
 차단 시 `outputs_approval/`에는 승인 리포트, blocker CSV, 재현성 메타데이터만
 기록되며 `outputs_etf_only/`는 변경하지 않습니다. 자세한 ledger 계약은
-[`DOCS/CORPORATE_ACTIONS.md`](DOCS/CORPORATE_ACTIONS.md)를 참고하세요.
+[`docs/corporate-actions.md`](docs/corporate-actions.md)를 참고하세요.
 
 1. ETF 하루 1회 실행 러너(기본 안전모드)
 
