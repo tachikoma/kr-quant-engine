@@ -26,6 +26,7 @@
   정책 포트폴리오(33/33/33, 50/30/20, 60/40)/현금과 비교. **발견: 33/33/33 정책이
   MDD -23.2%(최소)·Calmar 0.83(최대)로 분산 효과 확인**
 - 유지보수: 2026 KRX 휴장일 보완, live_trading print→logging 통일, KIWOOM_HTTP_DEBUG_* 제거
+- **Soft trend-bonus 검증 (2026-08-29):** bear paralysis 완화 목적으로 `rank_etfs()`의 `trend_ok` 하드 게이트를 소프트 보너스 스코어링(`ETF_TREND_BONUS`, 그리드 0.0/0.5/1.0/1.5/2.0)으로 대체 실험. in-sample(2024-01~2026-08) 하드 게이트 압승(CAGR 110.5%/MDD -23.9% vs soft 최선 101.1%/-52.1%), WF 3/1/1은 bonus_2.0 근소 우위·2/1/1은 hard 역전으로 robust하지 않음. **결론: hard gate 유지, merge 금지.** 상세는 `docs/experiments/2026-08-soft-trend-bonus.md`
 
 ## 2026-07 — PIT 선행 작업 묶음
 
