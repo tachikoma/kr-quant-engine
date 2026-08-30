@@ -51,7 +51,7 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 - **`.env` must be loaded before `import pykrx`** — the token expires otherwise. Both entrypoints call `load_dotenv()` at module level before the `from pykrx import stock` line.
 - **Safety first** — `live_trading/etf_daily_runner.py` defaults to `LIVE_ORDER_ENABLED=0`. Live orders require `--force-live` CLI flag.
 - **Env-var-driven config** — backtest mode (`ETF_BACKTEST_MODE=single|experiment`), slippage (`ETF_BASE_SLIPPAGE=0.0005`), slippage units accept `"5bp"`, `"0.5%"`, or `"0.0005"` via `config_utils.parse_pct_env()`.
-- **BROKER_TYPE=KIWOOM|KIS** — selects live brokerage adapter (default KIWOOM).
+- **BROKER_TYPE=KIWOOM|KIS|NH|KB** — selects live brokerage adapter (default KIWOOM). NH/KB are independent implementations (no external repo runtime dependency).
 - **TAXABLE_ETF_TICKERS** — auto-computed from KRX classification in auto mode; hardcoded 8 tickers in static mode. Subject to 15.4% dividend tax on trading gains.
 - **ETF_UNIVERSE_MODE** — `static` (default, hardcoded `ETF_LIST`) or `auto` (KRX-classification-based auto-build). `ETF_LIST` env var takes precedence over auto.
 
@@ -65,8 +65,9 @@ ruff check .                # lint (ruff only, no mypy/pytest config)
 | `ETF_RETURN_BASIS` | `price` | `nav` uses NAV as ranking basis for total-return approximation |
 | `MIN_AVG_TRADING_VALUE` | `1000000000` | Min avg daily trading value (KRW) for ETF liquidity filter |
 | `MAX_PREMIUM_DISCOUNT` | `0.02` | Default absolute price/NAV deviation threshold (fallback when group/ticker thresholds don't apply) |
-| `LIVE_ORDER_ENABLED` | `0` | Live order toggle (0=safe mode) |
-| `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` or `KIS` |
+| `LIVE_ORDER_ENABLED` | `0` | Live order toggle (0=safe mode). Per-broker `{BROKER}_LIVE_ORDER_ENABLED` takes precedence (e.g. `KIS_LIVE_ORDER_ENABLED`, `NH_LIVE_ORDER_ENABLED`) |
+| `BROKER_TYPE` | `KIWOOM` | Broker choice: `KIWOOM` / `KIS` / `NH` / `KB` |
+| `MODE` | `demo` | Single trading mode (`demo`/`real`). Aliases: `BROKER_MODE`. `ENV_MODE` is deprecated fallback. NH: `demo`→`moapi` / `real`→`api` |
 | `LOG_LEVEL` | `INFO` | 로그 레벨. `DEBUG`로 설정 시 필터별 탈락 티커 목록 포함 상세 로그 출력 |
 | `TARGET_WEIGHT_REBALANCE` | `0` | `1`이면 전체 포트폴리오 평가액 기준 목표비중 리밸런싱. `0`은 기존 현금 배분 방식 |
 | `WF_STATE_BASED` | `1` | 폴드 경계에서 실제 보유/현금/원가 이월. `0`이면 기존 슬라이싱+경계비용 경로 |

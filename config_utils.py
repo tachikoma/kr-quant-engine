@@ -72,3 +72,57 @@ def parse_fraction_env(name: str, default: float) -> float:
     except Exception:
         print(f"⚠️ 환경변수 {name} 파싱 실패: '{raw}' — 기본값({default}) 사용")
         return float(default)
+
+
+# --- 모드 단일화: MODE > BROKER_MODE > ENV_MODE (deprecated) ---
+_WARNED_ENV_MODE = False
+
+
+def get_mode(default: str = "demo") -> str:
+    """실전/모의 모드를 단일 소스로 반환. 우선순위: MODE > BROKER_MODE > ENV_MODE."""
+    global _WARNED_ENV_MODE
+    for key in ("MODE", "BROKER_MODE"):
+        v = os.environ.get(key)
+        if v is not None and str(v).strip():
+            s = str(v).strip()
+            if "#" in s:
+                s = s[: s.index("#")].strip()
+            s = s.strip('"').strip("'").lower()
+            if s in {"real", "demo", "mock", "paper", "test", "live", "paper-trading"}:
+                # normalize aliases
+                if s in {"mock", "paper", "paper-trading"}:
+                    return "demo"
+                if s == "live":
+                    return "real"
+                return s
+            if s:
+                return s
+    v = os.environ.get("ENV_MODE")
+    if v is not None and str(v).strip():
+        if not _WARNED_ENV_MODE:
+            print("⚠️ ENV_MODE는 deprecated — MODE 또는 BROKER_MODE를 사용하세요 (ENV_MODE는 fallback으로만 동작)")
+            _WARNED_ENV_MODE = True
+        s = str(v).strip()
+        if "#" in s:
+            s = s[: s.index("#")].strip()
+        s = s.strip('"').strip("'").lower()
+        if s in {"mock", "paper", "paper-trading"}:
+            return "demo"
+        if s == "live":
+            return "real"
+        return s or default
+    return default
+
+
+def is_demo_mode() -> bool:
+    return get_mode() in {"demo", "mock", "paper", "test"}
+
+
+def get_live_enabled(broker_type: str | None = None) -> bool:
+    """브로커별 LIVE_ORDER_ENABLED. 우선순위: {BROKER}_LIVE_ORDER_ENABLED > LIVE_ORDER_ENABLED."""
+    if broker_type:
+        key = f"{broker_type.upper()}_LIVE_ORDER_ENABLED"
+        v = os.environ.get(key)
+        if v is not None:
+            return str(v).strip() == "1"
+    return os.environ.get("LIVE_ORDER_ENABLED", "0").strip() == "1"

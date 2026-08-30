@@ -66,8 +66,13 @@ class KisAuthManager:
         self._session = requests.Session()
         self._auth_timeout = float(os.environ.get("KIS_AUTH_TIMEOUT", "10"))
         self._token_max_retries = int(os.environ.get("KIS_TOKEN_MAX_RETRIES", "3"))
-        _env_mode = os.environ.get("ENV_MODE", "real").lower()
-        _default_retry = "1.0" if _env_mode == "demo" else "0.05"
+        try:
+            from config_utils import get_mode
+
+            _mode = get_mode()
+        except Exception:
+            _mode = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
+        _default_retry = "1.0" if _mode == "demo" else "0.05"
         self._token_retry_delay = float(os.environ.get("KIS_RETRY_DELAY", _default_retry))
 
     # ------------------------------------------------------------------
@@ -103,8 +108,13 @@ class KisAuthManager:
 
     def _load_credentials(self) -> None:
         """환경변수에서 자격증명을 로드합니다."""
-        env_mode = os.environ.get("ENV_MODE", "real").lower()
-        is_real = (env_mode == "real")
+        try:
+            from config_utils import get_mode
+
+            _mode = get_mode()
+        except Exception:
+            _mode = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
+        is_real = (_mode == "real")
         self._svr = "prod" if is_real else "vps"
 
         self.app_key = os.environ.get("KIS_APP_KEY", "")
@@ -139,8 +149,13 @@ class KisAuthManager:
 
     def _setup_token_file(self) -> None:
         """오늘 날짜 기반 토큰 파일 경로를 설정하고, 디렉터리가 없으면 생성합니다."""
-        env_mode = os.environ.get("ENV_MODE", "real").lower()
-        token_filename = f"KIS_{env_mode}_{datetime.today().strftime('%Y%m%d')}.json"
+        try:
+            from config_utils import get_mode
+
+            _mode = get_mode()
+        except Exception:
+            _mode = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
+        token_filename = f"KIS_{_mode}_{datetime.today().strftime('%Y%m%d')}.json"
         self._token_file = os.path.join(self._token_dir, token_filename)
         os.makedirs(self._token_dir, exist_ok=True)
 
@@ -272,11 +287,16 @@ class KisAuthManager:
                 except (ValueError, AttributeError):
                     pass
                 if msg_cd in ("EGW00103", "EGW00105"):
-                    env_mode = os.environ.get("ENV_MODE", "real")
+                    try:
+                        from config_utils import get_mode
+
+                        _mode = get_mode()
+                    except Exception:
+                        _mode = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
                     raise RuntimeError(
-                        f"KIS 앱키/시크릿이 ENV_MODE({env_mode}) 환경과 일치하지 않습니다 "
+                        f"KIS 앱키/시크릿이 MODE({_mode}) 환경과 일치하지 않습니다 "
                         f"(msg_cd={msg_cd}: {msg1}). "
-                        "ENV_MODE(real/demo)와 KIS_APP_KEY/KIS_APP_SECRET의 발급 환경을 확인하세요."
+                        "MODE/BROKER_MODE(real/demo)와 KIS_APP_KEY/KIS_APP_SECRET의 발급 환경을 확인하세요."
                     )
                 raise RuntimeError(
                     f"KIS 토큰 발급 실패: HTTP {res.status_code} - {res.text[:500]}"

@@ -2103,7 +2103,21 @@ def run_daily() -> None:
     if broker_type == "KIS":
         AdapterClass = KisAdapter
         adapter_name = "KIS"
+    elif broker_type == "NH":
+        from live_trading.nh_adapter import NhAdapter
+
+        AdapterClass = NhAdapter
+        adapter_name = "NH"
+    elif broker_type == "KB":
+        from live_trading.kb_adapter import KbAdapter
+
+        AdapterClass = KbAdapter
+        adapter_name = "KB"
+    elif broker_type in {"KIWOOM", "KIWOOM_REST", "LS"}:
+        AdapterClass = KiwoomAdapter
+        adapter_name = "키움"
     else:
+        logger.warning(f"[경고] 알 수 없는 BROKER_TYPE='{broker_type}', KIWOOM으로 fallback")
         AdapterClass = KiwoomAdapter
         adapter_name = "키움"
 
