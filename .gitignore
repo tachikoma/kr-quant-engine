@@ -10,3 +10,5 @@ outputs_*/
 .kis_token_cache/
 .kiwoom_token_cache/
 .opencode/
+.slim/deepwork/
+data/raw/

@@ -8,11 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import etf_shared
 from etf_distributions import distributions_file_sha256, distributions_path, load_distributions
-from etf_shared import ETF_LIST
 
 
 def main() -> None:
+    if etf_shared.UNIVERSE_MODE == "auto":
+        etf_shared.ensure_universe_initialized()
+    universe = list(etf_shared.ETF_LIST)
     path = distributions_path()
     data = load_distributions(path, required=False)
     if data.empty:
@@ -39,7 +42,7 @@ def main() -> None:
         "start": str(data["ex_date"].min().date()),
         "end": str(data["ex_date"].max().date()),
         "events_by_ticker": counts,
-        "universe_without_events": sorted(set(ETF_LIST) - set(counts)),
+        "universe_without_events": sorted(set(universe) - set(counts)),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

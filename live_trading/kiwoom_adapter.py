@@ -71,8 +71,13 @@ class KiwoomAdapter:
     """ETF 드라이런/하루 1회 라이브 러너에서 사용하는 소형 어댑터."""
 
     def __init__(self) -> None:
-        env_mode = os.environ.get("ENV_MODE", "real").lower()
-        if env_mode == "real":
+        try:
+            from config_utils import get_mode
+
+            _mode = get_mode(default="real")
+        except Exception:
+            _mode = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
+        if _mode == "real":
             self.base_url = "https://api.kiwoom.com"
         else:
             self.base_url = "https://mockapi.kiwoom.com"
@@ -82,9 +87,18 @@ class KiwoomAdapter:
         self.access_token = ""
         self.timeout = float(os.environ.get("KIWOOM_TIMEOUT", "10"))
         self.http_max_retries = int(os.environ.get("KIWOOM_HTTP_MAX_RETRIES", "4"))
-        # Rate limit defaults by ENV_MODE: 실전=0.1s(10/sec, 50% margin), 모의=1.0s(1/sec, 40% margin)
-        _env_mode = os.environ.get("ENV_MODE", "real").lower()
-        _default_interval = 0.1 if _env_mode == "real" else 1.0
+        # Rate limit defaults by MODE: 실전=0.1s(10/sec, 50% margin), 모의=1.0s(1/sec, 40% margin)
+        try:
+            from config_utils import is_demo_mode
+
+            _is_demo = is_demo_mode()
+        except Exception:
+            _is_demo = (os.environ.get("MODE") or os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower() in {
+                "demo",
+                "mock",
+                "paper",
+            }
+        _default_interval = 1.0 if _is_demo else 0.1
         self.http_min_interval = float(os.environ.get("KIWOOM_HTTP_MIN_INTERVAL", str(_default_interval)))
         # Retry delay unified with throttle interval (same value)
         self.http_retry_delay = float(os.environ.get("KIWOOM_HTTP_RETRY_DELAY", str(self.http_min_interval)))

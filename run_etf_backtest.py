@@ -1,11 +1,17 @@
-from pathlib import Path
-from collections.abc import Callable, Sequence
-from typing import Any
+import argparse
+import hashlib
 import json
 import logging
 import os
-import argparse
+import shutil
+import tempfile
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import date, datetime
+from decimal import Decimal
+from functools import wraps
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -20,7 +26,23 @@ logger = logging.getLogger(__name__)
 # 백테스트 전용: 기본 슬리피지 및 호가 스프레드 (환경변수로 재정의 가능)
 # ETF_BASE_SLIPPAGE: 예) 0.0005 (5bp)
 # ETF_SPREAD_PCT: 예) 0.0005 (기본 0.0005)
-from config_utils import parse_pct_env, parse_fraction_env
+from config_utils import parse_fraction_env, parse_pct_env
+from etf_corporate_actions import (
+    ApprovalBlocker,
+    ApprovalReport,
+    CorporateActionBlocked,
+    CorporateActionLedger,
+    EventType,
+    HoldingState,
+    LifecycleState,
+    apply_lifecycle_event,
+    create_distribution_receivable,
+    final_approval_report,
+    load_corporate_action_ledger,
+    process_pending_receivables,
+    process_settlement,
+    transform_split_holding,
+)
 from etf_distributions import (
     add_distributions,
     distribution_cash_for_holdings,
@@ -64,13 +86,7 @@ def load_dotenv(dotenv_path: str | Path | None = None) -> None:
 load_dotenv()
 
 
-from pykrx_utils import (
-    _call_capture_stderr,
-    _range_has_weekday,
-    fetch_etf_ohlcv_with_nav,
-    get_listing_dates,
-    get_ticker_name,
-)
+import etf_shared as _etf_shared
 from etf_shared import (
     ETF_LIST,
     ETF_MAX_POSITIONS,
@@ -80,28 +96,61 @@ from etf_shared import (
     MARKET_MA_DAYS,
     MARKET_SLOPE_DAYS,
     TAXABLE_ETF_TICKERS,
-    rank_etfs,
-    apply_buy_cost,
-    apply_sell_value,
-    build_rebalance_orders,
     add_deviation_flag,
     add_liquidity_flag,
     add_listing_flag,
     add_price_basis_columns,
+    apply_buy_cost,
+    apply_sell_value,
     build_gating_decision,
-    get_valuation_price,
+    build_rebalance_orders,
+    ensure_universe_initialized,
     get_strategy_config,
+    get_valuation_price,
+    rank_etfs,
     update_last_valid_prices,
 )
-import etf_shared as _etf_shared
+from pykrx_utils import (
+    _call_capture_stderr,
+    _range_has_weekday,
+    fetch_etf_ohlcv_with_nav,
+    get_listing_dates,
+    get_ticker_name,
+)
 
-strategy_cfg = get_strategy_config()
+strategy_cfg = get_strategy_config(initialize_universe=False)
 REBALANCE_STEP_DAYS = strategy_cfg["rebalance_step_days"]  # env override 반영 (기본 10)
 SLIPPAGE_PCT = parse_pct_env("ETF_BASE_SLIPPAGE", strategy_cfg.get("default_slippage_pct", 0.0005))
 SPREAD_PCT = parse_pct_env("ETF_SPREAD_PCT", strategy_cfg.get("spread_pct", 0.0005))
 BASE_SLIPPAGE = SLIPPAGE_PCT
 
-from pykrx import stock
+# Lazy-loaded in ``main`` after strict approval preflight.  Importing pykrx can
+# authenticate immediately, which must not happen for a blocked approval run.
+stock = None
+
+
+def get_stock():
+    """Return the pykrx stock client, importing it only for network work."""
+    global stock
+    if stock is None:
+        from pykrx import stock as pykrx_stock
+
+        stock = pykrx_stock
+    return stock
+
+
+def _restore_ticker_groups_on_exit(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        ticker_groups = kwargs.get("ticker_groups")
+        original = _etf_shared.ETF_TICKER_GROUPS
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if ticker_groups is not None:
+                _etf_shared.ETF_TICKER_GROUPS = original
+
+    return wrapped
 
 HAS_KRX_CREDENTIALS = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
 
@@ -176,6 +225,48 @@ def _parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--start", "-s", help="시작일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 20160101", default=None)
     parser.add_argument("--end", "-e", help="종료일 (YYYYMMDD 또는 YYYY-MM-DD). 기본: 오늘(또는 마지막 영업일)", default=None)
     parser.add_argument("--mode", "-m", choices=["single", "experiment", "risk_off_compare"], help="실행 모드: single | experiment | risk_off_compare (옵션)", default=None)
+    parser.add_argument(
+        "--approval-strict",
+        action="store_true",
+        help="검증된 corporate-action ledger를 사용하는 승인 전용 실행 경로",
+    )
+    parser.add_argument(
+        "--corporate-actions-ledger",
+        default="data/etf_corporate_actions.csv",
+        help="strict 모드 corporate-action ledger CSV 경로",
+    )
+    parser.add_argument(
+        "--corporate-actions-manifest",
+        default="data/etf_corporate_actions_manifest.json",
+        help="strict 모드 corporate-action manifest 경로",
+    )
+    parser.add_argument(
+        "--approval-output-dir",
+        default="outputs_approval",
+        help="strict 모드 승인 산출물 경로",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=["legacy", "ohlcv_capacity"],
+        default="legacy",
+        help="실행 시나리오: legacy 또는 진단 전용 OHLCV capacity",
+    )
+    parser.add_argument(
+        "--execution-participation-rate",
+        type=float,
+        default=0.05,
+        help="OHLCV capacity 참여율 (기본 0.05)",
+    )
+    parser.add_argument(
+        "--execution-aum",
+        default="10000000,100000000,1000000000",
+        help="capacity 시나리오별 초기 AUM (쉼표 구분)",
+    )
+    parser.add_argument(
+        "--execution-output-dir",
+        default="outputs_execution",
+        help="capacity 진단 산출물 경로",
+    )
     return parser.parse_args()
 
 
@@ -557,7 +648,7 @@ def get_index_data() -> pd.DataFrame:
                     print(f"[캐시] KOSPI left 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
                 else:
                     try:
-                        raw_left = _call_capture_stderr(stock.get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                        raw_left = _call_capture_stderr(get_stock().get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
                     except Exception as e:
                         print(f"[캐시] KOSPI left 호출 실패: {e}")
                     else:
@@ -587,7 +678,7 @@ def get_index_data() -> pd.DataFrame:
                     print(f"[캐시] KOSPI right 범위 주말 전용({fetch_start}~{fetch_end}) — 조회 생략")
                 else:
                     try:
-                        raw_right = _call_capture_stderr(stock.get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
+                        raw_right = _call_capture_stderr(get_stock().get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
                     except Exception as e:
                         print(f"[캐시] KOSPI right 호출 실패: {e}")
                     else:
@@ -654,7 +745,7 @@ def get_index_data() -> pd.DataFrame:
         )
 
     try:
-        idx_raw = _call_capture_stderr(stock.get_index_ohlcv_by_date, START, END, KOSPI_INDEX_CODE)
+        idx_raw = _call_capture_stderr(get_stock().get_index_ohlcv_by_date, START, END, KOSPI_INDEX_CODE)
     except Exception as e:
         raise RuntimeError(
             f"KOSPI 지수 데이터 조회 중 오류 발생: {str(e)}\n"
@@ -842,6 +933,8 @@ def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame
     분배금 파일이 있으면 분배금 컬럼을 병합하고, ``ETF_RETURN_BASIS``에 따라
     ``close_adj``(랭킹 기준 수익률용), ``ret_60``, ``ret_120`` 등을 계산한다.
     """
+    if ticker_universe is None:
+        ensure_universe_initialized()
     frames = []
     failed = []
     empty = []
@@ -859,7 +952,7 @@ def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame
                 print(f"[데이터] {ticker} 비어있음")
                 continue
             frames.append(df)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate one ticker in legacy runs
             failed.append((ticker, str(exc)))
             print(f"[데이터] {ticker} 수집 실패: {exc}")
 
@@ -897,6 +990,7 @@ def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame
 
 
 
+@_restore_ticker_groups_on_exit
 def run_etf_strategy(
     initial_cash: float,
     common_dates: list[pd.Timestamp],
@@ -904,7 +998,6 @@ def run_etf_strategy(
     use_market_filter: bool = True,
     max_positions: int = ETF_MAX_POSITIONS,
     slippage: float = SLIPPAGE_PCT,
-    # noqa: PLR0913 — 전략 파라미터가 많음
     risk_off_liquidate: bool = True,
     price_data: pd.DataFrame | None = None,
     max_asset_pct: float | None = None,
@@ -922,6 +1015,10 @@ def run_etf_strategy(
     initial_state: dict[str, Any] | None = None,
     return_final_state: bool = False,
     ticker_groups: dict[str, str] | None = None,
+    approval_strict: bool = False,
+    corporate_action_ledger: CorporateActionLedger | None = None,
+    execution_mode: str = "legacy",
+    participation_rate: float = 0.05,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
@@ -932,9 +1029,45 @@ def run_etf_strategy(
     Args:
         rebalance_observer: 선택적 콜백. 각 리밸런싱 전후 상태(의사결정, 주문, 체결)
            를 담은 dict를 전달한다. ``None``이면 기존 동작과 동일하다.
+        approval_strict: 검증된 corporate-action ledger를 사용하는 승인 전용 경로.
+           기본값 ``False``이며 legacy 실행에는 ledger를 로드하지 않는다.
+        corporate_action_ledger: ``approval_strict`` 실행에 사용할 검증된 ledger.
+        execution_mode: ``legacy`` or opt-in ``ohlcv_capacity`` scenario.
+        participation_rate: OHLCV capacity participation fraction.
     """
+    if execution_mode not in {"legacy", "ohlcv_capacity"}:
+        raise ValueError("execution_mode must be exactly legacy or ohlcv_capacity")
+    if isinstance(participation_rate, bool):
+        raise TypeError("participation_rate must be a finite number")
+    try:
+        participation_rate = float(participation_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("participation_rate must be a finite number between 0 and 1") from exc
+    if not np.isfinite(participation_rate) or not 0 <= participation_rate <= 1:
+        raise ValueError("participation_rate must be a finite number between 0 and 1")
+    execution_decide = None
+    if execution_mode == "ohlcv_capacity":
+        from etf_execution import DecisionType, OHLCVBar, OrderRequest, decide_execution
+
+        execution_decide = decide_execution
+    if approval_strict and corporate_action_ledger is None:
+        raise ValueError("approval_strict 실행에는 corporate_action_ledger가 필요합니다.")
+    if approval_strict and corporate_action_ledger is not None:
+        ledger_report = corporate_action_ledger.approval_report()
+        if not ledger_report.approval_valid:
+            raise CorporateActionBlocked(ledger_report.blockers[0])
     ensure_no_current_prefix_columns(price_data, context="run_etf_strategy(price_data)")
+    if universe_tickers is None:
+        ensure_universe_initialized()
     universe = [str(ticker) for ticker in (universe_tickers if universe_tickers is not None else ETF_LIST)]
+    if approval_strict and corporate_action_ledger is not None:
+        coverage_blockers = _strict_coverage_blockers(
+            corporate_action_ledger,
+            common_dates,
+            universe,
+        )
+        if coverage_blockers:
+            raise CorporateActionBlocked(coverage_blockers[0])
     price = price_data.copy() if price_data is not None else load_etf_price(universe)
     price_by_date = {dt: day.set_index("ticker") for dt, day in price.groupby("date")}
 
@@ -970,6 +1103,28 @@ def run_etf_strategy(
         }
         rebalance_phase_offset = int(initial_state.get("rebalance_phase_offset", 0))
         exit_phase_offset = int(initial_state.get("exit_phase_offset", rebalance_phase_offset))
+    strict_states: dict[str, HoldingState] = {}
+    strict_state_event_ids: dict[str, str] = {}
+    pending_receivables = []
+    processed_action_ids: set[str] = set()
+    strict_action_blockers: list[ApprovalBlocker] = []
+    blocked_orders: list[dict[str, Any]] = []
+    execution_diagnostics: list[dict[str, Any]] = []
+    execution_diagnostic_index: dict[str, dict[str, Any]] = {}
+    pending_execution_carries: dict[tuple[str, str, str], dict[str, Any]] = {}
+    execution_excluded_buy_tickers: set[str] = set()
+    historical_holdings: dict[pd.Timestamp, dict[str, int]] = {}
+    if approval_strict:
+        strict_states = {
+            ticker: HoldingState(
+                ticker,
+                int(holdings.get(ticker, 0)),
+                Decimal(str(holding_cost_basis.get(ticker, 0.0))) * int(holdings.get(ticker, 0)),
+            )
+            for ticker in universe
+        }
+        if common_dates:
+            historical_holdings[pd.Timestamp(common_dates[0])] = dict(holdings)
     trades = []
     equity_rows = []
 
@@ -996,14 +1151,91 @@ def run_etf_strategy(
     if not 0 <= effective_portfolio_trailing_stop_pct < 1:
         raise ValueError("ETF_PORTFOLIO_TRAILING_STOP_PCT는 0 이상 1 미만이어야 합니다.")
 
+    def _make_execution_order_id(
+        *,
+        origin_date: str,
+        execution_date: pd.Timestamp,
+        ticker: str,
+        side: str,
+        carry_age: int,
+        reason: str,
+    ) -> str:
+        return "|".join(
+            (
+                str(origin_date),
+                pd.Timestamp(execution_date).strftime("%Y-%m-%d"),
+                str(ticker),
+                str(side),
+                str(carry_age),
+                str(reason),
+            )
+        )
+
     def execute_exit(
         ticker: str,
         qty: int,
         next_open: pd.Series,
         next_dt: pd.Timestamp,
         reason: str,
+        due_date: pd.Timestamp | None = None,
     ) -> bool:
         nonlocal cash
+
+        if execution_mode == "ohlcv_capacity":
+            execution_excluded_buy_tickers.add(ticker)
+            # An exit intent supersedes an outstanding opposite-side BUY
+            # remainder; otherwise the later carry could rebuy the position.
+            _cancel_pending_execution_carries(
+                ticker,
+                side="BUY",
+                cancellation_date=next_dt,
+                reason="pending BUY carry cancelled by exit intent",
+            )
+            if any(
+                pending["ticker"] == ticker and pending["side"] == "SELL"
+                for pending in pending_execution_carries.values()
+            ):
+                # The due SELL carry is the existing exit intent; do not
+                # create a duplicate same-side exit before it is retried.
+                return 0
+            open_price = safe_get(next_open, ticker)
+            reference_price = (
+                open_price * (1 - SPREAD_PCT / 2) if open_price is not None else None
+            )
+            order = {
+                "ticker": ticker,
+                "side": "SELL",
+                "qty": int(qty),
+                "reference_price": reference_price,
+                "reason": reason,
+                "execution_order_id": _make_execution_order_id(
+                    origin_date=pd.Timestamp(next_dt).strftime("%Y-%m-%d"),
+                    execution_date=next_dt,
+                    ticker=ticker,
+                    side="SELL",
+                    carry_age=0,
+                    reason=reason,
+                ),
+            }
+            decision = _evaluate_execution_order(
+                order,
+                origin_date=pd.Timestamp(next_dt).strftime("%Y-%m-%d"),
+                carry_age=0,
+                execution_date=next_dt,
+                execution_day=next_day,
+            )
+            _store_execution_carry(
+                order,
+                decision,
+                origin_date=pd.Timestamp(next_dt).strftime("%Y-%m-%d"),
+                due_date=due_date,
+            )
+            if decision.filled_qty <= 0:
+                return 0
+            return _apply_filled_order(
+                _reprice_execution_order(order, decision.filled_qty),
+                next_dt,
+            )
 
         open_price = safe_get(next_open, ticker)
         if open_price is None:
@@ -1046,27 +1278,665 @@ def run_etf_strategy(
         )
         return True
 
+    def _strict_holding_state(ticker: str) -> HoldingState:
+        state = strict_states.get(ticker)
+        if state is not None:
+            return state
+        qty = int(holdings.get(ticker, 0) or 0)
+        state = HoldingState(
+            ticker,
+            qty,
+            Decimal(str(holding_cost_basis.get(ticker, 0.0))) * qty,
+        )
+        strict_states[ticker] = state
+        return state
+
+    def _strict_sync_state(ticker: str, state: HoldingState | None = None) -> None:
+        if state is None:
+            state = _strict_holding_state(ticker)
+        qty = int(holdings.get(ticker, 0) or 0)
+        total_cost = Decimal(str(holding_cost_basis.get(ticker, 0.0))) * qty
+        strict_states[ticker] = replace(state, quantity=qty, total_cost_basis=total_cost)
+
+    def _record_blocked_order(
+        *,
+        order_date: pd.Timestamp,
+        ticker: str,
+        side: str,
+        intent: str,
+        reason: str,
+    ) -> None:
+        """Record a strict order rejected by the corporate-action lifecycle."""
+        if not approval_strict:
+            return
+        state = _strict_holding_state(ticker)
+        blocked_orders.append(
+            {
+                "date": order_date,
+                "ticker": ticker,
+                "side": side,
+                "intent": intent,
+                "lifecycle_state": state.lifecycle.value,
+                "event_id": strict_state_event_ids.get(ticker),
+                "reason": reason,
+            }
+        )
+
+    def _execution_bar(ticker: str, execution_date: pd.Timestamp, day: pd.DataFrame):
+        if execution_mode != "ohlcv_capacity":
+            return None
+        row = day.loc[ticker] if ticker in day.index else None
+
+        def value(name: str, fallback: Any = None) -> Any:
+            if row is None:
+                return fallback
+            raw = row.get(name, fallback)
+            if raw is None or pd.isna(raw):
+                return fallback
+            return float(raw)
+
+        close = value("close", 1.0)
+        return OHLCVBar(
+            pd.Timestamp(execution_date).strftime("%Y-%m-%d"),
+            ticker,
+            value("open"),
+            value("high", close),
+            value("low", close),
+            close,
+            value("volume", 0.0),
+            value("trading_value"),
+        )
+
+    def _record_execution_diagnostic(
+        decision: Any,
+        *,
+        origin_date: str,
+        order_reason: str,
+        execution_order_id: str,
+    ) -> None:
+        if execution_mode != "ohlcv_capacity":
+            return
+        diagnostic = decision.to_dict()
+        diagnostic.update(
+            {
+                "origin_date": origin_date,
+                "order_reason": order_reason,
+                "execution_order_id": execution_order_id,
+                "terminal_applied": True,
+                "execution_mode": "ohlcv_capacity",
+            }
+        )
+        prior = execution_diagnostic_index.get(execution_order_id)
+        if prior is None:
+            execution_diagnostics.append(diagnostic)
+            execution_diagnostic_index[execution_order_id] = diagnostic
+        else:
+            prior.update(diagnostic)
+
+    def _evaluate_execution_order(
+        order: dict,
+        *,
+        origin_date: str,
+        carry_age: int,
+        execution_date: pd.Timestamp,
+        execution_day: pd.DataFrame,
+    ) -> Any:
+        assert execution_decide is not None
+        ticker = str(order.get("ticker"))
+        side = str(order.get("side"))
+        execution_order_id = str(
+            order.get("execution_order_id")
+            or _make_execution_order_id(
+                origin_date=origin_date,
+                execution_date=execution_date,
+                ticker=ticker,
+                side=side,
+                carry_age=carry_age,
+                reason=str(order.get("reason", "ETF_REBALANCE")),
+            )
+        )
+        order["execution_order_id"] = execution_order_id
+        explicit_suspension = False
+        if approval_strict:
+            explicit_suspension = _strict_holding_state(ticker).lifecycle != LifecycleState.ACTIVE
+        request = OrderRequest(
+            pd.Timestamp(execution_date).strftime("%Y-%m-%d"),
+            ticker,
+            side,
+            int(order.get("qty", 0) or 0),
+            participation_rate,
+            carry_age,
+            1,
+            explicit_suspension,
+        )
+        decision = execution_decide(request, _execution_bar(ticker, execution_date, execution_day))
+        _record_execution_diagnostic(
+            decision,
+            origin_date=origin_date,
+            order_reason=str(order.get("reason", "ETF_REBALANCE")),
+            execution_order_id=execution_order_id,
+        )
+        return decision
+
+    def _record_no_due_carry(order: dict, decision: Any, *, reason: str) -> None:
+        execution_order_id = str(order.get("execution_order_id", ""))
+        diagnostic = execution_diagnostic_index.get(execution_order_id)
+        if diagnostic is None:
+            diagnostic = decision.to_dict()
+            execution_diagnostics.append(diagnostic)
+            execution_diagnostic_index[execution_order_id] = diagnostic
+        diagnostic.update(
+            {
+                "decision": "CARRY_CANCELLED",
+                "reason": reason,
+                "diagnostic_labels": [
+                    *diagnostic.get("diagnostic_labels", []),
+                    "CARRY_CANCELLED_NO_DUE_DATE",
+                ],
+                "next_carry": None,
+                "order_reason": str(order.get("reason", "ETF_REBALANCE")),
+                "execution_order_id": execution_order_id,
+                "execution_mode": "ohlcv_capacity",
+            }
+        )
+
+    def _store_execution_carry(
+        order: dict,
+        decision: Any,
+        *,
+        origin_date: str,
+        due_date: pd.Timestamp | None,
+    ) -> None:
+        if decision.decision is not DecisionType.PARTIAL_CARRY:
+            return
+        if due_date is None:
+            _record_no_due_carry(
+                order,
+                decision,
+                reason="partial remainder has no following trading date",
+            )
+            return
+        due_key = pd.Timestamp(due_date).strftime("%Y-%m-%d")
+        carry_key = (due_key, str(order.get("ticker")), str(order.get("side")))
+        pending_execution_carries[carry_key] = {
+            "origin_date": origin_date,
+            "due_date": due_key,
+            "ticker": str(order.get("ticker")),
+            "side": str(order.get("side")),
+            "remaining_qty": decision.remaining_qty,
+            "order_reason": str(order.get("reason", "ETF_REBALANCE")),
+            "execution_order_id": str(order.get("execution_order_id", "")),
+        }
+
+    def _record_cash_limited_carry(
+        order: dict,
+        decision: Any,
+        *,
+        affordable_qty: int,
+        reason: str,
+    ) -> None:
+        execution_order_id = str(order.get("execution_order_id", ""))
+        diagnostic = execution_diagnostic_index.get(execution_order_id)
+        if diagnostic is None:
+            diagnostic = decision.to_dict()
+            execution_diagnostics.append(diagnostic)
+            execution_diagnostic_index[execution_order_id] = diagnostic
+        diagnostic.update(
+            {
+                "decision": "CARRY_CANCELLED",
+                "filled_qty": affordable_qty,
+                "remaining_qty": max(decision.requested_qty - affordable_qty, 0),
+                "reason": reason,
+                "diagnostic_labels": [
+                    *diagnostic.get("diagnostic_labels", []),
+                    "CASH_LIMITED_CARRY_CANCEL",
+                ],
+                "next_carry": None,
+                "order_reason": str(order.get("reason", "ETF_EXECUTION_CARRY")),
+                "execution_order_id": execution_order_id,
+                "execution_mode": "ohlcv_capacity",
+            }
+        )
+
+    def _record_cash_limited_buy(
+        order: dict,
+        *,
+        affordable_qty: int,
+        reason: str,
+    ) -> None:
+        execution_order_id = str(order.get("execution_order_id", ""))
+        diagnostic = execution_diagnostic_index.get(execution_order_id)
+        if diagnostic is not None:
+            diagnostic.update(
+                {
+                    "decision": "CASH_LIMITED",
+                    "filled_qty": affordable_qty,
+                    "remaining_qty": max(int(order.get("qty", 0) or 0) - affordable_qty, 0),
+                    "reason": reason,
+                    "diagnostic_labels": [
+                        *diagnostic.get("diagnostic_labels", []),
+                        "CASH_LIMITED_FILL_CANCEL",
+                    ],
+                    "next_carry": None,
+                }
+            )
+
+    def _cancel_pending_execution_carries(
+        ticker: str,
+        *,
+        side: str | None = None,
+        cancellation_date: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        if execution_mode != "ohlcv_capacity":
+            return
+        for key, pending in list(pending_execution_carries.items()):
+            if pending["ticker"] != ticker or (side is not None and pending["side"] != side):
+                continue
+            pending_execution_carries.pop(key, None)
+            cancellation_id = (
+                f"{pending['execution_order_id']}|cancel|"
+                f"{pd.Timestamp(cancellation_date).strftime('%Y-%m-%d')}"
+            )
+            execution_diagnostics.append(
+                {
+                    "date": pd.Timestamp(cancellation_date).strftime("%Y-%m-%d"),
+                    "ticker": ticker,
+                    "side": pending["side"],
+                    "decision": "CARRY_CANCELLED",
+                    "requested_qty": pending["remaining_qty"],
+                    "filled_qty": 0,
+                    "remaining_qty": pending["remaining_qty"],
+                    "capacity_qty": 0,
+                    "bar_volume": None,
+                    "bar_value": None,
+                    "close_volume_notional_estimate": None,
+                    "participation_rate": participation_rate,
+                    "carry_age": 1,
+                    "max_carry_days": 1,
+                    "reason": reason,
+                    "diagnostic_labels": [
+                        "OHLCV_CAPACITY_SCENARIO",
+                        "CARRY_CANCELLED_BY_LIFECYCLE",
+                    ],
+                    "next_carry": None,
+                    "origin_date": pending["origin_date"],
+                    "due_date": pending["due_date"],
+                    "order_reason": pending["order_reason"],
+                    "execution_order_id": cancellation_id,
+                    "terminal_applied": False,
+                    "execution_mode": "ohlcv_capacity",
+                }
+            )
+
+    def _reprice_execution_order(order: dict, filled_qty: int) -> dict:
+        adjusted = dict(order)
+        ticker = str(order.get("ticker"))
+        reference_price = float(order.get("reference_price") or 0.0)
+        adjusted["qty"] = int(filled_qty)
+        if order.get("side") == "BUY":
+            cost = int(filled_qty) * apply_buy_cost(reference_price, slippage)
+            adjusted["estimated_value"] = float(cost)
+            adjusted["estimated_tax"] = 0.0
+            return adjusted
+        cost_basis = holding_cost_basis.get(ticker)
+        tax_rate = ETF_TAXABLE_SELL_TAX_PCT if ticker in TAXABLE_ETF_TICKERS else 0.0
+        estimated_value = apply_sell_value(
+            reference_price,
+            int(filled_qty),
+            tax_rate,
+            slippage,
+            cost_basis_per_share=cost_basis,
+        )
+        sell_price_adj = reference_price * (1 - slippage)
+        taxable_gain = (
+            max(0.0, int(filled_qty) * (sell_price_adj - cost_basis))
+            if cost_basis is not None
+            else 0.0
+        )
+        adjusted["estimated_value"] = float(estimated_value)
+        adjusted["estimated_tax"] = float(taxable_gain * tax_rate)
+        return adjusted
+
+    def _apply_filled_order(order: dict, execution_date: pd.Timestamp) -> int:
+        """Apply one already capacity-approved fill to portfolio state."""
+        nonlocal cash
+        ticker = str(order.get("ticker"))
+        qty = int(order.get("qty", 0) or 0)
+        side = str(order.get("side"))
+        if qty <= 0:
+            return 0
+        if side == "SELL":
+            qty = min(qty, int(holdings.get(ticker, 0) or 0))
+            if qty <= 0:
+                return 0
+            remaining_qty = max(int(holdings.get(ticker, 0) or 0) - qty, 0)
+            if remaining_qty > 0:
+                holdings[ticker] = remaining_qty
+            else:
+                holdings.pop(ticker, None)
+                holding_cost_basis.pop(ticker, None)
+                holding_peak_closes.pop(ticker, None)
+            cash += float(order.get("estimated_value", 0.0))
+            trades.append(
+                {
+                    "date": execution_date,
+                    "ticker": ticker,
+                    "name": get_ticker_name(ticker),
+                    "side": "SELL",
+                    "reason": order.get("reason", "ETF_REBALANCE"),
+                    "qty": qty,
+                    "price": order.get("reference_price"),
+                    "net_value": float(order.get("estimated_value", 0.0)),
+                    "cash_flow": float(order.get("estimated_value", 0.0)),
+                    "estimated_tax": float(order.get("estimated_tax", 0.0)),
+                    "cash_after": cash,
+                }
+            )
+        else:
+            cost = float(order.get("estimated_value", 0.0))
+            previous_qty = int(holdings.get(ticker, 0) or 0)
+            holdings[ticker] = previous_qty + qty
+            fill_unit_cost = cost / qty
+            if ticker in holding_cost_basis and previous_qty > 0:
+                previous_total_cost = float(holding_cost_basis[ticker]) * previous_qty
+                holding_cost_basis[ticker] = (previous_total_cost + cost) / holdings[ticker]
+            else:
+                holding_cost_basis[ticker] = fill_unit_cost
+            cash = max(0.0, cash - cost)
+            trades.append(
+                {
+                    "date": execution_date,
+                    "ticker": ticker,
+                    "name": get_ticker_name(ticker),
+                    "side": "BUY",
+                    "reason": order.get("reason", "ETF_REBALANCE"),
+                    "qty": qty,
+                    "price": order.get("reference_price"),
+                    "net_value": cost,
+                    "cash_flow": -cost,
+                    "estimated_tax": 0.0,
+                    "cash_after": cash,
+                }
+            )
+        if execution_mode == "ohlcv_capacity":
+            trades[-1]["execution_order_id"] = order.get("execution_order_id")
+        if approval_strict:
+            _strict_sync_state(ticker)
+        return qty
+
+    def _process_due_execution_carries(
+        execution_date: pd.Timestamp,
+        execution_day: pd.DataFrame,
+    ) -> None:
+        if execution_mode != "ohlcv_capacity":
+            return
+        execution_key = pd.Timestamp(execution_date).strftime("%Y-%m-%d")
+        for key, pending in list(pending_execution_carries.items()):
+            if pending["due_date"] > execution_key:
+                continue
+            pending_execution_carries.pop(key, None)
+            order = {
+                "ticker": pending["ticker"],
+                "side": pending["side"],
+                "qty": pending["remaining_qty"],
+                "reference_price": None,
+                "reason": "ETF_EXECUTION_CARRY",
+                "execution_order_id": _make_execution_order_id(
+                    origin_date=pending["origin_date"],
+                    execution_date=execution_date,
+                    ticker=pending["ticker"],
+                    side=pending["side"],
+                    carry_age=1,
+                    reason="ETF_EXECUTION_CARRY",
+                ),
+            }
+            open_price = safe_get(execution_day.get("open"), pending["ticker"])
+            if open_price is not None:
+                spread = SPREAD_PCT / 2
+                order["reference_price"] = open_price * (1 + spread if pending["side"] == "BUY" else 1 - spread)
+            decision = _evaluate_execution_order(
+                order,
+                origin_date=pending["origin_date"],
+                carry_age=1,
+                execution_date=execution_date,
+                execution_day=execution_day,
+            )
+            execution_excluded_buy_tickers.add(pending["ticker"])
+            if decision.filled_qty > 0:
+                fill_qty = decision.filled_qty
+                if pending["side"] == "BUY":
+                    unit_cost = apply_buy_cost(float(order["reference_price"]), slippage)
+                    affordable_qty = (
+                        min(fill_qty, max(0, int(cash // unit_cost))) if unit_cost > 0 else 0
+                    )
+                    if affordable_qty < fill_qty:
+                        _record_cash_limited_carry(
+                            order,
+                            decision,
+                            affordable_qty=affordable_qty,
+                            reason="repriced carry BUY remainder cancelled by current cash",
+                        )
+                    fill_qty = affordable_qty
+                if fill_qty <= 0:
+                    continue
+                _apply_filled_order(
+                    _reprice_execution_order(order, fill_qty),
+                    execution_date,
+                )
+
+    def _strict_unpaid_receivables() -> float:
+        return float(sum(receivable.amount for receivable in pending_receivables if not receivable.paid))
+
+    def _strict_process_actions(as_of: pd.Timestamp) -> float:
+        """Apply ledger events and pay receivables before today's decisions."""
+        nonlocal cash
+        if not approval_strict or corporate_action_ledger is None:
+            return 0.0
+
+        payment_date = as_of.date()
+        pending_receivables_updated, payment_cash = process_pending_receivables(
+            pending_receivables, payment_date
+        )
+        pending_receivables[:] = pending_receivables_updated
+        cash += float(payment_cash)
+
+        actions = sorted(
+            corporate_action_ledger.events,
+            key=lambda action: (
+                (
+                    action.settlement_date
+                    if action.event_type in {EventType.CASH_SETTLEMENT, EventType.REDEMPTION}
+                    else max(
+                        value
+                        for value in (action.event_date, action.record_date, action.ex_date)
+                        if value is not None
+                    )
+                ),
+                action.event_id,
+            ),
+        )
+        for action in actions:
+            if action.event_id in processed_action_ids:
+                continue
+            effective_date = (
+                action.settlement_date
+                if action.event_type in {EventType.CASH_SETTLEMENT, EventType.REDEMPTION}
+                else max(
+                    value
+                    for value in (action.event_date, action.record_date, action.ex_date)
+                    if value is not None
+                )
+            )
+            if effective_date is None or effective_date > payment_date:
+                continue
+            ticker = action.ticker
+            if action.event_type in {
+                EventType.CASH_SETTLEMENT,
+                EventType.REDEMPTION,
+                EventType.DELISTING,
+                EventType.SUSPENSION_START,
+            }:
+                _cancel_pending_execution_carries(
+                    ticker,
+                    cancellation_date=as_of,
+                    reason="pending carry cancelled by settlement or delisting",
+                )
+            state = _strict_holding_state(ticker)
+            try:
+                if action.event_type == EventType.CASH_DISTRIBUTION:
+                    def snapshot_on_or_after(target_date: date | None) -> dict[str, int] | None:
+                        if target_date is None:
+                            return dict(holdings)
+                        candidates = sorted(
+                            key
+                            for key in historical_holdings
+                            if pd.Timestamp(target_date) <= key <= as_of
+                        )
+                        return historical_holdings[candidates[0]] if candidates else None
+
+                    record_holdings = snapshot_on_or_after(action.record_date)
+                    ex_holdings = snapshot_on_or_after(action.ex_date)
+                    if record_holdings is None or ex_holdings is None:
+                        raise CorporateActionBlocked(
+                            ApprovalBlocker(
+                                "MISSING_ENTITLEMENT_SNAPSHOT",
+                                "strict distribution entitlement lacks an as-of holding snapshot",
+                                event_id=action.event_id,
+                                ticker=action.ticker,
+                                event_date=action.event_date,
+                            )
+                        )
+                    entitlement_quantity = int(ex_holdings.get(ticker, 0) or 0)
+                    receivable = (
+                        create_distribution_receivable(
+                            action,
+                            entitlement_quantity,
+                            held_on_record_date=int(record_holdings.get(ticker, 0) or 0) > 0,
+                            held_on_ex_date=entitlement_quantity > 0,
+                        )
+                        if entitlement_quantity > 0
+                        else None
+                    )
+                    if receivable is not None:
+                        pending_receivables.append(receivable)
+                elif action.event_type in {EventType.SPLIT, EventType.REVERSE_SPLIT}:
+                    transformed = transform_split_holding(state, action)
+                    if transformed.quantity > 0:
+                        holdings[ticker] = transformed.quantity
+                    else:
+                        holdings.pop(ticker, None)
+                    if transformed.quantity > 0:
+                        holding_cost_basis[ticker] = float(
+                            transformed.total_cost_basis / transformed.quantity
+                        )
+                    _strict_sync_state(ticker, transformed)
+                    strict_state_event_ids[ticker] = action.event_id
+                elif action.event_type in {
+                    EventType.SUSPENSION_START,
+                    EventType.SUSPENSION_END,
+                    EventType.DELISTING,
+                }:
+                    _strict_sync_state(ticker, apply_lifecycle_event(state, action))
+                    strict_state_event_ids[ticker] = action.event_id
+                elif action.event_type in {EventType.CASH_SETTLEMENT, EventType.REDEMPTION}:
+                    settlement = process_settlement(state, action, payment_date)
+                    strict_states[ticker] = settlement.holding
+                    if settlement.cash_paid:
+                        cash += float(settlement.cash_paid)
+                    holdings.pop(ticker, None)
+                    holding_cost_basis.pop(ticker, None)
+                    holding_peak_closes.pop(ticker, None)
+                    strict_state_event_ids[ticker] = action.event_id
+                processed_action_ids.add(action.event_id)
+            except CorporateActionBlocked as exc:
+                strict_action_blockers.append(exc.blocker)
+                processed_action_ids.add(action.event_id)
+        pending_receivables_updated, same_day_payment_cash = process_pending_receivables(
+            pending_receivables, payment_date
+        )
+        pending_receivables[:] = pending_receivables_updated
+        cash += float(same_day_payment_cash)
+        payment_cash += same_day_payment_cash
+        return float(payment_cash)
+
+    def _strict_refresh_existing_row(as_of: pd.Timestamp, distribution_cash: float) -> None:
+        if not equity_rows or pd.Timestamp(equity_rows[-1]["date"]) != as_of:
+            return
+        day = price_by_date.get(as_of, pd.DataFrame())
+        close_series = day.get("close") if not day.empty else None
+        market_value = 0.0
+        for ticker, qty in holdings.items():
+            if _strict_holding_state(ticker).lifecycle != LifecycleState.ACTIVE:
+                continue
+            close_price = get_valuation_price(ticker, close_series, last_valid_closes)
+            if close_price is not None:
+                market_value += qty * close_price
+        receivables = _strict_unpaid_receivables()
+        equity_rows[-1].update(
+            {
+                "cash": cash,
+                "market_value": market_value,
+                "receivables": receivables,
+                "equity": cash + market_value + receivables,
+                "distribution_cash": float(equity_rows[-1].get("distribution_cash", 0.0))
+                + distribution_cash,
+            }
+        )
+
     warmup_days = 0 if initial_state else max(120, MARKET_MA_DAYS + MARKET_SLOPE_DAYS)
     for i, dt in enumerate(common_dates[:-1]):
+        strict_payment_cash = _strict_process_actions(pd.Timestamp(dt))
+        if approval_strict:
+            historical_holdings.setdefault(pd.Timestamp(dt), dict(holdings))
+            if i < warmup_days:
+                historical_holdings[pd.Timestamp(common_dates[i + 1])] = dict(holdings)
         if i < warmup_days:
             continue
 
         next_dt = common_dates[i + 1]
+        carry_due_date = common_dates[i + 2] if i + 2 < len(common_dates) else None
         today = price_by_date.get(dt, pd.DataFrame())
         next_day = price_by_date.get(next_dt, pd.DataFrame())
         if today.empty or next_day.empty:
+            if execution_mode == "ohlcv_capacity":
+                for pending in list(pending_execution_carries.values()):
+                    if pending["due_date"] <= pd.Timestamp(next_dt).strftime("%Y-%m-%d"):
+                        _cancel_pending_execution_carries(
+                            pending["ticker"],
+                            side=pending["side"],
+                            cancellation_date=next_dt,
+                            reason="carry due date has an empty today or next-day row",
+                        )
             continue
+        execution_excluded_buy_tickers.clear()
+
+        if approval_strict:
+            historical_holdings[pd.Timestamp(next_dt)] = dict(holdings)
+            update_last_valid_prices(last_valid_closes, today.get("close"))
+            _strict_refresh_existing_row(pd.Timestamp(dt), strict_payment_cash)
 
         next_open = next_day["open"]
         next_close = next_day["close"]
-        entitled_holdings = dict(holdings)
-        distribution_cash = distribution_cash_for_holdings(
-            entitled_holdings,
-            next_day.get("distribution"),
-            parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
-        )
+        if approval_strict:
+            entitled_holdings = {}
+            distribution_cash = 0.0
+        else:
+            entitled_holdings = dict(holdings)
+            distribution_cash = distribution_cash_for_holdings(
+                entitled_holdings,
+                next_day.get("distribution"),
+                parse_pct_env("ETF_DISTRIBUTION_TAX_PCT", 0.0),
+            )
         update_last_valid_prices(last_valid_closes, today.get("close"))
-        should_rebalance = (i - warmup_days + rebalance_phase_offset) % REBALANCE_STEP_DAYS == 0
+        periodic_rebalance = (
+            i - warmup_days + rebalance_phase_offset
+        ) % REBALANCE_STEP_DAYS == 0
+        # A capacity remainder is eligible on the immediately following
+        # trading date, even when that date is outside the normal rebalance
+        # cadence.  Re-enter the existing order path so carry fills and
+        # opposite-order cancellation share the same apply loop.
+        should_rebalance = periodic_rebalance
         rebalance_order_count = 0
         exit_order_count = 0
         stopped_tickers: set[str] = set()
@@ -1075,10 +1945,14 @@ def run_etf_strategy(
 
         current_market_value = 0.0
         for ticker, qty in holdings.items():
+            if approval_strict and strict_states.get(ticker, _strict_holding_state(ticker)).lifecycle != LifecycleState.ACTIVE:
+                continue
             close_price = get_valuation_price(ticker, today.get("close"), last_valid_closes)
             if close_price is not None:
                 current_market_value += qty * close_price
         current_equity = cash + current_market_value
+        if approval_strict:
+            current_equity += _strict_unpaid_receivables()
         if holdings:
             portfolio_peak_equity = max(
                 portfolio_peak_equity or current_equity,
@@ -1110,17 +1984,39 @@ def run_etf_strategy(
             <= portfolio_peak_equity * (1 - effective_portfolio_trailing_stop_pct)
         )
         if should_stop_portfolio:
-            sellable = all(safe_get(next_open, ticker) is not None for ticker in holdings)
+            if approval_strict:
+                for ticker in holdings:
+                    if _strict_holding_state(ticker).lifecycle != LifecycleState.ACTIVE:
+                        _record_blocked_order(
+                            order_date=next_dt,
+                            ticker=ticker,
+                            side="SELL",
+                            intent="ETF_PORTFOLIO_TRAILING_STOP",
+                            reason="portfolio trailing exit rejected because lifecycle is not ACTIVE",
+                        )
+            sellable = execution_mode == "ohlcv_capacity" or all(
+                safe_get(next_open, ticker) is not None
+                for ticker in holdings
+                if ticker in holdings
+                and (
+                    not approval_strict
+                    or _strict_holding_state(ticker).lifecycle == LifecycleState.ACTIVE
+                )
+            )
             if sellable:
                 for ticker, qty in list(holdings.items()):
+                    if approval_strict and _strict_holding_state(ticker).lifecycle != LifecycleState.ACTIVE:
+                        continue
                     if execute_exit(
                         ticker,
                         int(qty),
                         next_open,
                         next_dt,
                         "ETF_PORTFOLIO_TRAILING_STOP",
+                        carry_due_date,
                     ):
-                        stopped_tickers.add(ticker)
+                        if ticker not in holdings:
+                            stopped_tickers.add(ticker)
                         exit_order_count += 1
                 portfolio_peak_equity = None
                 portfolio_stop_triggered = True
@@ -1137,6 +2033,15 @@ def run_etf_strategy(
                     continue
                 if close_price > peak_close * (1 - effective_trailing_stop_pct):
                     continue
+                if approval_strict and _strict_holding_state(ticker).lifecycle != LifecycleState.ACTIVE:
+                    _record_blocked_order(
+                        order_date=next_dt,
+                        ticker=ticker,
+                        side="SELL",
+                        intent="ETF_TRAILING_STOP",
+                        reason="position trailing exit rejected because lifecycle is not ACTIVE",
+                    )
+                    continue
 
                 if execute_exit(
                     ticker,
@@ -1144,9 +2049,15 @@ def run_etf_strategy(
                     next_open,
                     next_dt,
                     "ETF_TRAILING_STOP",
+                    carry_due_date,
                 ):
-                    stopped_tickers.add(ticker)
+                    if ticker not in holdings:
+                        stopped_tickers.add(ticker)
                     exit_order_count += 1
+
+        # Carry retries happen exactly on their stored due date and before a
+        # periodic ranking pass. They do not themselves trigger a rebalance.
+        _process_due_execution_carries(next_dt, next_day)
 
         if should_rebalance:
             # 시장 필터 + 랭킹으로 목표 종목 결정
@@ -1178,6 +2089,43 @@ def run_etf_strategy(
             if stopped_tickers:
                 targets = [ticker for ticker in targets if ticker not in stopped_tickers]
 
+            if approval_strict:
+                blocked_tickers = {
+                    ticker
+                    for ticker, state in strict_states.items()
+                    if state.lifecycle != LifecycleState.ACTIVE
+                }
+                for ticker in sorted(set(targets) & blocked_tickers):
+                    _record_blocked_order(
+                        order_date=next_dt,
+                        ticker=ticker,
+                        side="BUY",
+                        intent="TARGET",
+                        reason="target rejected because lifecycle is not ACTIVE",
+                    )
+                for ticker in sorted(set(forced_exit_tickers) & blocked_tickers):
+                    _record_blocked_order(
+                        order_date=next_dt,
+                        ticker=ticker,
+                        side="SELL",
+                        intent="FORCED_EXIT",
+                        reason="forced exit rejected because lifecycle is not ACTIVE",
+                    )
+                for ticker in sorted(
+                    set(holdings) & blocked_tickers - set(targets) - set(forced_exit_tickers)
+                ):
+                    _record_blocked_order(
+                        order_date=next_dt,
+                        ticker=ticker,
+                        side="SELL",
+                        intent="REBALANCE_EXIT",
+                        reason="holding exit rejected because lifecycle is not ACTIVE",
+                    )
+                targets = [ticker for ticker in targets if ticker not in blocked_tickers]
+                forced_exit_tickers = {
+                    ticker for ticker in forced_exit_tickers if ticker not in blocked_tickers
+                }
+
             # split은 후보가 비어도 허용 그룹 보유분을 보호한다. hybrid와
             # 멀티 인덱스 비활성 모드는 기존 risk-off 전량매도 동작을 보존한다.
             selective_empty_protection = (
@@ -1203,6 +2151,8 @@ def run_etf_strategy(
                 if close_price is not None:
                     pre_market_value += qty * close_price
             pre_equity = pre_cash + pre_market_value
+            if approval_strict:
+                pre_equity += _strict_unpaid_receivables()
 
             if rebalance_observer is not None:
                 observer_event = {
@@ -1261,14 +2211,29 @@ def run_etf_strategy(
                 else bool(strategy_cfg.get("trim_overweight_positions", False))
             )
 
+            order_holdings = holdings
+            order_cost_basis = holding_cost_basis
+            if approval_strict:
+                order_holdings = {
+                    ticker: qty
+                    for ticker, qty in holdings.items()
+                    if strict_states.get(ticker, _strict_holding_state(ticker)).lifecycle
+                    == LifecycleState.ACTIVE
+                }
+                order_cost_basis = {
+                    ticker: holding_cost_basis[ticker]
+                    for ticker in order_holdings
+                    if ticker in holding_cost_basis
+                }
+
             orders = build_rebalance_orders(
-                current_holdings=holdings,
+                current_holdings=order_holdings,
                 target_tickers=targets,
                 latest_prices=latest_prices,
                 available_cash=cash,
                 latest_buy_prices=latest_buy_prices,
                 latest_sell_prices=latest_sell_prices,
-                current_cost_basis=holding_cost_basis,
+                current_cost_basis=order_cost_basis,
                 max_positions=max_positions,
                 sell_rank_buffer=ETF_SELL_RANK_BUFFER,
                 slippage=slippage,
@@ -1283,74 +2248,72 @@ def run_etf_strategy(
                 rebalance_band_pct=effective_rebalance_band_pct,
                 trim_overweight_positions=effective_trim_overweight_positions,
             )
+            if execution_mode == "ohlcv_capacity":
+                orders = [
+                    order
+                    for order in orders
+                    if not (
+                        order.get("side") == "BUY"
+                        and str(order.get("ticker")) in execution_excluded_buy_tickers
+                    )
+                ]
             rebalance_order_count = len(orders)
 
+            execution_orders = orders
+            if execution_mode == "ohlcv_capacity":
+                execution_orders = []
+                for order in orders:
+                    origin_date = pd.Timestamp(dt).strftime("%Y-%m-%d")
+                    decision = _evaluate_execution_order(
+                        order,
+                        origin_date=origin_date,
+                        carry_age=0,
+                        execution_date=next_dt,
+                        execution_day=next_day,
+                    )
+                    _store_execution_carry(
+                        order,
+                        decision,
+                        origin_date=origin_date,
+                        due_date=carry_due_date,
+                    )
+                    if decision.filled_qty > 0:
+                        execution_orders.append(
+                            _reprice_execution_order(order, decision.filled_qty)
+                        )
+
             # 생성된 주문을 즉시 전량 체결로 모사 (백테스트 단순화)
-            for o in orders:
-                raw_ticker = o.get("ticker")
-                ticker = str(raw_ticker)
-                qty = int(o.get("qty", 0) or 0)
-                ref_price = o.get("reference_price")
-                side = o.get("side")
-
-                if side == "SELL":
-                    held_qty = int(holdings.get(ticker, 0) or 0)
-                    remaining_qty = max(held_qty - qty, 0)
-                    if remaining_qty > 0:
-                        holdings[ticker] = remaining_qty
-                    else:
-                        holdings.pop(ticker, None)
-                        holding_cost_basis.pop(ticker, None)
-                        holding_peak_closes.pop(ticker, None)
-                    cash += float(o.get("estimated_value", 0.0))
-                    trades.append(
-                        {
-                            "date": next_dt,
-                            "ticker": ticker,
-                            "name": get_ticker_name(ticker),
-                            "side": "SELL",
-                            "reason": o.get("reason", "ETF_REBALANCE"),
-                            "qty": qty,
-                            "price": ref_price,
-                            "net_value": float(o.get("estimated_value", 0.0)),
-                            "cash_flow": float(o.get("estimated_value", 0.0)),
-                            "estimated_tax": float(o.get("estimated_tax", 0.0)),
-                            "cash_after": cash,
-                        }
+            for o in execution_orders:
+                if execution_mode == "ohlcv_capacity" and str(o.get("side")) == "BUY":
+                    # capacity 승인 수량이라도 실행 시점 가용 현금을 초과하면
+                    # 남은 수량을 취소한다(캐리 경로와 동일한 보수 정책).
+                    # 미적용 시 max(0, cash-cost) 클램프가 자본을 유령 생성한다.
+                    buy_qty = int(o.get("qty", 0) or 0)
+                    unit_cost = (
+                        float(o.get("estimated_value", 0.0)) / buy_qty if buy_qty > 0 else 0.0
                     )
-                else:  # BUY
-                    cost = float(o.get("estimated_value", 0.0))
-                    if qty <= 0:
+                    affordable_qty = (
+                        min(buy_qty, max(0, int(cash // unit_cost))) if unit_cost > 0 else 0
+                    )
+                    if affordable_qty < buy_qty:
+                        _record_cash_limited_buy(
+                            o,
+                            affordable_qty=affordable_qty,
+                            reason="capacity BUY exceeds current cash; remainder cancelled",
+                        )
+                    if affordable_qty <= 0:
                         continue
-                    prev_qty = int(holdings.get(ticker, 0) or 0)
-                    holdings[ticker] = prev_qty + qty
-                    fill_unit_cost = cost / qty if qty > 0 else 0.0
-                    if ticker in holding_cost_basis and prev_qty > 0:
-                        previous_total_cost = float(holding_cost_basis[ticker]) * prev_qty
-                        holding_cost_basis[ticker] = (previous_total_cost + cost) / holdings[ticker]
-                    else:
-                        holding_cost_basis[ticker] = fill_unit_cost
-                    cash -= cost
-                    trades.append(
-                        {
-                            "date": next_dt,
-                            "ticker": ticker,
-                            "name": get_ticker_name(ticker),
-                            "side": "BUY",
-                            "reason": o.get("reason", "ETF_REBALANCE"),
-                            "qty": qty,
-                            "price": ref_price,
-                            "net_value": cost,
-                            "cash_flow": -cost,
-                            "estimated_tax": 0.0,
-                            "cash_after": cash,
-                        }
-                    )
+                    if affordable_qty < buy_qty:
+                        o = _reprice_execution_order(o, affordable_qty)
+                _apply_filled_order(o, next_dt)
 
-        cash += distribution_cash
+        if not approval_strict:
+            cash += distribution_cash
         update_last_valid_prices(last_valid_closes, next_close)
         market_value = 0.0
         for ticker, qty in holdings.items():
+            if approval_strict and strict_states.get(ticker, _strict_holding_state(ticker)).lifecycle != LifecycleState.ACTIVE:
+                continue
             close_price = get_valuation_price(ticker, next_close, last_valid_closes)
             if close_price is not None:
                 market_value += qty * close_price
@@ -1358,29 +2321,33 @@ def run_etf_strategy(
                     holding_peak_closes.get(ticker, close_price),
                     close_price,
                 )
-        post_equity = cash + market_value
+        unpaid_receivables = _strict_unpaid_receivables() if approval_strict else 0.0
+        post_equity = cash + market_value + unpaid_receivables
         if holdings:
             portfolio_peak_equity = max(portfolio_peak_equity or post_equity, post_equity)
         else:
             portfolio_peak_equity = None
 
-        equity_rows.append(
-            {
-                "date": next_dt,
-                "equity": post_equity,
-                "cash": cash,
-                "market_value": market_value,
-                "holdings": ",".join(sorted(map(str, holdings.keys()))),
-                "distribution_cash": distribution_cash,
-                "rebalance_decision": should_rebalance,
-                "rebalance_order_count": rebalance_order_count,
-                "exit_order_count": exit_order_count,
-            }
-        )
+        equity_row = {
+            "date": next_dt,
+            "equity": post_equity,
+            "cash": cash,
+            "market_value": market_value,
+            "holdings": ",".join(sorted(map(str, holdings.keys()))),
+            "distribution_cash": distribution_cash,
+            "rebalance_decision": should_rebalance,
+            "rebalance_order_count": rebalance_order_count,
+            "exit_order_count": exit_order_count,
+        }
+        if approval_strict:
+            equity_row["receivables"] = unpaid_receivables
+        equity_rows.append(equity_row)
 
         if observer_event is not None:
             post_holdings_snapshot = dict(holdings)
-            post_equity = cash + market_value
+            post_equity = cash + market_value + (
+                _strict_unpaid_receivables() if approval_strict else 0.0
+            )
             observer_event.update(
                 {
                     "execution_date": next_dt,
@@ -1401,10 +2368,81 @@ def run_etf_strategy(
                 logger.exception("rebalance_observer 실행 실패")
                 raise
 
+    final_stale_tickers: set[str] = set()
+    if approval_strict and common_dates:
+        final_payment_cash = _strict_process_actions(pd.Timestamp(common_dates[-1]))
+        if equity_rows:
+            final_day = price_by_date.get(common_dates[-1], pd.DataFrame())
+            final_close = final_day.get("close") if not final_day.empty else None
+            final_market_value = 0.0
+            for ticker, qty in holdings.items():
+                if strict_states.get(ticker, _strict_holding_state(ticker)).lifecycle != LifecycleState.ACTIVE:
+                    continue
+                close_price = safe_get(final_close, ticker)
+                if close_price is not None:
+                    final_market_value += qty * close_price
+            equity_rows[-1].update(
+                {
+                    "cash": cash,
+                    "market_value": final_market_value,
+                    "receivables": _strict_unpaid_receivables(),
+                    "equity": cash + final_market_value + _strict_unpaid_receivables(),
+                    "distribution_cash": float(equity_rows[-1]["distribution_cash"])
+                    + final_payment_cash,
+                }
+            )
+        final_day = price_by_date.get(common_dates[-1], pd.DataFrame())
+        final_close = final_day.get("close") if not final_day.empty else None
+        for ticker, state in strict_states.items():
+            if state.quantity <= 0:
+                continue
+            if state.lifecycle != LifecycleState.ACTIVE:
+                final_stale_tickers.add(ticker)
+                continue
+            if safe_get(final_close, ticker) is None:
+                final_stale_tickers.add(ticker)
+        final_report = final_approval_report(
+            corporate_action_ledger,
+            strict_states,
+            stale_tickers=final_stale_tickers,
+        )
+        if strict_action_blockers:
+            final_report = ApprovalReport(
+                "BLOCKED",
+                tuple(
+                    sorted(
+                        set(final_report.blockers).union(strict_action_blockers),
+                        key=lambda blocker: (
+                            blocker.code,
+                            blocker.event_id or "",
+                            blocker.ticker or "",
+                            blocker.message,
+                        ),
+                    )
+                ),
+                final_report.event_count,
+                final_report.ledger_sha256,
+            )
+    else:
+        final_report = None
+
+    if execution_mode == "ohlcv_capacity" and common_dates:
+        for pending in list(pending_execution_carries.values()):
+            _cancel_pending_execution_carries(
+                pending["ticker"],
+                cancellation_date=common_dates[-1],
+                reason="pending carry cancelled because the run has no following trading date",
+            )
+
     result = (pd.DataFrame(equity_rows), pd.DataFrame(trades))
     if original_ticker_groups is not None:
         _etf_shared.ETF_TICKER_GROUPS = original_ticker_groups
-    if return_final_state:
+    if return_final_state or approval_strict or execution_mode == "ohlcv_capacity":
+        final_equity = None
+        if not result[0].empty and "equity" in result[0].columns:
+            candidate_final_equity = float(result[0]["equity"].iloc[-1])
+            if np.isfinite(candidate_final_equity) and candidate_final_equity > 0:
+                final_equity = candidate_final_equity
         final_state = {
             "cash": cash,
             "holdings": holdings,
@@ -1414,7 +2452,26 @@ def run_etf_strategy(
             "last_valid_closes": last_valid_closes,
             "rebalance_phase_offset": rebalance_phase_offset,
             "exit_phase_offset": exit_phase_offset,
+            "final_equity": final_equity,
         }
+        if approval_strict:
+            final_state.update(
+                {
+                    "corporate_action_states": strict_states,
+                    "pending_receivables": tuple(pending_receivables),
+                    "approval_report": final_report,
+                    "approval_stale_tickers": sorted(final_stale_tickers),
+                    "blocked_orders": blocked_orders,
+                }
+            )
+        if execution_mode == "ohlcv_capacity":
+            final_state.update(
+                {
+                    "execution_mode": "ohlcv_capacity",
+                    "execution_diagnostics": execution_diagnostics,
+                    "pending_execution_carries": tuple(pending_execution_carries.values()),
+                }
+            )
         return (*result, final_state)
     return result
 
@@ -1883,14 +2940,23 @@ def build_period_comparison(df: pd.DataFrame) -> pd.DataFrame:
     return comparison
 
 
-def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_single_mode(
+    *,
+    approval_strict: bool = False,
+    corporate_action_ledger: CorporateActionLedger | None = None,
+    initial_cash: float = INITIAL_CASH,
+    execution_mode: str = "legacy",
+    execution_participation_rate: float = 0.05,
+    return_final_state: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     index_df = get_index_data()
     us_index_df = get_us_index_data() if ENABLE_MULTI_INDEX_RISK else None
     common_dates = list(index_df["date"])
 
     strategy_cfg = get_strategy_config()
-    result, trades = run_etf_strategy(
-        INITIAL_CASH,
+    wants_final_state = approval_strict or return_final_state
+    strategy_result = run_etf_strategy(
+        initial_cash,
         common_dates,
         index_df,
         use_market_filter=USE_MARKET_FILTER,
@@ -1899,11 +2965,21 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
         risk_off_liquidate=strategy_cfg.get("liquidate_on_risk_off", True),
         us_index_df=us_index_df,
         enable_multi_index_risk=ENABLE_MULTI_INDEX_RISK,
+        approval_strict=approval_strict,
+        corporate_action_ledger=corporate_action_ledger,
+        return_final_state=wants_final_state,
+        execution_mode=execution_mode,
+        participation_rate=execution_participation_rate,
     )
+    if wants_final_state:
+        result, trades, final_state = strategy_result
+    else:
+        result, trades = strategy_result
+        final_state = None
 
-    if ENABLE_BENCHMARK:
+    if ENABLE_BENCHMARK and not approval_strict and execution_mode == "legacy":
         try:
-            benchmark_curve = run_kodex200_buy_and_hold(INITIAL_CASH, common_dates)
+            benchmark_curve = run_kodex200_buy_and_hold(initial_cash, common_dates)
         except Exception as e:
             print(f"[경고] 벤치마크 수집 실패: {e} — 벤치마크 병합을 생략합니다.")
             benchmark_curve = pd.DataFrame()
@@ -1921,8 +2997,8 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
             result = pd.merge(result, benchmark_curve, on="date", how="outer")
 
     result = result.sort_values("date")
-    result["equity"] = result["equity"].ffill().fillna(INITIAL_CASH)
-    result["cash"] = result["cash"].ffill().fillna(INITIAL_CASH)
+    result["equity"] = result["equity"].ffill().fillna(initial_cash)
+    result["cash"] = result["cash"].ffill().fillna(initial_cash)
     result["market_value"] = result["market_value"].ffill().fillna(0)
     result["rebalance_decision"] = (
         result["rebalance_decision"].astype("boolean").fillna(False).astype(bool)
@@ -1932,10 +3008,477 @@ def run_single_mode() -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     result["exit_order_count"] = result["exit_order_count"].fillna(0).astype(int)
 
-    if ENABLE_BENCHMARK and "equity_kodex200_bh" in result.columns:
-        result["equity_kodex200_bh"] = result["equity_kodex200_bh"].ffill().fillna(INITIAL_CASH)
+    if ENABLE_BENCHMARK and not approval_strict and execution_mode == "legacy" and "equity_kodex200_bh" in result.columns:
+        result["equity_kodex200_bh"] = result["equity_kodex200_bh"].ffill().fillna(initial_cash)
 
+    if wants_final_state:
+        return result, trades, final_state
     return result, trades
+
+
+def _parse_execution_aums(raw: str | Sequence[int | float]) -> list[int]:
+    values = raw.split(",") if isinstance(raw, str) else list(raw)
+    aums: list[int] = []
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            amount = int(text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid execution AUM: {text}") from exc
+        if amount <= 0:
+            raise ValueError("execution AUM values must be positive integers")
+        aums.append(amount)
+    if not aums:
+        raise ValueError("at least one execution AUM is required")
+    return aums
+
+
+def _validate_execution_output_dir(output_dir: str | Path) -> Path:
+    candidate = Path(output_dir).expanduser().resolve()
+    forbidden = [
+        OUTPUT_DIR.expanduser().resolve(),
+        Path("outputs_approval").expanduser().resolve(),
+    ]
+    for protected in forbidden:
+        if candidate == protected or candidate in protected.parents or protected in candidate.parents:
+            raise ValueError(f"execution output directory overlaps protected path: {candidate}")
+    return candidate
+
+
+_EXECUTION_ARTIFACT_NAMES = frozenset(
+    {
+        "execution_summary.csv",
+        "execution_diagnostics.csv",
+        "execution_trades.csv",
+        "execution_reconciliation.csv",
+        "execution_metadata.json",
+    }
+)
+
+
+def _prepare_execution_output_dir(output_dir: str | Path) -> Path:
+    candidate = _validate_execution_output_dir(output_dir)
+    if not candidate.exists():
+        return candidate
+    if not candidate.is_dir():
+        raise ValueError(f"execution output path is not a directory: {candidate}")
+    extras = [path.name for path in candidate.iterdir() if path.name not in _EXECUTION_ARTIFACT_NAMES]
+    if extras:
+        raise ValueError(
+            "execution output directory contains unowned stale entries: "
+            + ", ".join(sorted(extras))
+        )
+    for name in _EXECUTION_ARTIFACT_NAMES:
+        path = candidate / name
+        if path.exists() and not path.is_file():
+            raise ValueError(f"execution artifact path is not a file: {path}")
+    return candidate
+
+
+def _validate_execution_cli_contract(
+    *,
+    execution_mode: str,
+    approval_strict: bool,
+    run_mode: str,
+    raw_aums: str,
+    raw_rate: float,
+    output_dir: str | Path,
+) -> tuple[list[int], float, Path] | None:
+    if execution_mode != "ohlcv_capacity":
+        return None
+    if approval_strict:
+        raise ValueError("execution capacity cannot be combined with approval-strict")
+    if run_mode != "single":
+        raise ValueError("execution capacity requires --mode single")
+    aums = _parse_execution_aums(raw_aums)
+    rate = float(raw_rate)
+    if not np.isfinite(rate) or not 0 <= rate <= 1:
+        raise ValueError("execution participation rate must be finite and between 0 and 1")
+    return aums, rate, _prepare_execution_output_dir(output_dir)
+
+
+def _execution_sha256(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _commit_execution_outputs(
+    *,
+    selected_dir: Path,
+    summaries: list[dict[str, Any]],
+    diagnostics: list[dict[str, Any]],
+    scenario_trades: list[dict[str, Any]],
+    reconciliations: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    summary_columns: list[str],
+    diagnostic_columns: list[str],
+    trade_columns: list[str],
+    reconciliation_columns: list[str],
+) -> None:
+    selected_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage_parent = selected_dir.parent
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{selected_dir.name}.staging-",
+            dir=str(stage_parent),
+        )
+    )
+    backup_dir: Path | None = None
+    try:
+        pd.DataFrame(summaries, columns=summary_columns).to_csv(
+            staging_dir / "execution_summary.csv", index=False, encoding="utf-8-sig"
+        )
+        pd.DataFrame(diagnostics, columns=diagnostic_columns).to_csv(
+            staging_dir / "execution_diagnostics.csv", index=False, encoding="utf-8-sig"
+        )
+        pd.DataFrame(scenario_trades, columns=trade_columns).to_csv(
+            staging_dir / "execution_trades.csv", index=False, encoding="utf-8-sig"
+        )
+        pd.DataFrame(reconciliations, columns=reconciliation_columns).to_csv(
+            staging_dir / "execution_reconciliation.csv", index=False, encoding="utf-8-sig"
+        )
+        (staging_dir / "execution_metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+
+        if selected_dir.exists():
+            backup_dir = Path(
+                tempfile.mkdtemp(prefix=f".{selected_dir.name}.backup-", dir=str(stage_parent))
+            )
+            shutil.rmtree(backup_dir)
+            os.replace(selected_dir, backup_dir)
+        try:
+            os.replace(staging_dir, selected_dir)
+        except BaseException:
+            if backup_dir is not None and backup_dir.exists() and not selected_dir.exists():
+                os.replace(backup_dir, selected_dir)
+            raise
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _execution_date_key(value: Any) -> str:
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _execution_capacity_scenario(
+    *,
+    aum: int,
+    result: pd.DataFrame,
+    trades: pd.DataFrame,
+    final_state: dict[str, Any],
+    input_hash: str,
+    config_hash: str,
+    participation_rate: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    scenario_id = f"aum_{aum}"
+    diagnostics = list(final_state.get("execution_diagnostics", ()))
+    if final_state.get("execution_mode") != "ohlcv_capacity":
+        raise RuntimeError(f"{scenario_id}: capacity execution mode was not reported")
+    if final_state.get("pending_execution_carries"):
+        raise RuntimeError(f"{scenario_id}: pending execution carry remains at scenario end")
+    diagnostic_ids = [str(row.get("execution_order_id", "")) for row in diagnostics]
+    if not diagnostics and not trades.empty:
+        raise RuntimeError(f"{scenario_id}: trades exist without execution diagnostics")
+    if diagnostics and any(not value for value in diagnostic_ids):
+        raise RuntimeError(f"{scenario_id}: every execution diagnostic requires an order ID")
+    if diagnostics and len(set(diagnostic_ids)) != len(diagnostic_ids):
+        raise RuntimeError(f"{scenario_id}: duplicate execution diagnostic IDs")
+    diagnostic_rows: list[dict[str, Any]] = []
+    for diagnostic in diagnostics:
+        row = {
+            "scenario_id": scenario_id,
+            "aum": aum,
+            "diagnostic_only": True,
+            "executable_fill_claim": False,
+            "input_hash": input_hash,
+            "config_hash": config_hash,
+        }
+        row.update(diagnostic)
+        if isinstance(row.get("diagnostic_labels"), (list, tuple)):
+            row["diagnostic_labels"] = json.dumps(row["diagnostic_labels"], ensure_ascii=False)
+        diagnostic_rows.append(row)
+
+    diagnostic_lookup: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    diagnostic_by_id = {str(row["execution_order_id"]): row for row in diagnostics}
+    for row in diagnostics:
+        key = (
+            _execution_date_key(row.get("date")),
+            str(row.get("ticker")),
+            str(row.get("side")),
+        )
+        diagnostic_lookup.setdefault(key, []).append(row)
+
+    trade_rows: list[dict[str, Any]] = []
+    if not trades.empty:
+        for trade in trades.to_dict("records"):
+            key = (
+                _execution_date_key(trade.get("date")),
+                str(trade.get("ticker")),
+                str(trade.get("side")),
+            )
+            matched = diagnostic_by_id.get(str(trade.get("execution_order_id")))
+            if matched is None:
+                candidates = diagnostic_lookup.get(key, [])
+                matched = candidates.pop(0) if candidates else {}
+            row = dict(trade)
+            row.update(
+                {
+                    "scenario_id": scenario_id,
+                    "aum": aum,
+                    "execution_mode": "ohlcv_capacity",
+                    "diagnostic_only": True,
+                    "executable_fill_claim": False,
+                    "filled_qty": int(trade.get("qty", 0) or 0),
+                    "requested_qty": matched.get("requested_qty"),
+                    "capacity_qty": matched.get("capacity_qty"),
+                    "decision": matched.get("decision"),
+                    "diagnostic_reason": matched.get("reason"),
+                    "input_hash": input_hash,
+                    "config_hash": config_hash,
+                }
+            )
+            trade_rows.append(row)
+
+    diagnostic_qty_by_id = {
+        str(row["execution_order_id"]): int(row.get("filled_qty", 0) or 0)
+        for row in diagnostics
+    }
+    trade_qty_by_id: dict[str, int] = {}
+    for row in trade_rows:
+        order_id = str(row.get("execution_order_id", ""))
+        if not order_id:
+            raise RuntimeError(f"{scenario_id}: execution trade is missing an order ID")
+        trade_qty_by_id[order_id] = trade_qty_by_id.get(order_id, 0) + int(
+            row.get("filled_qty", 0) or 0
+        )
+    for order_id, filled_qty in diagnostic_qty_by_id.items():
+        if filled_qty != trade_qty_by_id.get(order_id, 0):
+            raise RuntimeError(f"{scenario_id}: trade/diagnostic quantity mismatch for {order_id}")
+
+    cash_flow_series = (
+        trades["cash_flow"] if "cash_flow" in trades.columns else pd.Series(dtype=float)
+    )
+    trade_cash_flow = float(pd.to_numeric(cash_flow_series, errors="coerce").fillna(0).sum())
+    distribution_cash = 0.0
+    if "distribution_cash" in result.columns:
+        distribution_cash = float(pd.to_numeric(result["distribution_cash"], errors="coerce").fillna(0).sum())
+    final_cash = float(final_state.get("cash", 0.0))
+    expected_cash = float(aum) + trade_cash_flow + distribution_cash
+    cash_delta = final_cash - expected_cash
+
+    net_trade_qty: dict[str, int] = {}
+    for trade in trades.to_dict("records"):
+        ticker = str(trade.get("ticker"))
+        signed_qty = int(trade.get("qty", 0) or 0)
+        net_trade_qty[ticker] = net_trade_qty.get(ticker, 0) + (
+            signed_qty if trade.get("side") == "BUY" else -signed_qty
+        )
+    final_holdings = {
+        str(ticker): int(quantity)
+        for ticker, quantity in dict(final_state.get("holdings", {})).items()
+    }
+    tickers = sorted(set(net_trade_qty) | set(final_holdings)) or ["<PORTFOLIO>"]
+    reconciliation_rows: list[dict[str, Any]] = []
+    for ticker in tickers:
+        final_qty = final_holdings.get(ticker, 0)
+        net_qty = net_trade_qty.get(ticker, 0)
+        reconciliation_rows.append(
+            {
+                "scenario_id": scenario_id,
+                "aum": aum,
+                "ticker": ticker,
+                "initial_cash": aum,
+                "trade_cash_flow": trade_cash_flow,
+                "distribution_cash": distribution_cash,
+                "expected_cash": expected_cash,
+                "final_cash": final_cash,
+                "cash_delta": cash_delta,
+                "net_trade_qty": net_qty,
+                "final_holdings_qty": final_qty,
+                "holdings_delta": final_qty - net_qty,
+                "cash_reconciled": abs(cash_delta) <= 1e-6,
+                "holdings_reconciled": final_qty == net_qty,
+                "reconciled": abs(cash_delta) <= 1e-6 and final_qty == net_qty,
+                "diagnostic_only": True,
+                "executable_fill_claim": False,
+            }
+        )
+
+    final_equity = float(result.iloc[-1]["equity"]) if not result.empty else final_cash
+    requested_total = sum(int(row.get("requested_qty", 0) or 0) for row in diagnostics)
+    filled_total = sum(int(row.get("filled_qty", 0) or 0) for row in diagnostics)
+    actual_filled_total = sum(int(row.get("filled_qty", 0) or 0) for row in trade_rows)
+    capacity_total = sum(int(row.get("capacity_qty", 0) or 0) for row in diagnostics)
+    summary = {
+        "scenario_id": scenario_id,
+        "aum": aum,
+        "execution_mode": "ohlcv_capacity",
+        "participation_rate": participation_rate,
+        "diagnostic_only": True,
+        "executable_fill_claim": False,
+        "orderbook_used": False,
+        "final_equity": final_equity,
+        "final_cash": final_cash,
+        "trade_count": len(trades),
+        "diagnostic_count": len(diagnostics),
+        "requested_qty_total": requested_total,
+        "filled_qty_total": filled_total,
+        "actual_trade_filled_qty_total": actual_filled_total,
+        "capacity_qty_total": capacity_total,
+        "carry_cancel_count": sum(
+            1 for row in diagnostics if str(row.get("decision")) == "CARRY_CANCELLED"
+        ),
+        "reconciled": all(row["reconciled"] for row in reconciliation_rows)
+        and filled_total == actual_filled_total,
+        "input_hash": input_hash,
+        "config_hash": config_hash,
+    }
+    return summary, diagnostic_rows, trade_rows, reconciliation_rows
+
+
+def run_execution_capacity_scenarios(
+    *,
+    aums: Sequence[int | float],
+    participation_rate: float = 0.05,
+    output_dir: str | Path = "outputs_execution",
+    strategy_runner: Callable[..., Any] | None = None,
+) -> dict[str, Path]:
+    """Run independent diagnostic-only OHLCV scenarios and write isolated outputs."""
+    if not np.isfinite(float(participation_rate)) or not 0 <= float(participation_rate) <= 1:
+        raise ValueError("execution participation rate must be finite and between 0 and 1")
+    parsed_aums = _parse_execution_aums(aums)
+    selected_dir = _prepare_execution_output_dir(output_dir)
+    runner = strategy_runner or run_single_mode
+    if _etf_shared.UNIVERSE_MODE == "auto":
+        ensure_universe_initialized()
+    execution_universe = [str(ticker) for ticker in getattr(_etf_shared, "ETF_LIST", ETF_LIST)]
+    input_payload = {
+        "start": START,
+        "end": END,
+        "mode": "single",
+        "universe": execution_universe,
+    }
+    config_payload = {
+        "strategy": get_strategy_config(),
+        "base_slippage": BASE_SLIPPAGE,
+        "spread_pct": SPREAD_PCT,
+        "participation_rate": float(participation_rate),
+        "carry_policy": "exactly one following trading date",
+    }
+    input_hash = _execution_sha256(input_payload)
+    config_hash = _execution_sha256(config_payload)
+    summaries: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    scenario_trades: list[dict[str, Any]] = []
+    reconciliations: list[dict[str, Any]] = []
+    scenario_periods: dict[str, list[str]] = {}
+
+    for aum in parsed_aums:
+        # Each invocation starts a fresh strategy state; no state is handed to
+        # the next AUM scenario.
+        result, trades, final_state = runner(
+            initial_cash=aum,
+            execution_mode="ohlcv_capacity",
+            execution_participation_rate=float(participation_rate),
+            return_final_state=True,
+        )
+        if not isinstance(final_state, dict):
+            raise TypeError("capacity strategy runner must return a final state mapping")
+        scenario_id = f"aum_{aum}"
+        scenario_periods[scenario_id] = (
+            [_execution_date_key(result["date"].iloc[0]), _execution_date_key(result["date"].iloc[-1])]
+            if not result.empty and "date" in result.columns
+            else [START, END]
+        )
+        summary, diag_rows, trade_rows, recon_rows = _execution_capacity_scenario(
+            aum=aum,
+            result=result,
+            trades=trades,
+            final_state=final_state,
+            input_hash=input_hash,
+            config_hash=config_hash,
+            participation_rate=float(participation_rate),
+        )
+        summaries.append(summary)
+        diagnostics.extend(diag_rows)
+        scenario_trades.extend(trade_rows)
+        reconciliations.extend(recon_rows)
+
+    if not all(summary["reconciled"] for summary in summaries):
+        raise RuntimeError("execution reconciliation failed; no capacity artifacts were written")
+
+    summary_columns = list(summaries[0]) if summaries else [
+        "scenario_id", "aum", "execution_mode", "participation_rate", "diagnostic_only",
+        "executable_fill_claim",
+    ]
+    diagnostic_columns = [
+        "scenario_id", "aum", "execution_mode", "diagnostic_only", "executable_fill_claim", "input_hash", "config_hash",
+        "date", "ticker", "side", "decision", "requested_qty", "filled_qty", "remaining_qty",
+        "capacity_qty", "bar_volume", "bar_value", "close_volume_notional_estimate", "participation_rate",
+        "carry_age", "max_carry_days", "reason", "diagnostic_labels", "origin_date", "due_date",
+        "order_reason", "execution_order_id", "terminal_applied",
+    ]
+    trade_columns = [
+        "scenario_id", "aum", "execution_mode", "diagnostic_only", "executable_fill_claim", "input_hash", "config_hash",
+        "date", "ticker", "side", "reason", "qty", "filled_qty", "requested_qty", "capacity_qty",
+        "decision", "diagnostic_reason", "execution_order_id", "price", "net_value", "cash_flow",
+        "estimated_tax", "cash_after",
+    ]
+    reconciliation_columns = list(reconciliations[0]) if reconciliations else [
+        "scenario_id", "aum", "ticker", "reconciled"
+    ]
+    metadata = {
+        "mode": "ohlcv_capacity",
+        "execution_mode": "ohlcv_capacity",
+        "diagnostic_only": True,
+        "executable_fill_claim": False,
+        "orderbook_used": False,
+        "aums": parsed_aums,
+        "participation_rate": float(participation_rate),
+        "carry_policy": "exactly one following trading date",
+        "input_hash": input_hash,
+        "config_hash": config_hash,
+        "period": {"start": START, "end": END},
+        "scenario_periods": scenario_periods,
+        "output_dir": str(selected_dir),
+        "protected_outputs": [str(OUTPUT_DIR), "outputs_approval"],
+        "artifacts": [
+            "execution_summary.csv",
+            "execution_diagnostics.csv",
+            "execution_trades.csv",
+            "execution_reconciliation.csv",
+            "execution_metadata.json",
+        ],
+    }
+    _commit_execution_outputs(
+        selected_dir=selected_dir,
+        summaries=summaries,
+        diagnostics=diagnostics,
+        scenario_trades=scenario_trades,
+        reconciliations=reconciliations,
+        metadata=metadata,
+        summary_columns=summary_columns,
+        diagnostic_columns=diagnostic_columns,
+        trade_columns=trade_columns,
+        reconciliation_columns=reconciliation_columns,
+    )
+    metadata_path = selected_dir / "execution_metadata.json"
+    return {
+        "output_dir": selected_dir,
+        "metadata": metadata_path,
+        "summary": selected_dir / "execution_summary.csv",
+        "diagnostics": selected_dir / "execution_diagnostics.csv",
+        "trades": selected_dir / "execution_trades.csv",
+        "reconciliation": selected_dir / "execution_reconciliation.csv",
+    }
 
 
 def run_experiment_mode() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -2202,6 +3745,226 @@ def _build_performance_config() -> dict:
     }
 
 
+def _strict_coverage_blockers(
+    ledger: CorporateActionLedger,
+    common_dates: Sequence[pd.Timestamp],
+    universe: Sequence[str],
+) -> list[ApprovalBlocker]:
+    """Bind the verified manifest scope to the actual strategy run scope."""
+    blockers: list[ApprovalBlocker] = []
+    verification_start = ledger.manifest.verification_start
+    verification_end = ledger.manifest.verification_end
+    if not common_dates:
+        blockers.append(ApprovalBlocker("EMPTY_STRATEGY_CALENDAR", "strategy common_dates is empty"))
+    else:
+        run_start = pd.Timestamp(common_dates[0]).date()
+        run_end = pd.Timestamp(common_dates[-1]).date()
+        if verification_start is None or verification_end is None:
+            blockers.append(
+                ApprovalBlocker(
+                    "RUN_OUTSIDE_VERIFICATION_PERIOD",
+                    "manifest verification period is required to bind the strategy calendar",
+                )
+            )
+        else:
+            if run_start < verification_start:
+                blockers.append(
+                    ApprovalBlocker(
+                        "RUN_START_OUTSIDE_VERIFICATION_PERIOD",
+                        f"strategy starts {run_start.isoformat()} before verified start "
+                        f"{verification_start.isoformat()}",
+                        event_date=run_start,
+                    )
+                )
+            if run_end > verification_end:
+                blockers.append(
+                    ApprovalBlocker(
+                        "RUN_END_OUTSIDE_VERIFICATION_PERIOD",
+                        f"strategy ends {run_end.isoformat()} after verified end "
+                        f"{verification_end.isoformat()}",
+                        event_date=run_end,
+                    )
+                )
+    covered = set(ledger.manifest.verification_tickers)
+    missing = sorted({str(ticker) for ticker in universe} - covered)
+    if missing:
+        blockers.append(
+            ApprovalBlocker(
+                "UNIVERSE_OUTSIDE_VERIFICATION_TICKERS",
+                "strategy universe is not fully covered by manifest: " + ",".join(missing),
+            )
+        )
+    return blockers
+
+
+def _validate_approval_output_dir(output_dir: Path) -> Path:
+    candidate = output_dir.expanduser().resolve()
+    standard = OUTPUT_DIR.expanduser().resolve()
+    if candidate == standard or candidate in standard.parents or standard in candidate.parents:
+        raise ValueError(
+            f"approval output directory overlaps standard output directory: {candidate}"
+        )
+    return candidate
+
+
+def _approval_report_payload(
+    report: ApprovalReport,
+    blocked_orders: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    return {
+        "status": report.status,
+        "approval_valid": report.approval_valid,
+        "event_count": report.event_count,
+        "ledger_sha256": report.ledger_sha256,
+        "blockers": [
+            {
+                "code": blocker.code,
+                "message": blocker.message,
+                "event_id": blocker.event_id,
+                "ticker": blocker.ticker,
+                "event_date": blocker.event_date.isoformat() if blocker.event_date else None,
+            }
+            for blocker in report.blockers
+        ],
+        "blocked_orders": list(blocked_orders),
+    }
+
+
+def _approval_reproducibility_payload(
+    *,
+    ledger_path: str,
+    manifest_path: str,
+    output_dir: str,
+    report: ApprovalReport,
+) -> dict[str, Any]:
+    strict_config = _build_performance_config()
+    strict_config["enable_benchmark"] = False
+    return {
+        "mode": "approval_strict",
+        "start": START,
+        "end": END,
+        "run_mode": RUN_MODE,
+        "ledger_path": ledger_path,
+        "manifest_path": manifest_path,
+        "output_dir": output_dir,
+        "ledger_sha256": report.ledger_sha256,
+        "strategy_config": strict_config,
+        "benchmark_supported": False,
+        "status": report.status,
+    }
+
+
+def _write_approval_blocked(
+    output_dir: Path,
+    report: ApprovalReport,
+    *,
+    ledger_path: str,
+    manifest_path: str,
+    blocked_orders: Sequence[dict[str, Any]] = (),
+) -> None:
+    """Write only deterministic approval diagnostics for a blocked strict run."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in (
+        "approval_equity_curve.csv",
+        "approval_trades.csv",
+        "approval_performance.json",
+        "performance.json",
+    ):
+        stale_path = output_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+    with (output_dir / "approval_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            _approval_report_payload(report, blocked_orders),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    blocker_rows = [
+        {
+            "code": blocker.code,
+            "message": blocker.message,
+            "event_id": blocker.event_id,
+            "ticker": blocker.ticker,
+            "event_date": blocker.event_date.isoformat() if blocker.event_date else None,
+        }
+        for blocker in report.blockers
+    ]
+    pd.DataFrame(
+        blocker_rows,
+        columns=["code", "message", "event_id", "ticker", "event_date"],
+    ).to_csv(output_dir / "approval_blockers.csv", index=False, encoding="utf-8-sig")
+    with (output_dir / "reproducibility.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            _approval_reproducibility_payload(
+                ledger_path=ledger_path,
+                manifest_path=manifest_path,
+                output_dir=str(output_dir),
+                report=report,
+            ),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+
+def _write_approval_result(
+    output_dir: Path,
+    result: pd.DataFrame,
+    trades: pd.DataFrame,
+    report: ApprovalReport,
+    *,
+    ledger_path: str,
+    manifest_path: str,
+    blocked_orders: Sequence[dict[str, Any]] = (),
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result.to_csv(output_dir / "approval_equity_curve.csv", index=False, encoding="utf-8-sig")
+    trades.to_csv(output_dir / "approval_trades.csv", index=False, encoding="utf-8-sig")
+    stats = calc_stats(result, "equity")
+    stats.update(
+        calc_trading_stats(
+            trades,
+            result["equity"],
+            result["date"],
+            result.get("rebalance_decision"),
+        )
+    )
+    with (output_dir / "approval_report.json").open("w", encoding="utf-8") as handle:
+        payload = _approval_report_payload(report, blocked_orders)
+        payload["performance"] = _to_json_serializable(stats)
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    blocker_rows = [
+        {
+            "code": blocker.code,
+            "message": blocker.message,
+            "event_id": blocker.event_id,
+            "ticker": blocker.ticker,
+            "event_date": blocker.event_date.isoformat() if blocker.event_date else None,
+        }
+        for blocker in report.blockers
+    ]
+    pd.DataFrame(
+        blocker_rows,
+        columns=["code", "message", "event_id", "ticker", "event_date"],
+    ).to_csv(output_dir / "approval_blockers.csv", index=False, encoding="utf-8-sig")
+    with (output_dir / "reproducibility.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            _approval_reproducibility_payload(
+                ledger_path=ledger_path,
+                manifest_path=manifest_path,
+                output_dir=str(output_dir),
+                report=report,
+            ),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+
 def run_risk_off_compare_mode() -> None:
     """liquidate_on_risk_off=True vs False 비교 실행"""
     index_df = get_index_data()
@@ -2318,7 +4081,115 @@ def main():
 
     print(f"백테스트 기간: {START} ~ {END} / 모드: {RUN_MODE}")
 
-    from pykrx_utils import check_krx_auth_status, KRX_PASSWORD_CHANGE_URL
+    execution_aums: list[int] | None = None
+    execution_rate: float | None = None
+    execution_output_dir: Path | None = None
+    try:
+        execution_contract = _validate_execution_cli_contract(
+            execution_mode=args.execution_mode,
+            approval_strict=args.approval_strict,
+            run_mode=RUN_MODE,
+            raw_aums=args.execution_aum,
+            raw_rate=args.execution_participation_rate,
+            output_dir=args.execution_output_dir,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"실행 capacity 입력/출력 경로 거부: {exc}")
+        return
+    if execution_contract is not None:
+        execution_aums, execution_rate, execution_output_dir = execution_contract
+
+    approval_output_dir = Path(args.approval_output_dir)
+    corporate_action_ledger = None
+    if args.approval_strict:
+        try:
+            approval_output_dir = _validate_approval_output_dir(approval_output_dir)
+        except ValueError as exc:
+            print(f"승인 출력 경로 거부: {exc}")
+            return
+        if RUN_MODE != "single":
+            report = ApprovalReport(
+                "BLOCKED",
+                (
+                    ApprovalBlocker(
+                        "STRICT_MODE_UNSUPPORTED",
+                        "approval_strict supports only --mode single; benchmark and experiment paths are excluded",
+                    ),
+                ),
+                0,
+                "",
+            )
+            _write_approval_blocked(
+                approval_output_dir,
+                report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+        try:
+            corporate_action_ledger = load_corporate_action_ledger(
+                args.corporate_actions_ledger,
+                args.corporate_actions_manifest,
+            )
+            initial_report = corporate_action_ledger.approval_report()
+        except (
+            AttributeError,
+            CorporateActionBlocked,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            report = ApprovalReport(
+                "BLOCKED",
+                (ApprovalBlocker("LEDGER_LOAD_ERROR", str(exc)),),
+                0,
+                "",
+            )
+            _write_approval_blocked(
+                approval_output_dir,
+                report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+        if not initial_report.approval_valid:
+            _write_approval_blocked(
+                approval_output_dir,
+                initial_report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+        if _etf_shared.UNIVERSE_MODE == "auto":
+            ensure_universe_initialized()
+        coverage_blockers = _strict_coverage_blockers(
+            corporate_action_ledger,
+            [pd.Timestamp(START), pd.Timestamp(END)],
+            ETF_LIST,
+        )
+        if coverage_blockers:
+            coverage_report = ApprovalReport(
+                "BLOCKED",
+                tuple(initial_report.blockers) + tuple(coverage_blockers),
+                initial_report.event_count,
+                initial_report.ledger_sha256,
+            )
+            _write_approval_blocked(
+                approval_output_dir,
+                coverage_report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+
+    from pykrx_utils import KRX_PASSWORD_CHANGE_URL, check_krx_auth_status
+    get_stock()
     krx_status = check_krx_auth_status()
     if krx_status == "password_change_needed":
         print()
@@ -2330,12 +4201,30 @@ def main():
         print()
         exit(1)
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
     if RUN_MODE not in {"single", "experiment", "risk_off_compare"}:
         print(f"\n❌ 잘못된 ETF_BACKTEST_MODE 값: {RUN_MODE}")
         print("   허용값: single | experiment | risk_off_compare")
         exit(1)
+
+    if args.execution_mode == "ohlcv_capacity":
+        try:
+            assert execution_aums is not None
+            assert execution_rate is not None
+            assert execution_output_dir is not None
+            artifacts = run_execution_capacity_scenarios(
+                aums=execution_aums,
+                participation_rate=execution_rate,
+                output_dir=execution_output_dir,
+                strategy_runner=run_single_mode,
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            print(f"실행 capacity 시나리오 실패: {exc}")
+            raise SystemExit(1) from exc
+        print(f"실행 capacity 진단 산출물 저장: {artifacts['output_dir']}")
+        return
+
+    if not args.approval_strict:
+        OUTPUT_DIR.mkdir(exist_ok=True)
 
     if RUN_MODE == "risk_off_compare":
         try:
@@ -2348,6 +4237,62 @@ def main():
             import traceback
             traceback.print_exc()
             exit(1)
+        return
+
+    if args.approval_strict:
+        try:
+            result, trades, final_state = run_single_mode(
+                approval_strict=True,
+                corporate_action_ledger=corporate_action_ledger,
+            )
+        except Exception as exc:  # noqa: BLE001 - strict runs must emit blockers
+            report = ApprovalReport(
+                "BLOCKED",
+                (ApprovalBlocker("STRICT_EXECUTION_ERROR", str(exc)),),
+                len(corporate_action_ledger.events),
+                corporate_action_ledger.ledger_sha256,
+            )
+            _write_approval_blocked(
+                approval_output_dir,
+                report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+        report = final_state["approval_report"]
+        if not report.approval_valid or result.empty:
+            if result.empty and report.approval_valid:
+                report = ApprovalReport(
+                    "BLOCKED",
+                    (
+                        ApprovalBlocker(
+                            "EMPTY_RESULT",
+                            "strict strategy produced no equity rows",
+                        ),
+                    ),
+                    report.event_count,
+                    report.ledger_sha256,
+                )
+            _write_approval_blocked(
+                approval_output_dir,
+                report,
+                ledger_path=args.corporate_actions_ledger,
+                manifest_path=args.corporate_actions_manifest,
+                blocked_orders=final_state.get("blocked_orders", ()),
+            )
+            print(f"승인 실행 차단: {approval_output_dir / 'approval_report.json'}")
+            return
+        _write_approval_result(
+            approval_output_dir,
+            result,
+            trades,
+            report,
+            ledger_path=args.corporate_actions_ledger,
+            manifest_path=args.corporate_actions_manifest,
+            blocked_orders=final_state.get("blocked_orders", ()),
+        )
+        print(f"승인 실행 완료: {approval_output_dir / 'approval_report.json'}")
         return
 
     try:

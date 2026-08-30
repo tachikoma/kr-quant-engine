@@ -4,6 +4,9 @@
 
 현재 운영 기준은 ETF 전용 시나리오이며, 실행 기준 스크립트는 run_etf_backtest.py 입니다.
 
+구현된 무결성 보호장치와 승인 전 blocker의 canonical 상태는
+[`docs/backtest-integrity.md`](docs/backtest-integrity.md)를 참고하세요.
+
 ## 현재 운영 방향
 
 - 주 실행 경로: run_etf_backtest.py
@@ -31,6 +34,44 @@ CLI 인자:
 - `--start`, `-s`: 백테스트 시작일 (기본: 20160101)
 - `--end`, `-e`: 백테스트 종료일 (기본: 오늘)
 - `--mode`, `-m`: 실행 모드 (기본: single, env `ETF_BACKTEST_MODE`보다 우선)
+
+OHLCV capacity는 기본 legacy 경로와 분리된 진단 전용 시나리오입니다. AUM별로
+독립 실행하며 `outputs_execution/` 아래에만 산출물을 기록합니다.
+
+```bash
+uv run python run_etf_backtest.py --mode single \
+  --execution-mode ohlcv_capacity \
+  --execution-participation-rate 0.05 \
+  --execution-aum 10000000,100000000,1000000000 \
+  --execution-output-dir outputs_execution
+```
+
+`execution_summary.csv`, `execution_diagnostics.csv`, `execution_trades.csv`,
+`execution_reconciliation.csv`, `execution_metadata.json`이 생성됩니다. 이는
+실제 체결이나 주문 제출의 증거가 아니며, order book을 사용하지 않는 OHLCV
+capacity 민감도 분석입니다. summary는 요청/용량/가정 filled 수량, diagnostics는
+capacity·carry·취소 사유, trades는 scenario 회계 반영 trade, reconciliation은
+현금·보유수량 검산을 담습니다. metadata는 `diagnostic_only=true`,
+`executable_fill_claim=false`, `orderbook_used=false`를 표시합니다. 출력은 staging
+후 directory swap/rollback으로 교체되어 실패 시 기존 리포트를 보존합니다.
+`outputs_etf_only/` 및 `outputs_approval/`과 겹치는 출력 경로는 거부되며,
+`--approval-strict`와 함께 사용할 수 없습니다. 한계와 승인 경계는
+[`docs/execution-capacity.md`](docs/execution-capacity.md) 및
+[`docs/backtest-integrity.md`](docs/backtest-integrity.md)를 참고하세요.
+
+승인용 corporate-action strict 실행은 별도 산출물 경로를 사용합니다.
+체크인된 ledger/manifest는 의도적으로 불완전하므로 실행이 차단됩니다.
+
+```bash
+uv run python run_etf_backtest.py --approval-strict --mode single \
+  --corporate-actions-ledger data/etf_corporate_actions.csv \
+  --corporate-actions-manifest data/etf_corporate_actions_manifest.json \
+  --approval-output-dir outputs_approval
+```
+
+차단 시 `outputs_approval/`에는 승인 리포트, blocker CSV, 재현성 메타데이터만
+기록되며 `outputs_etf_only/`는 변경하지 않습니다. 자세한 ledger 계약은
+[`docs/corporate-actions.md`](docs/corporate-actions.md)를 참고하세요.
 
 1. ETF 하루 1회 실행 러너(기본 안전모드)
 
@@ -145,6 +186,7 @@ python live_trading/etf_daily_runner.py --force-live
 - `TELEGRAM_CHAT_ID`: 수신 채팅/채널 ID
 - 토큰/채팅ID 미설정 시 조용히 비활성화됨
 - 실전 실행 요약에 주문 전 전략 평가액, 최대 종목 비중, 누적 고점 대비 낙폭 경고 포함
+- 시작 실패(pykrx import 단계 KRX 로그인 불가)와 런타임 미처리 예외에도 텔레그램으로 실패 알림을 동기 발송 후 종료 (exit 1)
 - 실계좌 고점은 `runtime_state/etf_daily_state.json`에 누적되며 최초 실행 시 현재 평가액으로 초기화
 - 증권사 API가 없는 모의 잔고는 저장된 실계좌 고점과 위험 스냅샷을 갱신하지 않음
 - 계좌 입출금은 수익이 아니어도 낙폭에 영향을 줄 수 있으므로 큰 현금 이동 후 고점 기준 확인 필요
@@ -203,7 +245,8 @@ python live_trading/etf_daily_runner.py --force-live
 - `data_cache/`: pykrx OHLCV parquet 캐시 (gitignored)
 - `runtime_state/`: 데일리 러너 상태 (`etf_daily_state.json`, gitignored)
 - `scripts/`: 분석/실험 스크립트
-- `DOCS/`: 추가 문서
+- `docs/`: 추가 문서
+- `docs/verification_2026-08-29.md`: 검증 종합 (백테스트-실전 정합성, trailing/PIT 간극, 검증 이력, 동결 상태)
 
 ## 분석/실험 스크립트 (`scripts/`)
 
@@ -270,10 +313,17 @@ uv run scripts/pit_backtest.py                            # PIT 유니버스 백
 `outputs_walk_forward/`에 저장됩니다. 이 분석은 전략 연구용이며 `strategy_freeze.json`의 공식
 표본외 트랙을 대체하지 않습니다.
 
-현재 기본 결과는 6개 fold입니다. 또한 각 파라미터 조합의 전체 기간 곡선에서 fold별
-일별 수익률을 잘라 이어 붙이고 경계 비용을 차감하는 방식입니다. fold 전환 시의 실제 보유 종목,
-현금, 세금 원가 상태를 재현하는 완전한 nested walk-forward는 아니므로 연구용 근사 OOS로
-해석합니다.
+기본 `WF_STATE_BASED=1` 경로는 폴드 경계에서 이전 폴드의 실제 보유/현금/세금 원가를
+이월하고, 각 폴드 첫 수익률을 직전 폴드 종료 equity로 앵커링해 경계 전환 수익률을
+보존합니다. `0`이면 각 파라미터 조합의 전체 기간 곡선에서 fold별 일별 수익률을 잘라
+이어 붙이고 인공 경계 비용을 차감하는 기존 슬라이싱 경로를 사용합니다. 두 방식 모두
+연구용 근사 OOS로 해석합니다.
+
+adaptive(폴드별 재선택) 결과와 frozen(`strategy_freeze.json` 고정 파라미터) OOS는
+절대 하나의 지표로 합치지 않습니다. adaptive 요약은 `policy_type=adaptive_fold_selected`,
+고정 정책 결과는 `fixed_policy_oos_equity_curve.csv`/`fixed_policy_oos_summary.json`
+(`policy_type=frozen_fixed`)으로 분리 저장됩니다. `WF_FIXED_POLICY_OOS=0`이면 고정
+정책 실행을 생략합니다.
 
 - `WF_REBALANCE_DAYS=10,20,30`
 - `WF_MAX_POSITIONS=1,2,3`
@@ -292,6 +342,8 @@ uv run scripts/pit_backtest.py                            # PIT 유니버스 백
 - `WF_EXIT_CHECK_DAYS=0`: OOS trailing exit 점검 주기
 - `WF_TRAILING_STOP_PCT=0`: OOS trailing stop 비율
 - `WF_PORTFOLIO_TRAILING_STOP_PCT=0`: OOS 포트폴리오 trailing stop 비율
+- `WF_FIXED_POLICY_OOS=1`: 실행 말미에 `strategy_freeze.json` 고정 파라미터 전 기간
+  연속 실행 후 OOS 구간만 별도 산출물로 저장. 동결 스냅샷 누락·위조 시 fail-closed
 
 ### 파라미터 주변값 안정성
 

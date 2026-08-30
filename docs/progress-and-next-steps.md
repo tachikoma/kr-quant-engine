@@ -52,7 +52,7 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
 - Static: CAGR 25.7%, MDD -32.7%, Sharpe 1.22, 알파 +7.9%
 - Auto: CAGR 12.2%, MDD -42.8%, Sharpe 0.56, 알파 -5.6% (벤치마크 미달)
 - 원인: 모멘텀 잡음(573종목 중 소형/테마 ETF 빈번 교체), 거래 비용 증가, 포지션 품질 희석
-- 상세 분석: `DOCS/UNIVERSE_AUTO_ANALYSIS.md`
+- 상세 분석: `docs/universe-auto-analysis.md`
 - 조치: `.env`에서 `ETF_UNIVERSE_MODE=auto` 주석 처리, static 유지
 
 ### 멀티 인덱스 리스크 시그널 — 구현 교정 후 미채택 (2026-07-21)
@@ -71,7 +71,7 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
 - 최근 테마 기여의 대부분은 네트워크인프라 1종목에서 발생
 - 커버드콜 3종목과 AI전력인프라는 거래가 없어 과거 성과 기여 0
 - 상장폐지를 포함한 point-in-time 유니버스는 아니므로 전부 in-sample 진단으로 취급
-- 상세: `DOCS/UNIVERSE_SELECTION_BIAS.md`
+- 상세: `docs/universe-selection-bias.md`
 
 ### Point-in-time ETF membership 구축 (2026-07-21, 파이프라인 완성 2026-08-05)
 
@@ -85,7 +85,7 @@ ETF 로테이션 전략 백테스트 및 실전 러너가 안정화 단계에 �
   1,370종목 모두 수집), 227종목 과거 분류 복원(`restore_pit_classification.py`),
   시점별 적격성 필터(`pit_membership_ok`)+그룹 매핑(`build_pit_ticker_groups`),
   PIT 백테스트(`pit_backtest.py`) 연결 완료 — 아래 0.9 참조
-- 상세: `DOCS/POINT_IN_TIME_UNIVERSE.md`
+- 상세: `docs/point-in-time-universe.md`
 
 위 작업 흐름은 다음 작업 1번의 선행 조건입니다. split 게이팅을 먼저 바로잡아
 기준 전략을 재동결했고, static 유니버스의 사후 선택 편향을 정리했으며,

@@ -8,12 +8,13 @@
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import os
-import time
-import contextlib
 import sys
+import time
 from pathlib import Path
+
 import pandas as pd
 
 

@@ -1,0 +1,13 @@
+{
+  "manifest_version": 1,
+  "ledger_file": "data/etf_corporate_actions.csv",
+  "ledger_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "verification_period": {
+    "start": null,
+    "end": null
+  },
+  "verification_tickers": [],
+  "source_documents": [],
+  "coverage_status": "INCOMPLETE",
+  "notes": "Template only. Replace with manually normalized KIND/issuer records, authoritative source documents, their SHA-256 values, verified period/tickers, and the canonical ledger hash before approval."
+}

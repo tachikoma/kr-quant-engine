@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import run_etf_backtest as rtb
+from etf_distributions import add_distributions, load_distributions
 from etf_shared import (
     ETF_LIST,
     add_deviation_flag,
@@ -32,8 +33,11 @@ from etf_shared import (
     add_listing_flag,
     add_price_basis_columns,
 )
-from etf_distributions import add_distributions, load_distributions
-from pit_universe import add_pit_membership_flag, build_pit_ticker_groups
+from pit_universe import (
+    add_pit_membership_flag,
+    build_pit_ticker_groups,
+    validate_pit_preflight,
+)
 
 OUTPUT_DIR = ROOT / "outputs_pit"
 PIT_PANEL = ROOT / "data_cache" / "pit_universe" / "pit_universe_snapshots.parquet"
@@ -99,7 +103,6 @@ def main() -> int:
         d for d in pd.to_datetime(index_df["date"])
         if START_DATE <= d <= END_DATE
     ]
-    us_index_df = rtb.get_us_index_data() if os.environ.get("ENABLE_MULTI_INDEX_RISK") == "1" else None
 
     # PIT 유니버스: 전체 티커 (membership 플래그가 as-of로 후보를 제한)
     all_tickers = sorted(pit_price["ticker"].unique())
@@ -111,6 +114,21 @@ def main() -> int:
         / "pit_classification_restored.parquet",
     )
     print(f"[pit_backtest] 그룹 매핑: {len(ticker_groups)}개 (static {len(ETF_LIST)}개)")
+
+    preflight = validate_pit_preflight(
+        panel=panel,
+        price=pit_price,
+        trading_dates=common_dates,
+        decision_dates=common_dates,
+        ticker_groups=ticker_groups,
+    )
+    print(f"[pit_backtest] strict preflight 통과: {preflight['decision_date_count']}개 거래일")
+
+    us_index_df = (
+        rtb.get_us_index_data()
+        if os.environ.get("ENABLE_MULTI_INDEX_RISK") == "1"
+        else None
+    )
 
     print(f"[pit_backtest] PIT 백테스트 실행 (티커 {len(all_tickers)}개, {common_dates[0].date()}~{common_dates[-1].date()})")
     curve, trades = rtb.run_etf_strategy(

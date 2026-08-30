@@ -1,4 +1,4 @@
-name: ETF Daily Runner for KIS
+name: ETF Daily Runner for NH
 
 on:
   workflow_dispatch:
@@ -16,15 +16,19 @@ on:
          default: false
          description: '이미 실행 완료된 경우에도 강제 재실행 (DAILY_RUN_FORCE=1)'
   repository_dispatch:
-    types: [run-daily]
+    types: [run-daily-nh]
 
 env:
-  BROKER_TYPE: KIS
+  BROKER_TYPE: NH
   PYTHONUNBUFFERED: '1'
   MODE: ${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}
-  ENV_MODE: ${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}  # deprecated alias for backward compat
+  ENV_MODE: ${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}  # deprecated alias
+  BROKER_MODE: ${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}  # deprecated alias
+  NHPLUG_BASE_URL: ${{ vars.NHPLUG_BASE_URL || '' }}
+  NHPLUG_AUTH_URL: ${{ vars.NHPLUG_AUTH_URL || 'https://api.nhplug.com:8443' }}
+  NHPLUG_ACCT_NO: ${{ secrets.NHPLUG_ACCT_NO || vars.NHPLUG_ACCT_NO || '' }}
   ENABLE_TICKER_NAME_LOOKUP: ${{ vars.ENABLE_TICKER_NAME_LOOKUP || '0' }}
-  LIVE_ORDER_ENABLED: ${{ vars.KIS_LIVE_ORDER_ENABLED || vars.LIVE_ORDER_ENABLED || '0' }}
+  LIVE_ORDER_ENABLED: ${{ vars.NH_LIVE_ORDER_ENABLED || vars.LIVE_ORDER_ENABLED || '0' }}
   REBALANCE_STEP_DAYS: ${{ vars.REBALANCE_STEP_DAYS || '20' }}
   # === Multi-Index Risk ===
   ENABLE_MULTI_INDEX_RISK: ${{ vars.ENABLE_MULTI_INDEX_RISK || '1' }}
@@ -32,19 +36,20 @@ env:
   US_RISK_PROXY: ${{ vars.US_RISK_PROXY || 'QQQ' }}
   US_MARKET_MA_DAYS: ${{ vars.US_MARKET_MA_DAYS || '120' }}
   US_MARKET_SLOPE_DAYS: ${{ vars.US_MARKET_SLOPE_DAYS || '20' }}
-  KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-  KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-  KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
-  KIS_ACCOUNT_PROD_CD: ${{ secrets.KIS_ACCOUNT_PROD_CD || '01' }}
-  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}   # 선택
-  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}       # 선택
-  KRX_ID: ${{ secrets.KRX_ID }}                           # 선택
-  KRX_PW: ${{ secrets.KRX_PW }}                           # 선택
+  NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+  NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  KRX_ID: ${{ secrets.KRX_ID }}
+  KRX_PW: ${{ secrets.KRX_PW }}
 
 jobs:
   daily-run:
     runs-on: ubuntu-latest
-    environment: kis-${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}
+    environment: nh-${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}
+    concurrency:
+      group: etf-daily-nh-${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -53,8 +58,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: runtime_state/
-          key: etf-daily-state-${{ github.run_id }}
+          key: etf-daily-nh-state-${{ github.run_id }}
           restore-keys: |
+            etf-daily-nh-state-
             etf-daily-state-
 
       - name: Ensure runtime_state directory
@@ -99,7 +105,7 @@ jobs:
           echo "force_rebalance=$FORCE_REBALANCE" >> "$GITHUB_OUTPUT"
           echo "force_run=$FORCE_RUN" >> "$GITHUB_OUTPUT"
 
-      - name: Run ETF daily runner
+      - name: Run ETF daily runner (NH)
         run: uv run python live_trading/etf_daily_runner.py ${{ steps.flags.outputs.force_live_flag }}
         env:
            FORCE_REBALANCE: ${{ steps.flags.outputs.force_rebalance || '0' }}
@@ -110,4 +116,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: runtime_state/
-          key: etf-daily-state-${{ github.run_id }}
+          key: etf-daily-nh-state-${{ github.run_id }}
