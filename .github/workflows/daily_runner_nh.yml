@@ -61,7 +61,6 @@ jobs:
           key: etf-daily-nh-state-${{ github.run_id }}
           restore-keys: |
             etf-daily-nh-state-
-            etf-daily-state-
 
       - name: Ensure runtime_state directory
         run: mkdir -p runtime_state
