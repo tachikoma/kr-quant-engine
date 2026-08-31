@@ -19,7 +19,7 @@ NH투자증권 PLUG REST API 어댑터 (독립 구현).
   NHPLUG_APP_KEY, NHPLUG_APP_SECRET (필수)
   NHPLUG_BASE_URL (기본 https://api.nhplug.com:8443)
   NHPLUG_AUTH_URL (기본 NHPLUG_BASE_URL과 동일, mock도 live로 토큰 발급)
-  NHPLUG_ACCT_NO (선택, 미지정시 /n2/acctinfo로 자동 발견)
+  NHPLUG_ACCT_NO (필수, 종합매매 계좌 명시 — 자동 구분 불가)
   NHPLUG_TOKEN_CACHE_DIR (기본 ~/.nhplug)
   NHPLUG_RATE_LIMIT (기본 4, 초당 요청)
   NHPLUG_TIMEOUT (기본 10)
@@ -91,6 +91,7 @@ class NhAdapter:
 
         self.access_token = ""
         self._token_file: str | None = None
+        self._iem_names: dict[str, str] = {}
 
         self._setup_token_file()
         self._issue_token_if_needed()
@@ -440,6 +441,10 @@ class NhAdapter:
                     out0 = data.get("Output_0", {})
                     if isinstance(out0, list):
                         out0 = out0[0] if out0 else {}
+                    # iem_nm 캐시 (pykrx 실패 시 fallback용)
+                    iem_nm = str(out0.get("iem_nm", "")).strip()
+                    if iem_nm and t not in self._iem_names:
+                        self._iem_names[t] = iem_nm
                     # 후보 필드
                     for key in ("prpr", "stck_prpr", "cur_prc", "price", "now_prc"):
                         if key in out0:
@@ -455,6 +460,10 @@ class NhAdapter:
                 except Exception:
                     continue
         return prices
+
+    def get_ticker_name(self, ticker: str) -> str | None:
+        """pykrx 실패 시 fallback용 — currentPrice에서 캐시된 iem_nm 반환."""
+        return self._iem_names.get(str(ticker).strip())
 
     def get_bid_ask_prices(self, tickers: list[str]) -> dict[str, dict[str, float]]:
         """매수/매도 기준가. 2026-08-30 확정: askp/bidp(askp1/bidp1) → stck_prpr fallback."""
@@ -474,6 +483,10 @@ class NhAdapter:
                         out0 = out0[0] if out0 else {}
                     if not isinstance(out0, dict) or not out0:
                         continue
+                    # iem_nm 캐시도 함께 갱신
+                    iem_nm = str(out0.get("iem_nm", "")).strip()
+                    if iem_nm and t not in self._iem_names:
+                        self._iem_names[t] = iem_nm
 
                     def _to_float(v: Any) -> float:
                         try:

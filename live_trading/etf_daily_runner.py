@@ -1251,6 +1251,16 @@ def _build_plan(
         set(etf_list) | set(holdings_for_rebalance.keys()) | set(external_holdings.keys())
     )
     ticker_names: dict[str, str] = {t: _format_ticker(t) for t in _all_tickers}
+    # NH: pykrx 실패 시 iem_nm fallback (KRX_ID 없이도 NH currentPrice의 iem_nm 사용)
+    if hasattr(api, "get_ticker_name"):
+        for t in _all_tickers:
+            if ticker_names.get(t) == t:  # pykrx가 이름 못 찾음
+                try:
+                    fallback = api.get_ticker_name(t)  # type: ignore[attr-defined]
+                    if fallback:
+                        ticker_names[t] = f"{fallback}({t})"
+                except Exception:
+                    pass
 
     # 2단계: ETF 가격 스냅샷 로드
     snapshot = _load_snapshot(etf_list, ticker_names=ticker_names)

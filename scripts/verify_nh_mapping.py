@@ -19,7 +19,7 @@ NH PLUG 모의 실연동 필드매핑 확정 스크립트.
   NHPLUG_APP_KEY, NHPLUG_APP_SECRET (필수)
   NHPLUG_BASE_URL (기본 https://api.nhplug.com:8443, 모의는 https://moapi.nhplug.com:8443)
   NHPLUG_AUTH_URL (기본 base와 동일, 모의도 live로 토큰 발급)
-  NHPLUG_ACCT_NO (선택, 미지정시 /n2/acctinfo 자동 발견)
+  NHPLUG_ACCT_NO (필수, 종합매매 계좌 명시)
 """
 
 from __future__ import annotations
