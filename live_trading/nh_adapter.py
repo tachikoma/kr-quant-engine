@@ -95,12 +95,14 @@ class NhAdapter:
         self._setup_token_file()
         self._issue_token_if_needed()
 
-        # acct_no 미지정시 자동 발견
+        # A안: 다계좌 보유 시 자동 선별 불가 — 명시 필수
         if not self.acct_no:
-            try:
-                self.acct_no = self._discover_account_no()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("NH acct_no 자동 발견 실패, NHPLUG_ACCT_NO 수동 설정 필요: %s", exc)
+            raise RuntimeError(
+                "NHPLUG_ACCT_NO 미설정: NH는 종합매매/선물옵션/해외파생 자동 구분이 불가합니다. "
+                "ETF 거래용 종합매매 계좌를 NHPLUG_ACCT_NO에 명시하세요. "
+                "demo/real 계좌가 다르므로 nh-demo/nh-real Environment에 각각 설정. "
+                "GitHub Actions는 Settings → Environments → nh-demo/nh-real → vars.NHPLUG_ACCT_NO(또는 secrets)에 설정."
+            )
 
     # ------------------------------------------------------------------
     # 토큰 관리 (24h, 파일 캐시, 401시에만 재발급)
