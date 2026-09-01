@@ -51,7 +51,7 @@ jobs:
       group: etf-daily-nh-${{ vars.MODE || vars.BROKER_MODE || vars.ENV_MODE || 'demo' }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore runtime state
         id: restore-state
@@ -66,10 +66,10 @@ jobs:
         run: mkdir -p runtime_state
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version-file: .python-version
 
