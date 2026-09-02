@@ -42,7 +42,16 @@ def _load_dotenv(dotenv_path: Path | None = None) -> None:
             if "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip('"').strip("'")
+            k = k.strip()
+            v = v.strip()
+            # Strip inline comments (unquoted): value "# comment" stays quoted,
+            # bare "value  # comment" gets truncated to "value".
+            quoted = (v.startswith('"') and v.endswith('"')) or (
+                v.startswith("'") and v.endswith("'")
+            )
+            v = v.strip('"').strip("'")
+            if not quoted and "#" in v:
+                v = v.split("#", 1)[0].rstrip()
             if k and k not in os.environ:
                 os.environ[k] = v
 
@@ -159,7 +168,7 @@ def run_preflight(
     cred_keys = {
         "KIS": ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"],
         "KIWOOM": ["KIWOOM_APP_KEY", "KIWOOM_SECRET_KEY", "KIWOOM_ACCOUNT_NO"],
-        "NH": ["NHPLUG_APP_KEY", "NHPLUG_SECRET_KEY", "NHPLUG_ACCT_NO"],
+        "NH": ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"],
         "KB": ["KB_APP_KEY", "KB_APP_SECRET", "KB_ACCOUNT_NO"],
     }
     for k in cred_keys.get(broker.upper(), []):

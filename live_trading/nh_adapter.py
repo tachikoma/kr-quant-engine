@@ -76,7 +76,11 @@ class NhAdapter:
         self.auth_url = (_raw_auth.rstrip("/") if _raw_auth else "https://api.nhplug.com:8443")
         self.app_key = os.environ.get("NHPLUG_APP_KEY", "").strip()
         self.app_secret = os.environ.get("NHPLUG_APP_SECRET", "").strip()
-        self.acct_no = os.environ.get("NHPLUG_ACCT_NO", "").strip()
+        self.acct_no = os.environ.get("NHPLUG_ACCT_NO", "").strip().replace("-", "")
+        if self.acct_no and not (self.acct_no.isdigit() and 8 <= len(self.acct_no) <= 13):
+            logger.warning(
+                "NHPLUG_ACCT_NO 형식 오류: %r (숫자 8~13자리, 하이픈 허용)", self.acct_no
+            )
         self.timeout = float(os.environ.get("NHPLUG_TIMEOUT", "10"))
         self.rate_limit = float(os.environ.get("NHPLUG_RATE_LIMIT", "4"))
         self.http_max_retries = int(os.environ.get("NHPLUG_HTTP_MAX_RETRIES", "4"))
@@ -631,10 +635,18 @@ class NhAdapter:
         payload: dict[str, Any] = {
             "act_no": self.acct_no,
             "iem_cd": ticker,
-            "ord_qty": str(int(qty)),
+            # trading-bot-kis shape: orr_qty/orr_pr as int + required NH PLUG cashBuy fields
+            "orr_qty": int(qty),
             "nmn_pr_tp_cd": nmn_cd,
+            "orr_cnd_dit_cd": "00",
+            "ssl_nmn_pr_dit_cd": "00",
+            "rmt_mkt_cd": "KRX",
+            "sor_mkt_sli_yn": "N",
+            # backward-compatible aliases
+            "ord_qty": str(int(qty)),
         }
         if not is_market and price is not None:
+            payload["orr_pr"] = int(price)
             payload["ord_uv"] = str(int(price))
         # dry_run 기본 차단: 실제 주문은 위 _check_live_enabled로 게이트
         data = self._call(path, payload)

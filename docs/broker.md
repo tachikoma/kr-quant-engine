@@ -35,9 +35,10 @@
 ### NH (PLUG)
 - Base URL: `https://api.nhplug.com:8443` (실전), `https://moapi.nhplug.com:8443` (모의, `MODE=demo`일 때 자동)
 - Auth URL: 항상 `https://api.nhplug.com:8443` (토큰은 live에서만 발급)
-- 계좌: `NHPLUG_ACCT_NO` 필수 (자동 선별 불가), demo/real 환경 분리
+- 계좌: `NHPLUG_ACCT_NO` 필수 (자동 선별 불가), demo/real 환경 분리 — 하이픈 포함 표기(`500-01-002017`)도 자동 정규화(숫자만)하여 `act_no`로 전송, 8~13자리 검증
 - 토큰: `~/.nhplug/token-YYYYMMDD.json` 24h 캐시
 - 레이트리밋: `NHPLUG_RATE_LIMIT` 기본 4/s, 초과 429 `IGW42902` 백오프
+- 주문: `cashBuy/cashSell`은 `trading-bot-kis`와 동일한 `orr_qty(int)/orr_pr(int)/rmt_mkt_cd` 등 필수 필드를 포함, 기존 `ord_qty/ord_uv` 별칭도 호환 유지 — `11166 계좌번호 오류`는 페이로드 불일치 시에도 발생할 수 있음
 - **모의(demo) currentPrice 미지원**: `moapi`의 `/krstock/quote/v1/currentPrice`는 `IGW40023`(모의투자에서 제공하지 않는 API)을 반환합니다. balance/주문 API는 정상 동작합니다.
   - **가격 라우팅 (NH demo 전용)**: demo(moapi)에서 quote(`/krstock/quote/v1/*`) 엔드포인트는 moapi를 먼저 호출하지 않고 **동일 토큰으로 실전 API(`api.nhplug.com:8443`)에 직접 라우팅**합니다. (토큰은 live에서만 발급되며 양쪽 모두 유효 — `[NH] demo quote direct to real API` 로그). moapi의 불필요한 `IGW40023` 호출(약 8~12s + 로그 스팸)을 제거합니다.
   - **가격 fallback 체인 (NH demo 전용)**:
