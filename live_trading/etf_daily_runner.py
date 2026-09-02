@@ -1188,6 +1188,95 @@ def _record_oos_equity_history(
         logger.info(f"⚠️ OOS 평가 이력 저장 실패: {exc}")
 
 
+def _is_demo_mode() -> bool:
+    """MODE/BROKER_MODE/ENV_MODE 기준 demo 여부 (NH moapi 등)."""
+    mode = (
+        os.environ.get("MODE")
+        or os.environ.get("BROKER_MODE")
+        or os.environ.get("ENV_MODE")
+        or "real"
+    ).lower()
+    return mode in {"demo", "mock", "paper", "test"}
+
+
+def _apply_price_fallback(
+    api: Any,
+    price_tickers: list[str],
+    latest_prices: dict[str, float],
+    latest_buy_prices: dict[str, float],
+    latest_sell_prices: dict[str, float],
+    raise_on_missing: bool = True,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """브로커 현재가 누락 시 가격을 보완한다.
+
+    - MODE=demo: 보유종목은 balance Output_1[].now_pr(브로커 권위), 유니버스는 pykrx 어제종가.
+    - MODE=real: pykrx fallback 사용 금지. raise_on_missing=True면 누락 시 예외(fail loud),
+      False면 기존 동작 유지(부분 가격 그대로 사용, 매도 후 재조회 경로).
+    """
+    missing = [
+        t
+        for t in price_tickers
+        if t not in latest_prices or pd.isna(latest_prices.get(t)) or float(latest_prices.get(t) or 0) <= 0
+    ]
+    if not missing:
+        return latest_prices, latest_buy_prices, latest_sell_prices
+
+    if not _is_demo_mode():
+        if raise_on_missing:
+            raise RuntimeError(
+                "실전 모드(MODE != demo)에서 브로커 현재가 조회 실패: "
+                f"{len(missing)}개 티커 가격 누락 ({', '.join(missing[:10])}). "
+                "pykrx fallback은 demo 전용이며 실전에서는 사용할 수 없습니다."
+            )
+        return latest_prices, latest_buy_prices, latest_sell_prices
+
+    # 1) 보유종목: balance Output_1[].now_pr (브로커 권위)
+    held_prices: dict[str, float] = {}
+    if hasattr(api, "get_held_prices"):
+        try:
+            held_prices = api.get_held_prices() or {}
+        except Exception as exc:  # noqa: BLE001 - 외부 브로커 호출 방어
+            logger.warning(f"[DEMO FALLBACK] balance now_pr 조회 실패: {exc}")
+
+    for t in list(missing):
+        hp = held_prices.get(t)
+        if hp is not None and float(hp) > 0:
+            p = float(hp)
+            latest_prices[t] = p
+            latest_buy_prices[t] = p
+            latest_sell_prices[t] = p
+            missing.remove(t)
+
+    # 2) 유니버스: pykrx 어제종가 (demo 전용)
+    if missing:
+        from live_trading.pykrx_fallback import get_universe_prices
+
+        try:
+            pykrx_prices = get_universe_prices(missing, _today_kst())
+        except Exception as exc:  # noqa: BLE001 - 외부 pykrx 호출 방어
+            logger.warning(f"[DEMO FALLBACK] pykrx 어제종가 조회 실패: {exc}")
+            pykrx_prices = {}
+        if pykrx_prices:
+            logger.info(
+                f"[DEMO FALLBACK] pykrx 어제종가 사용: {len(pykrx_prices)}개 티커 "
+                f"({', '.join(sorted(pykrx_prices)[:10])})"
+            )
+            for t, p in pykrx_prices.items():
+                if t in missing:
+                    pv = float(p)
+                    latest_prices[t] = pv
+                    latest_buy_prices[t] = pv
+                    latest_sell_prices[t] = pv
+                    missing.remove(t)
+
+    if missing:
+        logger.warning(
+            f"[DEMO FALLBACK] 가격 미확보 티커 {len(missing)}개: {', '.join(missing[:10])}"
+        )
+
+    return latest_prices, latest_buy_prices, latest_sell_prices
+
+
 def _build_plan(
     config: RunnerConfig,
     api: Any | None,
@@ -1243,6 +1332,11 @@ def _build_plan(
                     latest_buy_prices[ticker] = float(buy_price)
                 if sell_price is not None:
                     latest_sell_prices[ticker] = float(sell_price)
+        # demo fallback: NH 모의 currentPrice 미지원(IGW40023) 시 보유종목은 balance now_pr,
+        # 유니버스는 pykrx 어제종가로 보완. 실전은 누락 시 예외(fail loud).
+        latest_prices, latest_buy_prices, latest_sell_prices = _apply_price_fallback(
+            api, price_tickers, latest_prices, latest_buy_prices, latest_sell_prices
+        )
         elapsed = (dt.datetime.now() - t0).total_seconds()
         logger.info(f"완료 ({elapsed:.1f}초) | 보유종목={len(holdings)}개, 예수금={cash:,.0f}")
 
@@ -2351,6 +2445,18 @@ def run_daily() -> None:
                             latest_buy_prices_after[ticker] = float(buy_price)
                         if sell_price is not None:
                             latest_sell_prices_after[ticker] = float(sell_price)
+                # demo fallback: 매도 후 재조회에서도 동일하게 보완.
+                # 실전은 raise_on_missing=False로 기존 동작 유지(부분 가격 사용, 중단 없음).
+                latest_prices_after, latest_buy_prices_after, latest_sell_prices_after = (
+                    _apply_price_fallback(
+                        api,
+                        price_tickers,
+                        latest_prices_after,
+                        latest_buy_prices_after,
+                        latest_sell_prices_after,
+                        raise_on_missing=False,
+                    )
+                )
             except Exception as exc:
                 logger.info(f"[경고] 매도 후 가격 재조회 실패: {exc}")
                 latest_prices_after = {}

@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# 실전 API 베이스 (demo 모의에서 quote API를 moapi 대신 직접 라우팅하는 데 사용)
+_REAL_BASE_URL = "https://api.nhplug.com:8443"
+
 # 주문 유형 매핑: PLUG nmn_pr_tp_cd (01=보통, 05=시장가 등)
 _ORDER_TYPE_TO_NMN: dict[str, str] = {
     "LIMIT": "01",
@@ -92,6 +95,8 @@ class NhAdapter:
         self.access_token = ""
         self._token_file: str | None = None
         self._iem_names: dict[str, str] = {}
+        self._last_balance_rows: list[dict[str, Any]] = []
+        self._last_balance_prices: dict[str, float] | None = None
 
         self._setup_token_file()
         self._issue_token_if_needed()
@@ -253,9 +258,34 @@ class NhAdapter:
         code = str(data.get("rsp_cd", ""))
         return "IGW40043" in msg or "IGW40043" in code
 
-    def _call(self, path: str, input_0: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _is_igw40023(data: dict[str, Any]) -> bool:
+        """모의투자에서 제공하지 않는 API (currentPrice 등)."""
+        msg = str(data.get("rsp_msg", "") or data.get("message", ""))
+        code = str(data.get("rsp_cd", ""))
+        return "IGW40023" in msg or "IGW40023" in code
+
+    def _is_demo_moapi(self) -> bool:
+        """demo(모의) 모드인지 — base_url이 moapi 도메인인지로 판단."""
+        return "moapi" in self.base_url
+
+    def _call_quote(self, path: str, input_0: dict[str, Any]) -> dict[str, Any]:
+        """quote 엔드포인트 호출.
+
+        demo(moapi)에서 quote API(/krstock/quote/v1/*)는 IGW40023(모의투자 미지원)을
+        항상 반환하므로, moapi를 먼저 호출하지 않고 동일 토큰으로 실전 API
+        (api.nhplug.com)에 직접 라우팅한다. 실전 API가 실패하면(IGW40023/401/네트워크)
+        그대로 반환/예외를 던져 호출부(runner의 pykrx fallback)가 이어받도록 한다.
+        """
+        if self._is_demo_moapi() and path.startswith("/krstock/quote/v1/"):
+            logger.info("[NH] demo quote direct to real API: %s", path)
+            return self._call(path, input_0, base_url=_REAL_BASE_URL)
+        return self._call(path, input_0)
+
+    def _call(self, path: str, input_0: dict[str, Any], base_url: str | None = None) -> dict[str, Any]:
         """POST {base_url}{path} with {"Input_0": ...} envelope."""
-        url = f"{self.base_url}{path}"
+        base_url = base_url or self.base_url
+        url = f"{base_url}{path}"
         body = {"Input_0": input_0}
         auth_retried = False
 
@@ -363,17 +393,36 @@ class NhAdapter:
         logger.warning("NH get_cash Output_0에서 예수금 필드 미발견: keys=%s", list(out0.keys()))
         return 0.0
 
-    def get_holdings(self) -> dict[str, int]:
-        """보유 종목 ticker -> 수량. Output_1 배열."""
-        # 2026-08-30 확정: iem_cd + itg_bnc_qty/rsdl_qty (실연동: 005935 1주)
+    def _fetch_balance(self) -> None:
+        """balance 조회 후 Output_1 행과 now_pr 가격 맵을 캐시한다."""
         data = self._call("/krstock/inquiry/v1/balance", {"act_no": self.acct_no})
         out1 = data.get("Output_1", [])
         if isinstance(out1, dict):
             out1 = [out1]
-        if not isinstance(out1, list):
-            return {}
+        self._last_balance_rows = out1 if isinstance(out1, list) else []
+        self._last_balance_prices = {}
+        for row in self._last_balance_rows:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("iem_cd", "") or row.get("pdno", "") or row.get("stk_cd", "")).strip()
+            if not ticker:
+                continue
+            if ticker.startswith("A") and len(ticker) == 7 and ticker[1:].isdigit():
+                ticker = ticker[1:]
+            now_pr = row.get("now_pr") or row.get("prpr") or row.get("stck_prpr") or row.get("cur_prc")
+            try:
+                p = float(str(now_pr).replace(",", "").strip())
+                if p > 0:
+                    self._last_balance_prices[ticker] = p
+            except (ValueError, TypeError, AttributeError):
+                continue
+
+    def get_holdings(self) -> dict[str, int]:
+        """보유 종목 ticker -> 수량. Output_1 배열."""
+        # 2026-08-30 확정: iem_cd + itg_bnc_qty/rsdl_qty (실연동: 005935 1주)
+        self._fetch_balance()
         holdings: dict[str, int] = {}
-        for row in out1:
+        for row in self._last_balance_rows:
             if not isinstance(row, dict):
                 continue
             ticker = str(row.get("iem_cd", "") or row.get("pdno", "") or row.get("stk_cd", "")).strip()
@@ -391,6 +440,12 @@ class NhAdapter:
                     ticker = ticker[1:]
                 holdings[ticker] = qty
         return holdings
+
+    def get_held_prices(self) -> dict[str, float]:
+        """보유종목 현재가. balance Output_1[].now_pr (브로커 권위)."""
+        if self._last_balance_prices is None:
+            self._fetch_balance()
+        return dict(self._last_balance_prices or {})
 
     def get_buyable_info(self, ticker: str, price: int) -> dict[str, str]:
         """매수 가능 정보. runner의 hasattr 분기 호환용."""
@@ -427,6 +482,7 @@ class NhAdapter:
     def get_prices(self, tickers: list[str]) -> dict[str, float]:
         """현재가 조회. /krstock/quote/v1/currentPrice 루프."""
         prices: dict[str, float] = {}
+        igw40023_logged = False
         for ticker in tickers:
             t = str(ticker).strip()
             if not t:
@@ -437,7 +493,16 @@ class NhAdapter:
                     payload: dict[str, Any] = {"iem_cd": t}
                     if market_cd:
                         payload["market_cd"] = market_cd
-                    data = self._call("/krstock/quote/v1/currentPrice", payload)
+                    data = self._call_quote("/krstock/quote/v1/currentPrice", payload)
+                    # 모의투자 미지원 API: 모든 market_cd 동일하게 실패하므로 1회 경고 후 중단
+                    if self._is_igw40023(data):
+                        if not igw40023_logged:
+                            logger.warning(
+                                "[NH] currentPrice IGW40023 — 모의투자에서 제공하지 않는 API입니다 "
+                                "(demo는 runner의 pykrx 어제종가 fallback 사용)"
+                            )
+                            igw40023_logged = True
+                        break
                     out0 = data.get("Output_0", {})
                     if isinstance(out0, list):
                         out0 = out0[0] if out0 else {}
@@ -468,6 +533,7 @@ class NhAdapter:
     def get_bid_ask_prices(self, tickers: list[str]) -> dict[str, dict[str, float]]:
         """매수/매도 기준가. 2026-08-30 확정: askp/bidp(askp1/bidp1) → stck_prpr fallback."""
         out: dict[str, dict[str, float]] = {}
+        igw40023_logged = False
         for ticker in tickers:
             t = str(ticker).strip()
             if not t:
@@ -477,7 +543,16 @@ class NhAdapter:
                     payload: dict[str, Any] = {"iem_cd": t}
                     if market_cd:
                         payload["market_cd"] = market_cd
-                    data = self._call("/krstock/quote/v1/currentPrice", payload)
+                    data = self._call_quote("/krstock/quote/v1/currentPrice", payload)
+                    # 모의투자 미지원 API: 모든 market_cd 동일하게 실패하므로 1회 경고 후 중단
+                    if self._is_igw40023(data):
+                        if not igw40023_logged:
+                            logger.warning(
+                                "[NH] currentPrice IGW40023 — 모의투자에서 제공하지 않는 API입니다 "
+                                "(demo는 runner의 pykrx 어제종가 fallback 사용)"
+                            )
+                            igw40023_logged = True
+                        break
                     out0 = data.get("Output_0", {})
                     if isinstance(out0, list):
                         out0 = out0[0] if out0 else {}

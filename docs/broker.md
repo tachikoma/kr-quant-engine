@@ -38,6 +38,14 @@
 - 계좌: `NHPLUG_ACCT_NO` 필수 (자동 선별 불가), demo/real 환경 분리
 - 토큰: `~/.nhplug/token-YYYYMMDD.json` 24h 캐시
 - 레이트리밋: `NHPLUG_RATE_LIMIT` 기본 4/s, 초과 429 `IGW42902` 백오프
+- **모의(demo) currentPrice 미지원**: `moapi`의 `/krstock/quote/v1/currentPrice`는 `IGW40023`(모의투자에서 제공하지 않는 API)을 반환합니다. balance/주문 API는 정상 동작합니다.
+  - **가격 라우팅 (NH demo 전용)**: demo(moapi)에서 quote(`/krstock/quote/v1/*`) 엔드포인트는 moapi를 먼저 호출하지 않고 **동일 토큰으로 실전 API(`api.nhplug.com:8443`)에 직접 라우팅**합니다. (토큰은 live에서만 발급되며 양쪽 모두 유효 — `[NH] demo quote direct to real API` 로그). moapi의 불필요한 `IGW40023` 호출(약 8~12s + 로그 스팸)을 제거합니다.
+  - **가격 fallback 체인 (NH demo 전용)**:
+    1. 실전 API quote 호출이 실패하면(IGW40023/401/네트워크) runner의 pykrx 어제종가 fallback으로 이어집니다.
+    2. 보유종목은 balance `Output_1[].now_pr`(브로커 권위), 유니버스/후보는 pykrx 어제종가(`live_trading/pykrx_fallback.py`, `runtime_state/last_valid_prices.json` 캐시 TTL 1일).
+  - **격리 보장**: 실전 API 라우팅은 **quote(`/krstock/quote/v1/*`) 엔드포인트에만** 적용됩니다. 주문/잔고/취소/조회는 항상 `moapi`(모의 격리)에 남습니다.
+  - **KRX_ID/KRX_PW 필수** — pykrx 어제종가 fallback이 동작하려면 `.env`에 KRX 인증 정보가 필요합니다.
+  - 실전(`MODE=real`)은 실전 API만 사용하며(재시도 없음) pykrx fallback을 사용하지 않습니다. 현재가 누락 시 예외로 종료합니다(fail loud).
 
 ### KIS
 - 기존 문서 유지, `KIS_APP_KEY/SECRET`, `KIS_ACCOUNT_NO` 등 참조
