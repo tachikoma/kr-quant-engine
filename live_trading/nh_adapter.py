@@ -56,6 +56,18 @@ _ORDER_TYPE_TO_NMN: dict[str, str] = {
     "MARKET": "05",
 }
 
+# 주문 성공 rsp_cd (복수 성공코드 — 00000 외 00048 등)
+_SUCCESS_RSP_CODES = {"00000", "00048"}
+
+
+class NhApiError(Exception):
+    """NH PLUG API 오류 (rsp_cd가 성공코드가 아닌 경우). runner가 exc.msg_cd를 읽는다."""
+
+    def __init__(self, msg_cd: str, msg: str):
+        self.msg_cd = msg_cd
+        self.msg = msg
+        super().__init__(f"[{msg_cd}] {msg}")
+
 
 class NhAdapter:
     """NH PLUG 어댑터. BrokerProtocol을 duck-typing으로 만족."""
@@ -471,7 +483,15 @@ class NhAdapter:
         """KIS 호환 alias."""
         if ticker and price:
             info = self.get_buyable_info(ticker, price)
-            for k in ("ord_psbl_amt", "ord_psbl_cash", "buy_psbl_amt"):
+            for k in (
+                "csh_orr_pbl_amt",
+                "orr_pbl_amt1",
+                "max_pbl_amt",
+                "dca",
+                "ord_psbl_amt",
+                "ord_psbl_cash",
+                "buy_psbl_amt",
+            ):
                 if k in info:
                     try:
                         return float(str(info[k]).replace(",", ""))
@@ -658,9 +678,18 @@ class NhAdapter:
             out0.get("ord_no")
             or out0.get("order_no")
             or out0.get("odno")
+            or out0.get("mkt_orr_no")
+            or out0.get("anw_cld_mkt_orr_no1")
             or data.get("ord_no")
             or ""
         )
+        # 실패 응답(예: rsp_cd=14250 잔고부족, Output_0 없음)을 성공으로 오판하지 않도록
+        # order_id가 없고 rsp_cd가 실패 코드면 예외를 던져 runner가 submitted=False 처리
+        if not order_id:
+            rsp_cd = str(data.get("rsp_cd", "") or "")
+            rsp_msg = str(data.get("rsp_msg", "") or "")
+            if rsp_cd and rsp_cd not in _SUCCESS_RSP_CODES:
+                raise NhApiError(rsp_cd, rsp_msg)
         return {"order_id": str(order_id), "response": data}
 
     def get_order_status(self, order_id: str, today: str | None = None) -> dict[str, Any]:

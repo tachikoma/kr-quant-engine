@@ -2602,6 +2602,30 @@ def run_daily() -> None:
                             )
                             _bo["qty"] = _bnq
                             _bo["estimated_value"] = _bnq * float(_bo.get("reference_price", 0))
+                        elif _bnq <= 0:
+                            # NH fallback: nrcvb_buy_qty 없음 → 현금 기반 매수 가능 수량
+                            # (csh_orr_pbl_amt/orr_pbl_amt1/max_pbl_amt/dca, 모두 숫자 문자열)
+                            for _ck in ("csh_orr_pbl_amt", "orr_pbl_amt1", "max_pbl_amt", "dca"):
+                                _cash_raw = _bi.get(_ck)
+                                if _cash_raw is None:
+                                    continue
+                                try:
+                                    _cash_i = int(str(_cash_raw).replace(",", ""))
+                                except ValueError:
+                                    continue
+                                if _cash_i <= 0:
+                                    continue
+                                _maq = _cash_i // _bp
+                                if 0 < _maq < int(_bo.get("qty", 0)):
+                                    _bdn = _bo.get("display_name", _bt)
+                                    logger.info(
+                                        f"[NH제한-순차] {_bdn} 수량 {_bo['qty']}→{_maq}주 (잔여 {_cash_i})"
+                                    )
+                                    _bo["qty"] = _maq
+                                    _bo["estimated_value"] = _maq * float(
+                                        _bo.get("reference_price", 0)
+                                    )
+                                break
                     except Exception:
                         pass
                 buy_results.extend(
