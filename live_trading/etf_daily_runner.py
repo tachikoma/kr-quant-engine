@@ -2217,13 +2217,13 @@ def run_daily() -> None:
 
         AdapterClass = KbAdapter
         adapter_name = "KB"
-    elif broker_type in {"KIWOOM", "KIWOOM_REST", "LS"}:
+    elif broker_type in {"KIWOOM", "KIWOOM_REST"}:
         AdapterClass = KiwoomAdapter
         adapter_name = "키움"
     else:
-        logger.warning(f"[경고] 알 수 없는 BROKER_TYPE='{broker_type}', KIWOOM으로 fallback")
-        AdapterClass = KiwoomAdapter
-        adapter_name = "키움"
+        raise RuntimeError(
+            f"Unsupported BROKER_TYPE='{broker_type}'. Supported: KIWOOM/KIS/NH/KB"
+        )
 
     if AdapterClass is not None:
         try:
