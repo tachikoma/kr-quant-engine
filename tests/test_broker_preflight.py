@@ -575,6 +575,47 @@ class ScrubTests(unittest.TestCase):
                 out = bp._scrub(f"err[{e}]end")
                 self.assertEqual(out, "err[***]end", repr(e))
 
+    def test_encoding_combinations_are_masked(self):
+        """문자 단위 느슨한 매칭: 인코딩이 섞인 표기도 가려진다 (Codex 지적: 대문자 hex + \\/ 조합 등)."""
+        from live_trading import broker_preflight as bp
+
+        secret = "한글/비밀+값 x"
+        echoes = [
+            r"\uD55C\uAE00\/\uBE44\uBC00+\uAC12 x",     # 대문자 hex + 슬래시 이스케이프
+            r"\ud55c\uae00\/\ubE44\uBc00\u002B\uac12\u0020x",  # hex 대소문자 혼합 + \u002B(+) + \u0020(공백)
+            "%ED%95%9C%EA%b8%80%2f%EB%B9%84%eb%b0%80%2B%EA%B0%92%20x",  # 퍼센트 대소문자 혼합
+            "한글/비밀+값+x",                                  # 공백이 '+' 로
+            "한글%2F비밀\\u002b값 x",                          # 표기 혼합
+        ]
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": secret}):
+            for e in echoes:
+                out = bp._scrub(f"err[{e}]end")
+                self.assertEqual(out, "err[***]end", repr(e))
+
+    def test_loose_matching_does_not_mask_unrelated_text(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "Sup3rSecretValue"}):
+            text = "supersecretvalue Sup3rSecretValu Sup3rSecretValue2 plain text"
+            out = bp._scrub(text)
+        self.assertEqual(out, "supersecretvalue Sup3rSecretValu ***2 plain text")
+
+    def test_scrub_is_fast_on_large_text(self):
+        import time as _t
+
+        from live_trading import broker_preflight as bp
+
+        env = {n: f"Secret{i}-Value{i}-Padding{i}" for i, n in enumerate(
+            ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY",
+             "NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO", "KBSEC_APP_KEY", "KBSEC_APP_SECRET"])}
+        text = ("lorem ipsum dolor sit amet " * 8000) + env["KIS_APP_KEY"]  # 약 200KB
+        with mock.patch.dict(os.environ, env):
+            t0 = _t.perf_counter()
+            out = bp._scrub(text)
+            elapsed = _t.perf_counter() - t0
+        self.assertNotIn(env["KIS_APP_KEY"], out)
+        self.assertLess(elapsed, 2.0, f"scrub took {elapsed:.2f}s")
+
     def test_short_non_secret_values_are_left_alone(self):
         from live_trading import broker_preflight as bp
 
@@ -588,6 +629,120 @@ class ScrubTests(unittest.TestCase):
             out = bp._scrub("act_no=50001002017 failed; raw 500-01-002017")
         self.assertNotIn("50001002017", out)
         self.assertNotIn("002017", out)
+
+
+
+class KbOrderMappingGuardTests(unittest.TestCase):
+    def test_flag_and_preflight_set_agree(self):
+        from live_trading import broker_preflight as bp
+        from live_trading import kb_adapter
+
+        self.assertEqual("KB" in bp.ORDER_MAPPING_UNVERIFIED, not kb_adapter.ORDER_MAPPING_VERIFIED)
+
+    def test_kb_place_order_refuses_before_any_request(self):
+        from live_trading import kb_adapter
+
+        a = object.__new__(kb_adapter.KbAdapter)
+        a._call = mock.Mock(side_effect=AssertionError("must not send"))
+        with mock.patch.dict(os.environ, {"LIVE_ORDER_ENABLED": "1"}):
+            with self.assertRaises(kb_adapter.KbOrderMappingUnverified):
+                a.place_order("BUY", "069500", 1, None, "MARKET")
+        a._call.assert_not_called()
+
+    def test_runner_fails_fast_for_unverified_adapter(self):
+        import ast
+
+        src = (ROOT / "live_trading" / "etf_daily_runner.py").read_text(encoding="utf-8")
+        fn = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)
+              and n.name == "_assert_order_mapping_verified"][0]
+        ns = {"Any": object}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "runner", "exec"), ns)
+        from live_trading.kb_adapter import KbAdapter
+
+        with self.assertRaises(RuntimeError):
+            ns["_assert_order_mapping_verified"](object.__new__(KbAdapter), "KB")
+        ns["_assert_order_mapping_verified"](object(), "KIWOOM")  # 플래그 없는 어댑터는 통과
+
+    def test_runner_calls_the_check_before_planning_or_ordering(self):
+        """배선 확인(AST): _run_daily_locked 에서 매핑 검사가 계획 수립·주문 제출보다 먼저 호출된다."""
+        import ast
+
+        src = (ROOT / "live_trading" / "etf_daily_runner.py").read_text(encoding="utf-8")
+        fn = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_run_daily_locked"][0]
+        first_line = {}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                first_line[node.func.id] = min(first_line.get(node.func.id, 10**9), node.lineno)
+        self.assertIn("_assert_order_mapping_verified", first_line)
+        for later in ("_build_plan", "_submit_orders"):
+            self.assertLess(first_line["_assert_order_mapping_verified"], first_line[later], later)
+
+    def test_kb_refusal_is_a_definite_rejection_not_an_uncertain_submit(self):
+        """원장이 UNCERTAIN 으로 남아 다음 실행을 막으면 안 된다 (브로커로 아무것도 안 나갔다)."""
+        import ast
+        import json as _json
+        import tempfile
+        from pathlib import Path
+
+        from live_trading.kb_adapter import KbOrderMappingUnverified
+
+        src = (ROOT / "live_trading" / "etf_daily_runner.py").read_text(encoding="utf-8")
+        names = {"_is_definite_rejection", "_load_live_order_journal", "_persist_live_order_journal",
+                 "_write_live_order_intent", "_update_live_order_intent", "_submit_orders"}
+        fns = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name in names]
+        import datetime as _dt
+        import logging
+
+        class Uncertain(RuntimeError):
+            def __init__(self, m, results=None):
+                super().__init__(m)
+                self.results = results or []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = {"Any": object, "dt": _dt, "json": _json, "os": os, "logger": logging.getLogger("t"),
+                  "_today_kst": lambda: _dt.date(2026, 11, 4), "_date_to_iso": lambda x: x.isoformat(),
+                  "OrderSubmissionUncertain": Uncertain, "_RUN_ACKED": [],
+                  "STATE_DIR": Path(tmp), "LIVE_ORDER_JOURNAL": Path(tmp) / "j.json"}
+            exec(compile(ast.Module(body=fns, type_ignores=[]), "runner", "exec"), ns)
+
+            class Broker:
+                def place_order(self, **kw):
+                    raise KbOrderMappingUnverified("nope")
+
+            res = ns["_submit_orders"](Broker(), "BUY", [{"ticker": "a", "qty": 1}, {"ticker": "b", "qty": 1}], False)
+            self.assertEqual([r["submitted"] for r in res], [False, False])
+            statuses = [e["status"] for e in _json.loads(ns["LIVE_ORDER_JOURNAL"].read_text())]
+            self.assertEqual(statuses, ["REJECTED", "REJECTED"])
+
+
+class RefusalReportedOutsideMarketHoursTests(unittest.TestCase):
+    def _run(self, broker, api, market_open):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"LIVE_ORDER_ENABLED": "0"}), \
+                mock.patch.object(bp, "_build_adapter", return_value=api), \
+                mock.patch.object(bp, "_is_market_hours", return_value=market_open), \
+                mock.patch.object(bp, "_stage2_orders") as stage2:
+            rep = bp.run_preflight(broker, "demo", True, ["069500"])
+        return rep, stage2
+
+    def test_kb_refusal_is_a_failure_even_after_hours(self):
+        rep, stage2 = self._run("KB", FakeBroker(base_url="https://developer.kbsec.com:32484"), False)
+        stage2.assert_not_called()
+        self.assertGreater(rep["summary"]["fail"], 0)
+        self.assertIn(("order-destination guard", "FAIL"), {(r["label"], r["status"]) for r in rep["results"]})
+
+    def test_wrong_endpoint_is_a_failure_even_after_hours(self):
+        rep, stage2 = self._run("NH", FakeBroker(base_url="https://api.nhplug.com:8443"), False)
+        stage2.assert_not_called()
+        self.assertGreater(rep["summary"]["fail"], 0)
+
+    def test_valid_demo_after_hours_is_guard_pass_then_skip(self):
+        rep, stage2 = self._run("KIWOOM", FakeBroker(base_url="https://mockapi.kiwoom.com"), False)
+        stage2.assert_not_called()
+        labels = {(r["label"], r["status"]) for r in rep["results"]}
+        self.assertIn(("order-destination guard", "PASS"), labels)
+        self.assertIn(("place_order", "SKIP"), labels)
 
 
 if __name__ == "__main__":

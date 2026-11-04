@@ -127,43 +127,53 @@ def _mask(s: str | None, keep: int = 4) -> str:
 
 
 def _credential_forms(raw: str) -> set[str]:
-    """한 자격증명 값이 로그/오류 본문에 나타날 수 있는 형태들 (어댑터의 정규화 포함)."""
-    from urllib.parse import quote
-
+    """한 자격증명 값의 기준 문자열들 (어댑터의 정규화 포함). 인코딩 변형은 _loose_pattern 이 처리한다."""
     v = raw.strip()  # 어댑터(NH 등)는 .strip() 후 사용
     if len(v) < 4:
         return set()  # 너무 짧은 값(예: 상품코드 '01')은 비밀이 아니며 진단 메모를 망가뜨린다
-    base = {raw, v, v.replace("-", "")}
+    forms = {raw, v, v.replace("-", "")}
     # 하이픈 조각(계좌 CANO/상품코드 분리 등): 조각도 strip, 6자 이상만 (짧은 조각은 일반 텍스트와 충돌)
-    base |= {p.strip() for p in v.split("-") if len(p.strip()) >= 6}
-    forms = set(base)
-    for f in base:  # 오류 본문이 값을 URL 인코딩/JSON 이스케이프해 되울리는 경우
-        pct = quote(f, safe="")
-        forms.add(pct)
-        forms.add(re.sub(r"%[0-9A-F]{2}", lambda m: m.group().lower(), pct))  # 소문자 퍼센트 인코딩
-        for ascii_only in (False, True):  # True: 비ASCII 를 \\uXXXX 로 (Python 기본 json.dumps)
-            js = json.dumps(f, ensure_ascii=ascii_only)[1:-1]
-            forms.add(js)
-            forms.add(js.replace("/", "\\/"))  # PHP/JS 계열은 '/' 를 '\\/' 로 이스케이프
-            forms.add(re.sub(r"\\u([0-9a-f]{4})", lambda m: "\\u" + m.group(1).upper(), js))  # 대문자 hex
+    forms |= {p.strip() for p in v.split("-") if len(p.strip()) >= 6}
     # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
     return {f for f in forms if len(f) >= 4 and f.strip(" -")}
+
+
+def _char_pattern(c: str) -> str:
+    """문자 하나가 오류 본문에 나타날 수 있는 표기들의 정규식 (문자 단위라 조합이 자동으로 처리된다).
+
+    원문 | 퍼센트 인코딩(UTF-8, hex 대소문자 무관) | JSON \\uXXXX(UTF-16, hex 대소문자 무관) |
+    JSON 백슬래시 이스케이프(\\/ \\" \\\\) | 공백의 '+'
+    """
+    alts = [re.escape(c)]
+    alts.append("".join(f"(?i:%{b:02X})" for b in c.encode("utf-8")))
+    u16 = c.encode("utf-16-be")
+    alts.append("".join(f"\\\\(?i:u{(u16[i] << 8) | u16[i + 1]:04X})" for i in range(0, len(u16), 2)))
+    if c in '/"\\':
+        alts.append("\\\\" + re.escape(c))
+    if c == " ":
+        alts.append(r"\+")
+    return "(?:" + "|".join(alts) + ")"
+
+
+def _loose_pattern(form: str) -> str:
+    return "".join(_char_pattern(c) for c in form)
 
 
 def _scrub(text: str) -> str:
     """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹.
 
-    모든 자격증명의 모든 형태를 모아 **길이 내림차순으로 한 번에** 치환한다 (한 값이 다른 값의
-    부분 문자열일 때 긴 값이 먼저 가려지도록). 4자 미만 값과 퇴화 형태는 치환하지 않는다.
+    모든 자격증명의 기준 문자열을 모아 **길이 내림차순으로 한 번에** 치환한다 (한 값이 다른 값의
+    부분 문자열일 때 긴 값이 먼저 가려지도록). 각 문자는 원문/퍼센트 인코딩/JSON 이스케이프 어느 표기든
+    매칭하므로 인코딩이 섞인 경우(예: `\\uD55C\\/`)도 가려진다. 4자 미만 값과 퇴화 형태는 치환하지 않는다.
     """
-    out = str(text)
     forms: set[str] = set()
     for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
         for n in names:
             forms |= _credential_forms(os.environ.get(n, ""))
-    for f in sorted(forms, key=len, reverse=True):
-        out = out.replace(f, "***")
-    return out
+    if not forms:
+        return str(text)
+    pattern = "|".join(_loose_pattern(f) for f in sorted(forms, key=len, reverse=True))
+    return re.sub(pattern, "***", str(text))
 
 
 def _try_call(label: str, fn, *args, **kwargs) -> tuple[str, Any, str]:
@@ -568,23 +578,26 @@ def run_preflight(
     elif mode != "demo" and not allow_real:
         record("2", "real-mode guard", "FAIL",
                "mode=real 에서 실계좌 주문이 발생합니다. 의도했다면 --allow-real 을 명시하세요")
-    elif not _is_market_hours(now):
-        record("2", "place_order", "SKIP", "market closed — write test requires 09:00~15:30 KST")
-    elif broker.upper() in LIVE_FLAG_REQUIRED and os.environ.get("LIVE_ORDER_ENABLED", "0").strip() != "1":
-        record("2", "place_order", "SKIP",
-               f"{broker.upper()} 어댑터는 LIVE_ORDER_ENABLED=1 일 때만 주문 전송 — 모의 검증 시 설정 필요")
     else:
+        # 거부 사유(잘못된 목적지, 매핑 미확정, 모의 미지원 등)는 장중/라이브 플래그 SKIP 보다 먼저 판정해
+        # 장외 시간에 실행해도 FAIL(종료 코드 1)로 보고되도록 한다.
         ok, detail = order_destination_ok(api, broker, mode, allow_real)
         if not ok:
             record("2", "order-destination guard", "FAIL", detail)
         else:
             record("2", "order-destination guard", "PASS", detail)
-            try:
-                _stage2_orders(api, record, tickers_hint=TEST_TICKER,
-                               broker=broker, mode=mode, allow_real=allow_real)
-            except Exception as e:  # noqa: BLE001
-                record("2", "stage2_unresolved", "FAIL",
-                       f"unexpected {type(e).__name__}: {e} — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
+            if not _is_market_hours(now):
+                record("2", "place_order", "SKIP", "market closed — write test requires 09:00~15:30 KST")
+            elif broker.upper() in LIVE_FLAG_REQUIRED and os.environ.get("LIVE_ORDER_ENABLED", "0").strip() != "1":
+                record("2", "place_order", "SKIP",
+                       f"{broker.upper()} 어댑터는 LIVE_ORDER_ENABLED=1 일 때만 주문 전송 — 모의 검증 시 설정 필요")
+            else:
+                try:
+                    _stage2_orders(api, record, tickers_hint=TEST_TICKER,
+                                   broker=broker, mode=mode, allow_real=allow_real)
+                except Exception as e:  # noqa: BLE001
+                    record("2", "stage2_unresolved", "FAIL",
+                           f"unexpected {type(e).__name__}: {e} — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
 
     # Stage 3: smoke는 문서상 선택 — 여기서는 runner --help 수준만 힌트
     print("\n[Stage 3] Smoke (선택)")

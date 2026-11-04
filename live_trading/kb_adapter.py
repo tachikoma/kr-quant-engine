@@ -45,7 +45,23 @@ from requests.adapters import HTTPAdapter
 logger = logging.getLogger(__name__)
 
 
+# 주문 필드 매핑(주문 구분 시장가/지정가, 가격 필드명)이 증권사 API 문서로 확정·검증되었는지.
+# 확정 전에는 place_order 가 주문을 전송하지 않는다. 확정 후 이 값을 True 로 바꾸고,
+# broker_preflight.ORDER_MAPPING_UNVERIFIED 에서 KB 를 제거한다 (tests 가 두 값의 일치를 검사).
+ORDER_MAPPING_VERIFIED = False
+
+
+class KbOrderMappingUnverified(RuntimeError):
+    """주문 필드 매핑 미확정으로 주문을 전송하지 않았다 (브로커로 아무것도 나가지 않음 = 명확한 거절)."""
+
+    msg_cd = "ORDER_MAPPING_UNVERIFIED"
+    http_status = 400
+
+
 class KbAdapter:
+    # 러너가 주문 전에 확인하는 플래그 (etf_daily_runner._assert_order_mapping_verified)
+    ORDER_MAPPING_VERIFIED = ORDER_MAPPING_VERIFIED
+
     """KB REST OPEN API 어댑터. BrokerProtocol duck-typing 준수."""
 
     def __init__(self) -> None:
@@ -362,6 +378,11 @@ class KbAdapter:
         order_type: str = "LIMIT",
     ) -> dict[str, Any]:
         self._check_live_enabled()
+        if not ORDER_MAPPING_VERIFIED:
+            raise KbOrderMappingUnverified(
+                "KB 주문 필드 매핑(주문 구분/가격 필드)이 확정되지 않아 주문을 전송하지 않습니다 "
+                "(kb_adapter.ORDER_MAPPING_VERIFIED=False)"
+            )
         side_u = side.upper()
         if side_u not in {"BUY", "SELL"}:
             raise ValueError(f"Invalid side: {side}")

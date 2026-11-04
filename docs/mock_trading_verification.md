@@ -18,15 +18,16 @@
 | KIWOOM | `KIWOOM_APPKEY`, `KIWOOM_SECRETKEY` | `KIWOOM_ACCOUNT_NO` (**불필요**, 비워 둠) | `MODE=demo` → `mockapi.kiwoom.com` | 키 이름에 밑줄 없음 (`APP_KEY` 아님) |
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` | `KIS_ACCOUNT_PROD_CD` (기본 `01`) | `MODE=demo` → vps | 계좌 `12345678-01` 형식 가능 |
 | NH | `NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET`, `NHPLUG_ACCT_NO` | — | `MODE=demo` → `moapi.nhplug.com` | 토큰은 실전 도메인에서 발급. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
-| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **모의투자 미지원** (모드 분기 없음) | 항상 실서버/실계좌. 주문 필드 매핑 미확정(TODO) → 프리플라이트 주문 검증 거부. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
+| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **모의투자 미지원** (모드 분기 없음) | 항상 실서버/실계좌. 주문 필드 매핑 미확정(TODO) → **어댑터가 주문 전송을 거부**, 러너는 시작 시 중단, 프리플라이트 주문 검증 거부. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
 
 `broker_preflight.py`의 Stage 0은 **필수/선택 인증 변수**(표의 `KIS_ACCOUNT_PROD_CD`, `KIWOOM_ACCOUNT_NO` 등)만
 검사한다(값은 마스킹). `KBSEC_IP_ADDR`/`KBSEC_MAC_ADDR`와 `KBSEC_BASE_URL`은 검사하지 않는다.
 필수 목록은 `tests/test_broker_preflight.py`가 정확한 값과 어댑터 소스 양쪽으로 대조한다.
-출력/리포트의 메모에서는 위 변수 값의 여러 형태(원본, 앞뒤 공백 제거본, 하이픈 제거본, 6자 이상 하이픈 조각,
-URL 인코딩, JSON 이스케이프)를 모든 자격증명에 걸쳐 길이 내림차순으로 **길이 제한 전에** `***`로 치환한다
-(`_scrub`). URL 인코딩은 대·소문자 hex, JSON 이스케이프는 `\uXXXX`(비ASCII, 대·소문자 hex)와 `\/` 변형을
-포함한다. 4자 미만 값(예: `KIS_ACCOUNT_PROD_CD=01`)과 파생 형태가 4자 미만이거나 `-`/공백뿐인 경우는
+출력/리포트의 메모에서는 위 변수 값의 기준 문자열(원본, 앞뒤 공백 제거본, 하이픈 제거본, 6자 이상 하이픈 조각)을
+모든 자격증명에 걸쳐 길이 내림차순으로 **길이 제한 전에** `***`로 치환한다(`_scrub`). 매칭은 **문자 단위**다:
+각 문자는 원문, 퍼센트 인코딩(UTF-8, hex 대·소문자 무관), JSON `\uXXXX`(UTF-16, hex 대·소문자 무관),
+`\/` `\"` `\\` 이스케이프, 공백의 `+` 중 어느 표기든 매칭하므로 인코딩이 섞인 경우도 가려진다.
+4자 미만 값(예: `KIS_ACCOUNT_PROD_CD=01`)과 파생 형태가 4자 미만이거나 `-`/공백뿐인 경우는
 비밀이 아니거나 진단 메모를 망가뜨리므로 치환하지 않는다(긴 값에서 나온 짧은 조각도 포함).
 그 밖의 인코딩(예: base64)이나 증권사가 값을 가공해 되돌려 주는 경우는 막지 못한다. 이 변수에 없는 값(토큰 등)이나 증권사 오류 본문은 그대로 남을 수 있으므로
 로그를 첨부할 때 눈으로 한 번 확인한다.
@@ -74,6 +75,8 @@ uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode d
   확정" TODO) **mode/`--allow-real`과 무관하게 주문 검증을 거부**한다(`ORDER_MAPPING_UNVERIFIED`).
   가드는 `run_preflight`뿐 아니라 `_stage2_orders` 자체에도 있어, 이 함수를 직접 호출해도
   `broker`/`mode`(필수 인자)와 같은 검사를 다시 수행하고 실패하면 `stage2-authorization` FAIL을 남긴다.
+  거부 사유(잘못된 목적지·매핑 미확정·모의 미지원)는 장중/라이브 플래그 SKIP보다 **먼저** 판정되므로
+  장외 시간에 실행해도 FAIL로 보고되고 종료 코드가 1이다. 유효한 모의 설정이면 가드 PASS 뒤 `place_order SKIP`이다.
 - **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. "체결"은 발견됨 & 체결수량≥주문수량
   & **잔량 0**일 때만 인정한다(수량 불일치는 미해결). 취소 요청이 실패해도 최종 상태를 조회하며,
   `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하거나 Stage 2 안에서 예상치 못한
@@ -146,15 +149,23 @@ KB증권은 모의투자를 제공하지 않으므로 위 2~5단계의 "모의 �
 
 - **지금 가능한 것:** 읽기 전용 점검 `uv run python live_trading/broker_preflight.py --broker KB --mode real`.
   주문은 없지만 **실계좌에 대한 호출**이다. Stage 0에 `mock_support SKIP`이 표시된다.
+- **코드 차단(세 겹):** ① `kb_adapter.place_order`는 `ORDER_MAPPING_VERIFIED=False`인 동안 요청을 보내기 전에
+  `KbOrderMappingUnverified`를 던진다(브로커로 아무것도 나가지 않으므로 러너는 이를 "명확한 거절"로 처리해
+  원장을 UNCERTAIN으로 남기지 않는다). ② 러너는 어댑터 생성 직후, 계획 수립·주문 이전에
+  `_assert_order_mapping_verified`로 중단한다(`BROKER_TYPE=KB` + `LIVE_ORDER_ENABLED=1`도 시작하지 못함).
+  ③ 프리플라이트는 `ORDER_MAPPING_UNVERIFIED`로 주문 검증을 거부한다. ①의 플래그와 ③의 집합이
+  일치하는지는 테스트가 검사한다.
 - **KB를 운영에 연결하기 전 선행 조건:**
   1. 증권사 API 문서로 주문 필드 매핑(주문 구분, 가격 필드)을 확정하고 `kb_adapter.place_order`를 수정한다.
-  2. 그 변경을 리뷰한 뒤 `broker_preflight.ORDER_MAPPING_UNVERIFIED`에서 `KB`를 제거한다(코드 변경이므로 PR 승인 필요).
+  2. 그 변경을 리뷰한 뒤 `kb_adapter.ORDER_MAPPING_VERIFIED=True`로 바꾸고 `broker_preflight.ORDER_MAPPING_UNVERIFIED`에서
+     `KB`를 제거한다(코드 변경이므로 PR 승인 필요).
   3. `docs/broker_onboarding.md` 정책에 따라 사전 승인을 받은 뒤 실계좌에서
      `--broker KB --mode real --allow-real --with-order`(`LIVE_ORDER_ENABLED=1`)로 1주 테스트를 수행한다.
 - **실계좌 1주 테스트의 실제 노출(승인 시):** 수량은 주문당 1주지만 **금액 상한은 없다.** 시장가 매수·매도는
   체결가 변동과 수수료·세금이 붙고, -25% 지정가 매수가 체결되면(급락 등) 1주가 추가로 남아 수동 매도가
   필요하다. `stage2_unresolved`/`roundtrip` FAIL 시 즉시 증권사 앱에서 미체결·보유를 정리한다.
 - **러너 시나리오(4장)는 KB에서 수행하지 않는다.** 러너의 취소·재주문 경로(`remaining_qty` 의미 등)는 KB 응답으로
-  검증된 적이 없다. 매핑이 확정되기 전에는 KB로 러너(`BROKER_TYPE=KB`)를 실행하지 않는다.
+  검증된 적이 없다. 매핑이 확정되기 전에는 KB 러너가 코드로 차단된다(위 ①②). 매핑 확정 후에도
+  취소·재주문 경로는 별도로 검증해야 한다.
 - KB의 모의 호스트가 없다는 점은 코드로 증명할 수 없다(`KBSEC_BASE_URL` 기본값은 `developer.kbsec.com`).
   증권사 문서/담당자로 재확인한다.

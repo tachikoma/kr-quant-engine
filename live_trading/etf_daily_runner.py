@@ -1658,6 +1658,15 @@ class OrderSubmissionUncertain(RuntimeError):
         self.results = results or []
 
 
+def _assert_order_mapping_verified(api: Any, adapter_name: str) -> None:
+    """주문 필드 매핑이 확정되지 않은 어댑터(KB 등)로는 실주문을 시작하지 않는다 (계획·주문 이전에 중단)."""
+    if getattr(api, "ORDER_MAPPING_VERIFIED", True) is False:
+        raise RuntimeError(
+            f"{adapter_name} 어댑터는 주문 필드 매핑이 확정되지 않아 실주문을 시작할 수 없습니다 "
+            "(ORDER_MAPPING_VERIFIED=False). 증권사 API 문서로 매핑을 확정·검증한 뒤 사용하세요."
+        )
+
+
 def _is_definite_rejection(exc: Exception) -> bool:
     """증권사가 응답을 돌려주며 명시적으로 거절한 경우만 True (타임아웃/연결오류는 False)."""
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
@@ -2462,6 +2471,9 @@ def _run_daily_locked() -> None:
             "로컬 실행 또는 Self-hosted Runner 사용을 고려하세요.\n"
             f"원인: {adapter_init_error}"
         )
+
+    if cfg.enable_live_order and api is not None:
+        _assert_order_mapping_verified(api, adapter_name)
 
     run_id = str(uuid.uuid4())
     _market_order_margin_rate = parse_pct_env(
