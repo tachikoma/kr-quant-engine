@@ -28,7 +28,9 @@ class PreflightCredentialTests(unittest.TestCase):
         """어댑터에 새 인증 변수가 추가되면 프리플라이트 목록 갱신 없이는 실패한다 (역방향 대조)."""
         from live_trading.broker_preflight import CRED_OPTIONAL, CRED_REQUIRED
 
-        pat = re.compile(r'environ\.get\(\s*"([A-Z0-9_]*(?:APP_?KEY|SECRET|ACCT_NO|ACCOUNT_NO|ACCOUNT_PROD)[A-Z0-9_]*)"')
+        pat = re.compile(
+            r'(?:environ\.get|getenv)\(\s*["\']([A-Z0-9_]*(?:APP_?KEY|SECRET|ACCT_NO|ACCOUNT_NO|ACCOUNT_PROD)[A-Z0-9_]*)["\']'
+        )
         for broker, src in ADAPTER_SRC.items():
             found = set(pat.findall(src.read_text(encoding="utf-8")))
             known = set(CRED_REQUIRED[broker]) | set(CRED_OPTIONAL[broker])
@@ -347,6 +349,31 @@ class AdversarialDestinationTests(unittest.TestCase):
         self.assertTrue(any(r["label"] == "stage2_unresolved" and r["status"] == "FAIL" for r in rep["results"]))
 
 
+    def test_more_url_oddities(self):
+        self.assertTrue(self._ok("NH", "https://MOAPI.NHPLUG.COM:8443"))      # 호스트명은 대소문자 무시
+        for url in (
+            "https://moapi.nhplug.com.:8443",                # 끝 점(FQDN) — 정확 일치 아님, 보수적으로 거부
+            "https://[::1]:8443",                            # IPv6
+            "https://moapi.nhplug.com\\@api.nhplug.com",     # 백슬래시 변형
+            "https://moapi.nhplug.com:99999999",             # 비정상 포트(파싱 오류여도 예외 없이 거부 또는 통과 후 요청 실패)
+            "https://móapi.nhplug.com",                      # 유니코드 위장
+        ):
+            try:
+                ok = self._ok("NH", url)
+            except Exception as e:  # 가드가 예외를 밖으로 내면 안 된다
+                self.fail(f"guard raised for {url!r}: {e}")
+            if "99999999" not in url:
+                self.assertFalse(ok, url)
+
+    def test_adapter_without_any_url_attribute_is_refused(self):
+        from live_trading import broker_preflight as bp
+
+        class NoUrl:
+            pass
+
+        self.assertFalse(bp.order_destination_ok(NoUrl(), "NH", "demo", False)[0])
+
+
 class FillConsistencyTests(unittest.TestCase):
     def test_filled_but_remaining_nonzero_is_not_terminal(self):
         from live_trading.broker_preflight import fully_filled as f
@@ -397,6 +424,28 @@ class ScrubTests(unittest.TestCase):
             notes = " ".join(r["note"] for r in rep["results"])
             self.assertNotIn(secret[:6], notes, f"pad={pad}")
             self.assertTrue(any(r["label"] == "adapter_init" and r["status"] == "FAIL" for r in rep["results"]))
+
+    def test_whitespace_padded_account_normalized_form_is_masked(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"NHPLUG_ACCT_NO": " 500-01-002017 "}):
+            out = bp._scrub("act_no=50001002017; raw= 500-01-002017 ;")
+        self.assertNotIn("50001002017", out)
+        self.assertNotIn("002017", out)
+
+    def test_degenerate_values_do_not_corrupt_notes(self):
+        from live_trading import broker_preflight as bp
+
+        for weird in ("----", "a---", "   ", "-- --"):
+            with mock.patch.dict(os.environ, {"KIWOOM_SECRETKEY": weird}):
+                out = bp._scrub("plain diagnostic message abc")
+            self.assertEqual(out, "plain diagnostic message abc", repr(weird))
+
+    def test_short_non_secret_values_are_left_alone(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KIS_ACCOUNT_PROD_CD": "01"}):
+            self.assertEqual(bp._scrub("code 01 ok"), "code 01 ok")
 
     def test_nh_normalized_account_is_masked(self):
         from live_trading import broker_preflight as bp

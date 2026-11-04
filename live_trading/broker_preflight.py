@@ -123,11 +123,14 @@ def _scrub(text: str) -> str:
     out = str(text)
     for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
         for n in names:
-            v = os.environ.get(n, "")
+            raw = os.environ.get(n, "")
+            v = raw.strip()  # 어댑터(NH 등)는 .strip() 후 사용하므로 정규화본도 대상
             if len(v) < 4:
-                continue
-            # 원본 + 하이픈 제거(NH 정규화) + 6자 이상 하이픈 조각(계좌 앞/뒤 구간)
-            forms = {v, v.replace("-", ""), *[p for p in v.split("-") if len(p) >= 6]}
+                continue  # 너무 짧은 값(예: 상품코드 '01')은 비밀이 아니며 진단 메모를 망가뜨린다
+            # 원본 + 공백 제거본 + 하이픈 제거(NH 정규화) + 6자 이상 하이픈 조각(계좌 앞/뒤 구간)
+            forms = {raw, v, v.replace("-", ""), *[p for p in v.split("-") if len(p) >= 6]}
+            # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
+            forms = {f for f in forms if len(f) >= 4 and f.strip(" -")}
             for f in sorted(forms, key=len, reverse=True):
                 out = out.replace(f, "***")
     return out
