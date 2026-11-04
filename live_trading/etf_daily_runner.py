@@ -2401,7 +2401,6 @@ def run_daily() -> None:
                         attempt=2,
                         notifier=notifier,
                         journal=journal,
-                        cutoff_time_hhmm=cfg.buy_cutoff_time if cfg.block_live_after_cutoff else None,
                         cutoff_time_hhmm=cfg.sell_cutoff_time if cfg.block_live_after_cutoff else None,
                     )
                     sell_retry_results = _poll_and_finalize_orders(
@@ -2738,6 +2737,7 @@ def run_daily() -> None:
                         attempt=2,
                         notifier=notifier,
                         journal=journal,
+                        cutoff_time_hhmm=cfg.buy_cutoff_time if cfg.block_live_after_cutoff else None,
                     )
                     buy_retry_results = _poll_and_finalize_orders(
                         api=api,
