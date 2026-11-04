@@ -134,6 +134,7 @@ class LiveOrderSafetyTests(unittest.TestCase):
         ns["OrderSubmissionUncertain"] = Uncertain
         ns["STATE_DIR"] = Path(tmp)
         ns["LIVE_ORDER_JOURNAL"] = Path(tmp) / "intents.json"
+        ns["_RUN_ACKED"] = []
         return ns
 
     def test_missing_order_id_blocks_further_orders(self):
@@ -317,6 +318,111 @@ class LiveOrderSafetyTests(unittest.TestCase):
                 return {"is_found": True, "order_qty": 10, "filled_qty": 6, "remaining_qty": 0, "is_filled": True}
         ns["_refresh_order_statuses"](Broker(), [row])
         self.assertEqual([r["qty"] for r in ns["_build_retry_orders"]([row])], [4])
+    def test_run_daily_blocks_concurrent_direct_call(self):
+        import fcntl
+        ns = isolated_functions("run_daily")
+        with tempfile.TemporaryDirectory() as tmp:
+            ns.update(fcntl=fcntl, STATE_DIR=Path(tmp), LIVE_RUN_LOCK=Path(tmp) / "l.lock")
+            ran = []
+            ns["_run_daily_locked"] = lambda: ran.append(1)
+            fd = os.open(ns["LIVE_RUN_LOCK"], os.O_RDWR | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a+") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(SystemExit):
+                    ns["run_daily"]()
+            self.assertEqual(ran, [])
+            ns["run_daily"]()  # 잠금 해제 후에는 정상 실행
+            self.assertEqual(ran, [1])
+            self.assertEqual(oct(ns["LIVE_RUN_LOCK"].stat().st_mode & 0o777), "0o600")
+
+    def test_journal_write_failure_stops_and_keeps_prior_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns(tmp)
+            n = []
+            orig = ns["_write_live_order_intent"]
+            def flaky(*a, **k):
+                n.append(1)
+                if len(n) == 2:
+                    raise OSError("disk full")
+                return orig(*a, **k)
+            ns["_write_live_order_intent"] = flaky
+            ns["_RUN_ACKED"] = []
+            sent = []
+            class Broker:
+                def place_order(self, **kw):
+                    sent.append(kw["ticker"]); return {"order_id": "A1"}
+            with self.assertRaises(RuntimeError) as cm:
+                ns["_submit_orders"](Broker(), "BUY", [{"ticker": "a", "qty": 1}, {"ticker": "b", "qty": 1}], False)
+            self.assertEqual(sent, ["a"])
+            self.assertEqual(len(cm.exception.results), 1)
+            self.assertEqual(ns["_RUN_ACKED"][0]["order_id"], "A1")
+
+    def _poll_ns(self):
+        ns = isolated_functions("_poll_and_finalize_orders")
+        t = {"n": 0}
+        def now():
+            t["n"] += 1
+            return dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=t["n"])
+        ns.update(
+            _now_kst=now, time=SimpleNamespace(sleep=lambda x: None),
+            _cutoff_deadline=lambda hhmm, to: dt.datetime(2026, 11, 4, 9, 0, 30, tzinfo=dt.timezone.utc),
+            _extract_exec_price=lambda r: None,
+        )
+        return ns
+
+    def test_poll_does_not_treat_kis_partial_cancel_as_filled(self):
+        ns = self._poll_ns()
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": True}
+            def cancel_order(self, **kw):
+                return {}
+        row = {"ticker": "a", "side": "BUY", "submitted": True, "order_id": "1",
+               "requested_qty": 10, "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", False)
+        self.assertFalse(out[0]["is_filled"])
+        self.assertEqual(out[0]["filled_qty"], 4)
+
+    def test_poll_clears_transient_status_error(self):
+        ns = self._poll_ns()
+        calls = []
+        class Broker:
+            def get_order_status(self, oid, today):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise TimeoutError("x")
+                return {"is_found": True, "order_qty": 5, "filled_qty": 5, "remaining_qty": 0, "is_filled": True}
+        row = {"ticker": "a", "side": "BUY", "submitted": True, "order_id": "1",
+               "requested_qty": 5, "qty": 5, "filled_qty": 0, "remaining_qty": 5, "is_filled": False}
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", False)
+        self.assertTrue(out[0]["is_filled"])
+        self.assertNotIn("status_error", out[0])
+
+    def test_kb_nh_order_post_not_resent_on_5xx(self):
+        from live_trading.kb_adapter import KbAdapter
+        from live_trading.nh_adapter import NhAdapter
+        for cls, call in ((KbAdapter, lambda a: a._call("SSQM1", {}, retry_network=False)),
+                          (NhAdapter, lambda a: a._call("/p", {}, retry_network=False))):
+            a = object.__new__(cls)
+            n = []
+            class Resp:
+                status_code = 503
+                text = "{}"
+                def json(self): return {}
+            class Sess:
+                def post(self, *x, **k): n.append(1); return Resp()
+            for k, v in dict(_session=Sess(), http_max_retries=3, http_retry_delay=0, timeout=1,
+                             base_url="http://x", ip_addr="", mac_addr="", acct_no="",
+                             _throttle_lock=__import__("threading").Lock(), _last_request_ts=0.0).items():
+                setattr(a, k, v)
+            a._throttle_request = lambda: None
+            a._headers = lambda *x, **k: {}
+            try:
+                call(a)
+            except Exception:
+                pass
+            self.assertEqual(len(n), 1, cls.__name__)
+
 
 class AdapterRowMatchTests(unittest.TestCase):
     """KB/NH get_order_status 는 주문번호가 일치하는 행만 사용해야 한다 (mock 응답, 네트워크 없음)."""

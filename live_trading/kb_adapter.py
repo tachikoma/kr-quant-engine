@@ -247,7 +247,7 @@ class KbAdapter:
                 self.invalidate_token()
                 self._ensure_token_valid()
                 continue
-            if resp.status_code in (500, 502, 503) and attempt < self.http_max_retries:
+            if resp.status_code in (500, 502, 503) and retry_network and attempt < self.http_max_retries:
                 time.sleep(min(self.http_retry_delay * (2**attempt), 10.0))
                 continue
 

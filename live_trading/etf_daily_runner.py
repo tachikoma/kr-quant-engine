@@ -1646,6 +1646,10 @@ def _build_plan(
 
 
 
+# 이번 프로세스에서 접수(ACK)된 주문 — 중단 시 운영자 대조용 (order_id 포함, 계좌정보 없음)
+_RUN_ACKED: list[dict[str, Any]] = []
+
+
 class OrderSubmissionUncertain(RuntimeError):
     """주문 전송 결과를 알 수 없음(타임아웃/전송 오류). 이후 모든 주문 제출을 중단해야 한다."""
 
@@ -1792,7 +1796,13 @@ def _submit_orders(
                     }
                 )
                 continue
-        intent_id = _write_live_order_intent(side, ticker, qty, attempt)
+        try:
+            intent_id = _write_live_order_intent(side, ticker, qty, attempt)
+        except Exception as exc:
+            # 원장 기록 실패 → 이 주문은 전송하지 않음. 이미 접수된 주문 정보는 보존해 알린다.
+            raise OrderSubmissionUncertain(
+                f"Journal write failed before {side} {ticker}; nothing sent for this order", results
+            ) from exc
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
             order_id = response.get("order_id", "")
@@ -1803,6 +1813,7 @@ def _submit_orders(
                     results,
                 )
             _update_live_order_intent(intent_id, "ACKED", str(order_id))
+            _RUN_ACKED.append({"side": side, "ticker": ticker, "qty": qty, "order_id": str(order_id)})
             results.append(
                 {
                     "ticker": ticker,
@@ -1912,7 +1923,13 @@ def _poll_and_finalize_orders(
             row["requested_qty"] = req_qty
             row["filled_qty"] = max(filled_qty, 0)
             row["remaining_qty"] = remaining_qty
-            row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
+            row.pop("status_error", None)  # 조회 성공 → 일시 오류 해소
+            # KIS 는 부분체결 후 취소도 is_filled=True 로 보고 → 체결수량으로 재검증
+            row["is_filled"] = (
+                bool(status.get("is_filled", False))
+                and row["remaining_qty"] == 0
+                and row["filled_qty"] >= req_qty > 0
+            )
             row["last_status"] = status
 
             if row["is_filled"]:
@@ -1961,7 +1978,12 @@ def _poll_and_finalize_orders(
                     row.get("side", ""), row.get("display_name", ticker), filled, total
                 )
 
-        row["is_filled"] = bool(row.get("remaining_qty", 0) == 0)
+        # remaining==0 만으로는 전량체결과 (부분체결 후) 취소를 구분할 수 없다 → 체결수량 확인.
+        row["is_filled"] = bool(
+            row.get("remaining_qty", 0) == 0
+            and int(row.get("filled_qty", 0)) >= int(row.get("requested_qty", row.get("qty", 0)))
+            > 0
+        )
         row["timed_out"] = True
 
     return results
@@ -2270,6 +2292,18 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
 
 
 def run_daily() -> None:
+    """프로세스 간 배타 잠금을 잡고 실행한다 (직접 호출해도 동시 실행 차단)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _lock_fd = os.open(LIVE_RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(_lock_fd, "a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("ETF runner already active: concurrent execution blocked") from None
+        _run_daily_locked()
+
+
+def _run_daily_locked() -> None:
     cfg = _read_env_config()
     setup_logging(cfg.log_level, cfg.log_file)
     if cfg.enable_live_order:
@@ -3002,33 +3036,24 @@ def main() -> None:
         os.environ["ALLOW_LATE_LIVE_ORDERS"] = "1"
         logger.warning("[경고] --force-live: 컷오프 안전차단 우회")
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _lock_fd = os.open(LIVE_RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(_lock_fd, "a+") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit("ETF runner already active: concurrent execution blocked")
-        try:
-            run_daily()
-        except SystemExit:
-            raise
-        except Exception as exc:
-            logger.exception("실행 중 예외 발생: %s", exc)
-            for _r in getattr(exc, "results", []) or []:
-                if _r.get("submitted"):
-                    logger.error(
-                        "[수동대조필요] 접수된 주문이 관리되지 않고 남아 있을 수 있음: "
-                        f"{_r.get('side')} {_r.get('ticker')} qty={_r.get('qty')} "
-                        f"order_id={_r.get('order_id')}"
-                    )
-            if TelegramNotifier is not None:
-                try:
-                    notifier = TelegramNotifier()
-                    notifier.send(f"⚠️ <b>실행 실패</b>\n{exc}")
-                except Exception:
-                    pass
-            sys.exit(1)
+    try:
+        run_daily()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.exception("실행 중 예외 발생: %s", exc)
+        for _r in _RUN_ACKED:
+            logger.error(
+                "[수동대조필요] 접수된 주문이 관리되지 않고 남아 있을 수 있음: "
+                f"{_r['side']} {_r['ticker']} qty={_r['qty']} order_id={_r['order_id']}"
+            )
+        if TelegramNotifier is not None:
+            try:
+                notifier = TelegramNotifier()
+                notifier.send(f"⚠️ <b>실행 실패</b>\n{exc}")
+            except Exception:
+                pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
