@@ -441,6 +441,35 @@ class ScrubTests(unittest.TestCase):
                 out = bp._scrub("plain diagnostic message abc")
             self.assertEqual(out, "plain diagnostic message abc", repr(weird))
 
+    def test_overlapping_credentials_longest_first(self):
+        from live_trading import broker_preflight as bp
+
+        env = {"KIS_APP_KEY": " InnerSecret123 ", "NHPLUG_APP_SECRET": "prefixInnerSecret123suffix"}
+        with mock.patch.dict(os.environ, env):
+            out = bp._scrub("err prefixInnerSecret123suffix and InnerSecret123")
+        self.assertNotIn("InnerSecret123", out)
+        self.assertNotIn("prefix", out)
+        self.assertNotIn("suffix", out)
+
+    def test_space_before_hyphen_account_piece_is_masked(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KIS_ACCOUNT_NO": "12345678 -01"}):
+            out = bp._scrub("cano=12345678 failed")
+        self.assertNotIn("12345678", out)
+
+    def test_url_encoded_and_json_escaped_forms_are_masked(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "abcd/efgh"}):
+            for echoed in ("abcd/efgh", "abcd%2Fefgh", "abcd\\/efgh"):
+                out = bp._scrub(f"resp: {echoed} bad")
+                self.assertNotIn("abcd", out, echoed)
+                self.assertNotIn("efgh", out, echoed)
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": 'ab"cd"ef'}):
+            out = bp._scrub('{"secret":"ab\\"cd\\"ef"}')
+        self.assertNotIn('cd', out)
+
     def test_short_non_secret_values_are_left_alone(self):
         from live_trading import broker_preflight as bp
 

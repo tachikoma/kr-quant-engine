@@ -118,21 +118,39 @@ def _mask(s: str | None, keep: int = 4) -> str:
     return s[:2] + "***" + s[-keep:]
 
 
+def _credential_forms(raw: str) -> set[str]:
+    """한 자격증명 값이 로그/오류 본문에 나타날 수 있는 형태들 (어댑터의 정규화 포함)."""
+    from urllib.parse import quote
+
+    v = raw.strip()  # 어댑터(NH 등)는 .strip() 후 사용
+    if len(v) < 4:
+        return set()  # 너무 짧은 값(예: 상품코드 '01')은 비밀이 아니며 진단 메모를 망가뜨린다
+    base = {raw, v, v.replace("-", "")}
+    # 하이픈 조각(계좌 CANO/상품코드 분리 등): 조각도 strip, 6자 이상만 (짧은 조각은 일반 텍스트와 충돌)
+    base |= {p.strip() for p in v.split("-") if len(p.strip()) >= 6}
+    forms = set(base)
+    for f in base:  # 오류 본문이 값을 URL 인코딩/JSON 이스케이프해 되울리는 경우
+        forms.add(quote(f, safe=""))
+        forms.add(json.dumps(f, ensure_ascii=False)[1:-1])
+        # 일부 직렬화기(PHP/JS 계열)는 '/' 를 '\\/' 로 이스케이프한다
+        forms.add(json.dumps(f, ensure_ascii=False)[1:-1].replace("/", "\\/"))
+    # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
+    return {f for f in forms if len(f) >= 4 and f.strip(" -")}
+
+
 def _scrub(text: str) -> str:
-    """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹."""
+    """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹.
+
+    모든 자격증명의 모든 형태를 모아 **길이 내림차순으로 한 번에** 치환한다 (한 값이 다른 값의
+    부분 문자열일 때 긴 값이 먼저 가려지도록). 4자 미만 값과 퇴화 형태는 치환하지 않는다.
+    """
     out = str(text)
+    forms: set[str] = set()
     for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
         for n in names:
-            raw = os.environ.get(n, "")
-            v = raw.strip()  # 어댑터(NH 등)는 .strip() 후 사용하므로 정규화본도 대상
-            if len(v) < 4:
-                continue  # 너무 짧은 값(예: 상품코드 '01')은 비밀이 아니며 진단 메모를 망가뜨린다
-            # 원본 + 공백 제거본 + 하이픈 제거(NH 정규화) + 6자 이상 하이픈 조각(계좌 앞/뒤 구간)
-            forms = {raw, v, v.replace("-", ""), *[p for p in v.split("-") if len(p) >= 6]}
-            # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
-            forms = {f for f in forms if len(f) >= 4 and f.strip(" -")}
-            for f in sorted(forms, key=len, reverse=True):
-                out = out.replace(f, "***")
+            forms |= _credential_forms(os.environ.get(n, ""))
+    for f in sorted(forms, key=len, reverse=True):
+        out = out.replace(f, "***")
     return out
 
 
