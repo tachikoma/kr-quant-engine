@@ -424,8 +424,7 @@ class KbAdapter:
             if str(r.get("ord_no", "")).strip() == str(order_id).strip():
                 target = r
                 break
-        if not target and len(rows) == 1:
-            target = rows[0]
+        # 주문번호가 일치하지 않는 행은 절대 대체 사용하지 않는다 (타 주문의 잔량을 오인 → 중복 주문).
         if not target:
             return {
                 "order_id": order_id,

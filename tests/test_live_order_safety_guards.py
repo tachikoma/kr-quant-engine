@@ -318,5 +318,45 @@ class LiveOrderSafetyTests(unittest.TestCase):
         ns["_refresh_order_statuses"](Broker(), [row])
         self.assertEqual([r["qty"] for r in ns["_build_retry_orders"]([row])], [4])
 
+class AdapterRowMatchTests(unittest.TestCase):
+    """KB/NH get_order_status 는 주문번호가 일치하는 행만 사용해야 한다 (mock 응답, 네트워크 없음)."""
+
+    ROW_OTHER = {"ord_no": "999", "ord_qty": "10", "ccld_qty": "4", "rmn_qty": "0"}
+    ROW_SELF = {"ord_no": "123", "ord_qty": "10", "ccld_qty": "10", "rmn_qty": "0"}
+
+    def _kb(self, rows):
+        from live_trading.kb_adapter import KbAdapter
+        a = object.__new__(KbAdapter)
+        a._call = lambda api_id, body, **kw: {"dataBody": {"list": rows}}
+        return a
+
+    def _nh(self, rows):
+        from live_trading.nh_adapter import NhAdapter
+        a = object.__new__(NhAdapter)
+        a.acct_no = "x"
+        a._call = lambda path, payload, **kw: {"Output_0": rows}
+        return a
+
+    def test_single_foreign_row_is_not_found(self):
+        for make in (self._kb, self._nh):
+            st = make([self.ROW_OTHER]).get_order_status("123")
+            self.assertFalse(st["is_found"], make.__name__)
+            self.assertFalse(st["is_filled"])
+
+    def test_matching_row_is_used(self):
+        for make in (self._kb, self._nh):
+            st = make([self.ROW_OTHER, self.ROW_SELF]).get_order_status("123")
+            self.assertTrue(st["is_found"], make.__name__)
+            self.assertEqual(st["filled_qty"], 10)
+
+    def test_foreign_row_never_confirms_cancel(self):
+        ns = isolated_functions("_wait_for_cancellations")
+        ns["time"] = SimpleNamespace(sleep=lambda x: None)
+        ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+        for make in (self._kb, self._nh):
+            row = {"ticker": "a", "order_id": "123", "cancel_submitted": True}
+            ns["_wait_for_cancellations"](make([self.ROW_OTHER]), [row], timeout_sec=0)
+            self.assertNotIn("cancel_confirmed", row, make.__name__)
+
 if __name__ == "__main__":
     unittest.main()
