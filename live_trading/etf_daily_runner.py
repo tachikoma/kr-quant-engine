@@ -1871,7 +1871,7 @@ def _wait_for_cancellations(
                 logger.info(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
                 continue
             remaining = int(status.get("remaining_qty", 1))
-            if remaining == 0 or not status.get("is_found", True):
+            if status.get("is_found", True) and remaining == 0:
                 row = pending.pop(order_id)
                 row["cancel_confirmed"] = True
                 logger.info(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
@@ -1879,7 +1879,7 @@ def _wait_for_cancellations(
             time.sleep(max(poll_interval_sec, 1))
 
     for order_id in pending:
-        logger.info(f"[취소확인] {order_id} → 미확인 (타임아웃, 계속 진행)")
+        logger.error(f"[취소확인] {order_id} → 미확인 (타임아웃, 재주문 차단)")
 
 
 def _refresh_order_statuses(
@@ -1933,6 +1933,9 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 f"[재시도-스킵] {ticker}: API 잔량=0, 자체계산={req_qty - filled_qty} — 재시도 생략"
             )
         if remaining_qty <= 0:
+            continue
+        if not row.get("submitted") or not row.get("order_id") or row.get("cancel_confirmed") is not True:
+            logger.error(f"[재시도-차단] {ticker}: 취소 완료를 확인하지 못해 재주문을 생략합니다.")
             continue
         retry_orders.append(
             {
@@ -2179,6 +2182,9 @@ def run_daily() -> None:
             _now_for_extend.date(), _parse_hhmm(_live_cutoff_hhmm), tzinfo=_now_for_extend.tzinfo
         )
         if _now_for_extend >= _live_cutoff_dt:
+            if os.environ.get("ALLOW_LATE_LIVE_ORDERS") != "1":
+                logger.error("[안전차단] 컷오프 후 실주문은 명시적 ALLOW_LATE_LIVE_ORDERS=1이 필요합니다.")
+                return
             _extend_min = int(os.environ.get("FORCE_LIVE_CUTOFF_EXTEND_MIN", "10"))
             cfg.buy_cutoff_time = (_now_for_extend + dt.timedelta(minutes=_extend_min)).strftime(
                 "%H:%M"
@@ -2804,6 +2810,7 @@ def main() -> None:
     if args.force_live:
         # 프로세스 환경변수로 안전차단 플래그를 덮어써서 컷오프 검사 우회
         os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
+        os.environ["ALLOW_LATE_LIVE_ORDERS"] = "1"
         logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
 
     try:
