@@ -18,7 +18,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -138,42 +137,130 @@ def _credential_forms(raw: str) -> set[str]:
     return {f for f in forms if len(f) >= 4 and f.strip(" -")}
 
 
-def _char_pattern(c: str) -> str:
-    """문자 하나가 오류 본문에 나타날 수 있는 표기들의 정규식 (문자 단위라 조합이 자동으로 처리된다).
+_JSON_SHORT_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_HEX = frozenset("0123456789abcdefABCDEF")
 
-    원문 | 퍼센트 인코딩(UTF-8, hex 대소문자 무관) | JSON \\uXXXX(UTF-16, hex 대소문자 무관) |
-    JSON 백슬래시 이스케이프(\\/ \\" \\\\) | 공백의 '+'
+
+def _is_hex(seg: str) -> bool:
+    return bool(seg) and all(ch in _HEX for ch in seg)
+
+
+def _is_pct(text: str, i: int) -> bool:
+    return text[i] == "%" and i + 2 < len(text) and _is_hex(text[i + 1:i + 3])
+
+
+def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
+    """본문을 '디코딩된 문자 단위' 열로 푼다: (문자 후보, 원문 시작, 원문 끝).
+
+    - 퍼센트 인코딩(%XX 연속은 UTF-8 로 디코딩, hex 대소문자 무관)
+    - JSON 이스케이프: \\uXXXX(서로게이트 쌍 결합), \\n \\r \\t \\b \\f \\/ \\" \\\\
+    - '+' 는 '+' 또는 공백 둘 다 후보(폼 인코딩)
+    정규식을 쓰지 않으므로 역추적이 없고 입력 길이에 선형이다.
     """
-    alts = [re.escape(c)]
-    alts.append("".join(f"(?i:%{b:02X})" for b in c.encode("utf-8")))
-    u16 = c.encode("utf-16-be")
-    alts.append("".join(f"\\\\(?i:u{(u16[i] << 8) | u16[i + 1]:04X})" for i in range(0, len(u16), 2)))
-    if c in '/"\\':
-        alts.append("\\\\" + re.escape(c))
-    if c == " ":
-        alts.append(r"\+")
-    return "(?:" + "|".join(alts) + ")"
+    import codecs
+
+    chars: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "%" and _is_pct(text, i):
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            seg_start = j = i
+            while j < n and _is_pct(text, j):
+                out = dec.decode(bytes([int(text[j + 1:j + 3], 16)]))
+                j += 3
+                if out:
+                    for ch in out:
+                        chars.append(ch); starts.append(seg_start); ends.append(j)
+                    seg_start = j
+            for ch in dec.decode(b"", final=True):  # 미완결 바이트는 대체문자로
+                chars.append(ch); starts.append(seg_start); ends.append(j)
+            i = j
+        elif c == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "u" and _is_hex(text[i + 2:i + 6]) and len(text[i + 2:i + 6]) == 4:
+                cu, end = int(text[i + 2:i + 6], 16), i + 6
+                lo_seg = text[i + 8:i + 12]
+                if (0xD800 <= cu <= 0xDBFF and text[i + 6:i + 8] == "\\u" and len(lo_seg) == 4
+                        and _is_hex(lo_seg) and 0xDC00 <= int(lo_seg, 16) <= 0xDFFF):
+                    ch = chr(0x10000 + ((cu - 0xD800) << 10) + (int(lo_seg, 16) - 0xDC00))
+                    end = i + 12
+                else:
+                    ch = chr(cu)  # 단독 서로게이트도 그대로 (인코딩하지 않으므로 예외 없음)
+                chars.append(ch); starts.append(i); ends.append(end)
+                i = end
+            elif nxt in _JSON_SHORT_ESCAPES:
+                chars.append(_JSON_SHORT_ESCAPES[nxt]); starts.append(i); ends.append(i + 2)
+                i += 2
+            else:
+                chars.append(c); starts.append(i); ends.append(i + 1)
+                i += 1
+        elif c == "+":
+            chars.append("+ "); starts.append(i); ends.append(i + 1)
+            i += 1
+        else:
+            chars.append(c); starts.append(i); ends.append(i + 1)
+            i += 1
+    return chars, starts, ends
 
 
-def _loose_pattern(form: str) -> str:
-    return "".join(_char_pattern(c) for c in form)
+def _match_spans(chars: list[str], starts: list[int], ends: list[int],
+                 buckets: dict[str, list[str]]) -> list[tuple[int, int]]:
+    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간."""
+    spans: list[tuple[int, int]] = []
+    total = len(chars)
+    for k in range(total):
+        alts = chars[k]
+        for first in alts:
+            for f in buckets.get(first, ()):
+                m = len(f)
+                if k + m > total:
+                    continue
+                if all(f[t] in chars[k + t] for t in range(1, m)):
+                    spans.append((starts[k], ends[k + m - 1]))
+    return spans
 
 
 def _scrub(text: str) -> str:
     """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹.
 
-    모든 자격증명의 기준 문자열을 모아 **길이 내림차순으로 한 번에** 치환한다 (한 값이 다른 값의
-    부분 문자열일 때 긴 값이 먼저 가려지도록). 각 문자는 원문/퍼센트 인코딩/JSON 이스케이프 어느 표기든
-    매칭하므로 인코딩이 섞인 경우(예: `\\uD55C\\/`)도 가려진다. 4자 미만 값과 퇴화 형태는 치환하지 않는다.
+    본문을 (a) 원문 문자 열과 (b) 디코딩된 문자 열(퍼센트/JSON 이스케이프/'+') 두 가지로 보고,
+    모든 자격증명의 기준 문자열이 나타나는 모든 구간(서로 겹쳐도)의 **합집합**을 `***`로 바꾼다.
+    인코딩이 섞인 경우, 겹치는 자격증명, 줄바꿈 등 짧은 이스케이프도 처리한다.
+    4자 미만 값과 퇴화 형태는 치환하지 않는다. 정규식을 쓰지 않아 역추적이 없다.
     """
+    text = str(text)
     forms: set[str] = set()
     for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
         for n in names:
             forms |= _credential_forms(os.environ.get(n, ""))
-    if not forms:
-        return str(text)
-    pattern = "|".join(_loose_pattern(f) for f in sorted(forms, key=len, reverse=True))
-    return re.sub(pattern, "***", str(text))
+    if not forms or not text:
+        return text
+    buckets: dict[str, list[str]] = {}
+    for f in forms:
+        buckets.setdefault(f[0], []).append(f)
+    spans = _match_spans(list(text), list(range(len(text))), list(range(1, len(text) + 1)), buckets)
+    spans += _match_spans(*_decoded_units(text), buckets)
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[list[int]] = [list(spans[0])]
+    for st, en in spans[1:]:
+        if st <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], en)
+        else:
+            merged.append([st, en])
+    out: list[str] = []
+    pos = 0
+    for st, en in merged:
+        out.append(text[pos:st])
+        out.append("***")
+        pos = en
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _try_call(label: str, fn, *args, **kwargs) -> tuple[str, Any, str]:

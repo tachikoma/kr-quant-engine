@@ -608,13 +608,81 @@ class ScrubTests(unittest.TestCase):
         env = {n: f"Secret{i}-Value{i}-Padding{i}" for i, n in enumerate(
             ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY",
              "NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO", "KBSEC_APP_KEY", "KBSEC_APP_SECRET"])}
-        text = ("lorem ipsum dolor sit amet " * 8000) + env["KIS_APP_KEY"]  # 약 200KB
+        # 비밀값과 접두가 같은 단어("Secret0-Value0-Padd")가 반복되는 어려운 입력 + 약 200KB
+        text = ("Secret0-Value0-Padd lorem ipsum Secret " * 5000) + env["KIS_APP_KEY"]
         with mock.patch.dict(os.environ, env):
             t0 = _t.perf_counter()
             out = bp._scrub(text)
             elapsed = _t.perf_counter() - t0
         self.assertNotIn(env["KIS_APP_KEY"], out)
         self.assertLess(elapsed, 2.0, f"scrub took {elapsed:.2f}s")
+
+    def test_json_short_escapes_are_masked(self):
+        import json
+
+        from live_trading import broker_preflight as bp
+
+        for secret in ("abcd\nefgh", "abcd\tefgh", "abcd\refgh", 'abcd"efgh', "abcd\\efgh", "abcd\befgh", "abcd\fefgh"):
+            with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": secret}):
+                for echoed in (json.dumps(secret)[1:-1], secret):
+                    out = bp._scrub(f"x[{echoed}]y")
+                    self.assertEqual(out, "x[***]y", (secret, echoed))
+
+    def test_non_bmp_secret_pair_and_percent(self):
+        from live_trading import broker_preflight as bp
+
+        secret = "비밀😀값값"
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": secret}):
+            for echoed in (secret, r"\uBE44\uBc00\uD83D\uDE00\uAC12\uac12",
+                           "%EB%B9%84%EB%B0%80%F0%9F%98%80%EA%B0%92%EA%B0%92"):
+                self.assertEqual(bp._scrub(f"[{echoed}]"), "[***]", echoed)
+
+    def test_percent_sign_in_secret_matches_raw_and_double_encoded(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "ab%41cd"}):
+            self.assertEqual(bp._scrub("[ab%41cd]"), "[***]")        # 원문
+            self.assertEqual(bp._scrub("[ab%2541cd]"), "[***]")      # % 가 %25 로 인코딩됨
+
+    def test_malformed_escapes_do_not_crash(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "SecretValue99"}):
+            text = "bad %zz %4 %  \\u12 \\uZZZZ \\ \\x \\ud83d tail%"
+            self.assertEqual(bp._scrub(text), text)
+
+    def test_pathological_backslashes_are_linear(self):
+        import time as _t
+
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "\\" * 40 + "X"}):
+            for n in (80, 50_000):
+                text = "\\" * n + "Y"
+                t0 = _t.perf_counter()
+                out = bp._scrub(text)
+                elapsed = _t.perf_counter() - t0
+                self.assertEqual(out, text)  # 일치 없음 → 원문 그대로
+                self.assertLess(elapsed, 3.0, f"n={n}: {elapsed:.2f}s")
+            hit = bp._scrub("pre" + "\\" * 40 + "X" + "post")
+        self.assertEqual(hit, "pre***post")
+
+    def test_overlapping_credentials_leave_no_suffix(self):
+        from live_trading import broker_preflight as bp
+
+        env = {"KIS_APP_KEY": "abcd", "KBSEC_APP_SECRET": "cdefgh"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(bp._scrub("xx abcdefgh yy"), "xx *** yy")
+            self.assertEqual(bp._scrub("abcd cdefgh"), "*** ***")
+
+    def test_surrogate_in_environment_value_does_not_break_reporting(self):
+        from live_trading import broker_preflight as bp
+
+        weird = "abc\udcffdef"  # os.environ(surrogateescape)가 만들 수 있는 값
+        env = {"KIS_APP_KEY": weird, "KIWOOM_SECRETKEY": "NormalSecret123"}
+        with mock.patch.dict(os.environ, env):
+            out = bp._scrub(f"k={weird} s=NormalSecret123 rest")
+        self.assertEqual(out, "k=*** s=*** rest")
 
     def test_short_non_secret_values_are_left_alone(self):
         from live_trading import broker_preflight as bp
@@ -663,22 +731,34 @@ class KbOrderMappingGuardTests(unittest.TestCase):
             ns["_assert_order_mapping_verified"](object.__new__(KbAdapter), "KB")
         ns["_assert_order_mapping_verified"](object(), "KIWOOM")  # 플래그 없는 어댑터는 통과
 
-    def test_runner_calls_the_check_before_planning_or_ordering(self):
-        """배선 확인(AST): _run_daily_locked 에서 매핑 검사가 계획 수립·주문 제출보다 먼저 호출된다."""
+    def test_runner_calls_the_check_unconditionally_before_planning_or_ordering(self):
+        """구조 확인(AST): 매핑 검사는 _run_daily_locked 최상위의 `if cfg.enable_live_order and api is not None:`
+        바로 아래에 있고(`if False:` 같은 우회 불가), 그 문장이 계획 수립·주문 제출 문장보다 앞선다."""
         import ast
 
         src = (ROOT / "live_trading" / "etf_daily_runner.py").read_text(encoding="utf-8")
         fn = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_run_daily_locked"][0]
-        first_line = {}
-        for node in ast.walk(fn):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                first_line[node.func.id] = min(first_line.get(node.func.id, 10**9), node.lineno)
-        self.assertIn("_assert_order_mapping_verified", first_line)
-        for later in ("_build_plan", "_submit_orders"):
-            self.assertLess(first_line["_assert_order_mapping_verified"], first_line[later], later)
+
+        def calls(stmt, name):
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+                       for n in ast.walk(stmt))
+
+        idx = {name: min((i for i, st in enumerate(fn.body) if calls(st, name)), default=None)
+               for name in ("_assert_order_mapping_verified", "_build_plan", "_submit_orders")}
+        self.assertIsNotNone(idx["_assert_order_mapping_verified"])
+        guard = fn.body[idx["_assert_order_mapping_verified"]]
+        self.assertIsInstance(guard, ast.If)
+        cond = ast.unparse(guard.test)
+        self.assertIn("cfg.enable_live_order", cond)
+        self.assertIn("api is not None", cond)
+        self.assertNotIn("or", cond.split())  # 조건이 느슨해져 우회되지 않도록
+        self.assertEqual(len(guard.body), 1)  # 검사만 수행
+        self.assertLess(idx["_assert_order_mapping_verified"], idx["_build_plan"])
+        self.assertLess(idx["_assert_order_mapping_verified"], idx["_submit_orders"])
 
     def test_kb_refusal_is_a_definite_rejection_not_an_uncertain_submit(self):
-        """원장이 UNCERTAIN 으로 남아 다음 실행을 막으면 안 된다 (브로커로 아무것도 안 나갔다)."""
+        """거부는 원장에 REJECTED 로 기록된다 (UNCERTAIN 이 아니다 — 브로커로 아무것도 나가지 않았다).
+        참고: 원장 파일 자체가 남아 있으면 다음 시작은 여전히 막힌다 (이 테스트의 검증 대상 아님)."""
         import ast
         import json as _json
         import tempfile
@@ -735,7 +815,7 @@ class RefusalReportedOutsideMarketHoursTests(unittest.TestCase):
     def test_wrong_endpoint_is_a_failure_even_after_hours(self):
         rep, stage2 = self._run("NH", FakeBroker(base_url="https://api.nhplug.com:8443"), False)
         stage2.assert_not_called()
-        self.assertGreater(rep["summary"]["fail"], 0)
+        self.assertIn(("order-destination guard", "FAIL"), {(r["label"], r["status"]) for r in rep["results"]})
 
     def test_valid_demo_after_hours_is_guard_pass_then_skip(self):
         rep, stage2 = self._run("KIWOOM", FakeBroker(base_url="https://mockapi.kiwoom.com"), False)
