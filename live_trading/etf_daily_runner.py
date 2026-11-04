@@ -2790,8 +2790,23 @@ def run_daily() -> None:
         **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
-    if cfg.enable_live_order and run_status == "DONE" and LIVE_ORDER_JOURNAL.exists():
+    if (
+        cfg.enable_live_order
+        and run_status == "DONE"
+        and LIVE_ORDER_JOURNAL.exists()
+        and executed_orders
+        and all(
+            row.get("submitted")
+            and row.get("order_id")
+            and row.get("is_filled")
+            and not row.get("timed_out")
+            and not row.get("status_error")
+            for row in executed_orders
+        )
+    ):
         LIVE_ORDER_JOURNAL.unlink()
+    elif cfg.enable_live_order and LIVE_ORDER_JOURNAL.exists():
+        logger.error("[안전차단] 미확인 주문이 있어 원장을 유지합니다. 다음 실전 실행 전 대조가 필요합니다.")
     try:
         _record_oos_equity_history(today, plan, run_status, run_id)
     except Exception as exc:
