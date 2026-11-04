@@ -217,20 +217,24 @@ def _norm_unit(ch: str) -> str:
     return _PLUS_CLASS if ch in ("+", " ") else ch
 
 
-def _build_automaton(forms) -> tuple[list[dict], list[int], list[list[int]]]:
-    """Aho-Corasick: 전이표, 실패 링크, 상태별 (끝나는) 패턴 길이 목록."""
+def _build_automaton(forms) -> tuple[list[dict], list[int], list[list[int]], list[int]]:
+    """Aho-Corasick: 전이표, 실패 링크, 상태별 패턴 길이(자기 것만), 출력 링크(다음 출력 상태).
+
+    출력을 자손에게 복사하지 않고 출력 링크로 따라가므로 저장량이 패턴 총 길이에 비례한다.
+    """
     goto: list[dict] = [{}]
-    out: list[list[int]] = [[]]
+    own: list[list[int]] = [[]]
     for f in forms:
         st = 0
         for ch in map(_norm_unit, f):
             nxt = goto[st].get(ch)
             if nxt is None:
-                goto.append({}); out.append([])
+                goto.append({}); own.append([])
                 nxt = goto[st][ch] = len(goto) - 1
             st = nxt
-        out[st].append(len(f))
+        own[st].append(len(f))
     fail = [0] * len(goto)
+    dict_link = [0] * len(goto)  # 실패 사슬에서 처음 만나는 '출력이 있는' 상태 (없으면 0=루트)
     queue = list(goto[0].values())
     for head in queue:  # BFS (queue 는 순회 중 확장)
         for ch, nxt in goto[head].items():
@@ -238,22 +242,25 @@ def _build_automaton(forms) -> tuple[list[dict], list[int], list[list[int]]]:
             while f and ch not in goto[f]:
                 f = fail[f]
             fail[nxt] = goto[f].get(ch, 0)
-            out[nxt] = out[nxt] + out[fail[nxt]]
+            dict_link[nxt] = fail[nxt] if own[fail[nxt]] else dict_link[fail[nxt]]
             queue.append(nxt)
-    return goto, fail, out
+    return goto, fail, own, dict_link
 
 
 def _match_spans(chars: list[str], starts: list[int], ends: list[int], automaton) -> list[tuple[int, int]]:
-    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간. 시간 O(입력 + 일치 수)."""
-    goto, fail, out = automaton
+    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간. 일치마다 O(1) 추가."""
+    goto, fail, own, dict_link = automaton
     spans: list[tuple[int, int]] = []
     st = 0
     for k, ch in enumerate(map(_norm_unit, chars)):
         while st and ch not in goto[st]:
             st = fail[st]
         st = goto[st].get(ch, 0)
-        for m in out[st]:
-            spans.append((starts[k - m + 1], ends[k]))
+        o = st if own[st] else dict_link[st]
+        while o:
+            for m in own[o]:
+                spans.append((starts[k - m + 1], ends[k]))
+            o = dict_link[o]
     return spans
 
 

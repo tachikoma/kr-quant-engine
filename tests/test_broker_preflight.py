@@ -683,6 +683,24 @@ class ScrubTests(unittest.TestCase):
             self.assertLess(elapsed, 3.0, f"{elapsed:.2f}s")
             self.assertEqual(bp._scrub("x" + "a" * m + "b" + "y"), "x***y")
 
+    def test_automaton_storage_is_proportional_to_pattern_length(self):
+        """실패 링크 출력 복사로 저장량이 세제곱이 되던 구성 (Codex): 상태 수·출력 수가 패턴 총 길이 이하."""
+        from live_trading import broker_preflight as bp
+
+        k = 60
+        cred = "a" * (k * k) + "-" + "-".join("a" * j for j in range(6, k + 6))
+        forms = bp._credential_forms(cred)
+        goto, fail, own, dict_link = bp._build_automaton(forms)
+        total = sum(len(f) for f in forms)
+        self.assertLessEqual(len(goto), total + 1)
+        self.assertLessEqual(sum(len(o) for o in own), len(forms))
+        import time as _t
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": cred}):
+            t0 = _t.perf_counter()
+            out = bp._scrub("a" * 20000)
+            self.assertLess(_t.perf_counter() - t0, 3.0)
+        self.assertNotIn("a" * 7, out.replace("***", ""))
+
     def test_automaton_finds_overlapping_and_nested_forms(self):
         from live_trading import broker_preflight as bp
 
@@ -794,6 +812,9 @@ class KbOrderMappingGuardTests(unittest.TestCase):
         self.assertIsInstance(stmt, ast.Expr)
         self.assertIsInstance(stmt.value, ast.Call)
         self.assertEqual(ast.unparse(stmt.value.func), "_assert_order_mapping_verified")
+        # 인자도 고정: 실제 어댑터 객체와 이름을 넘겨야 한다 (다른 객체를 넘기면 검사가 무의미해진다)
+        self.assertEqual([ast.unparse(a) for a in stmt.value.args], ["api", "adapter_name"])
+        self.assertEqual(stmt.value.keywords, [])
         # 그 호출이 가드 밖(다른 위치)에서 또 쓰이지 않아도 되지만, 가드보다 앞서는 문장에 숨은 호출은 없어야 한다
         self.assertEqual(sum(1 for st in fn.body if calls(st, "_assert_order_mapping_verified")), 1)
         self.assertLess(idx["_assert_order_mapping_verified"], idx["_build_plan"])
