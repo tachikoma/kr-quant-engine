@@ -141,6 +141,24 @@ class LiveFunctionRegressionTests(unittest.TestCase):
         record.update(cancel_confirmed=True, status_verified=True, remaining_qty=0)
         self.assertEqual(build([record])[0]["qty"], 6)
 
+    def test_notifier_error_does_not_change_acknowledgement(self):
+        submit = self.function_from_source("_submit_orders")
+        class FakeBroker:
+            def place_order(self, **kwargs):
+                return {"order_id": "known-ack"}
+        class BrokenNotifier:
+            def notify_order_submitted(self, *args):
+                raise RuntimeError("notification transport failure")
+        results = submit(
+            FakeBroker(), "BUY", [{"ticker": "069500", "qty": 1}],
+            dry_run=False, notifier=BrokenNotifier(), journal=OrderIntentJournal(self.path),
+        )
+        self.assertTrue(results[0]["submitted"])
+        self.assertEqual(
+            json.loads(self.path.read_text())["records"][0]["state"],
+            "ACKNOWLEDGED",
+        )
+
     def test_missing_order_id_blocks_new_order(self):
         submit = self.function_from_source("_submit_orders")
         class FakeBroker:
