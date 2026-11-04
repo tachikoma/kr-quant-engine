@@ -298,7 +298,10 @@ class NhAdapter:
             return self._call(path, input_0, base_url=_REAL_BASE_URL)
         return self._call(path, input_0)
 
-    def _call(self, path: str, input_0: dict[str, Any], base_url: str | None = None) -> dict[str, Any]:
+    def _call(
+        self, path: str, input_0: dict[str, Any], base_url: str | None = None,
+        retry_network: bool = True,
+    ) -> dict[str, Any]:
         """POST {base_url}{path} with {"Input_0": ...} envelope."""
         base_url = base_url or self.base_url
         url = f"{base_url}{path}"
@@ -310,7 +313,7 @@ class NhAdapter:
             try:
                 resp = self._session.post(url, headers=self._headers(), json=body, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self.http_max_retries:
+                if retry_network and attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2**attempt), 10.0)
                     logger.debug("[NH][재시도] 네트워크 %s -> %.1fs", type(e).__name__, delay)
                     time.sleep(delay)
@@ -669,7 +672,7 @@ class NhAdapter:
             payload["orr_pr"] = int(price)
             payload["ord_uv"] = str(int(price))
         # dry_run 기본 차단: 실제 주문은 위 _check_live_enabled로 게이트
-        data = self._call(path, payload)
+        data = self._call(path, payload, retry_network=False)
         # order_id 추출 후보
         out0 = data.get("Output_0", {})
         if isinstance(out0, list):

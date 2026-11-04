@@ -1659,7 +1659,11 @@ def _is_definite_rejection(exc: Exception) -> bool:
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         return False
     if hasattr(exc, "msg_cd"):
-        return int(getattr(exc, "http_status", 200) or 200) < 500
+        if str(getattr(exc, "msg_cd", "")) in {"NETWORK_ERROR", "PARSE_ERROR"}:
+            return False
+        status = getattr(exc, "http_status", 200)
+        # http_status 0(전송 실패)·5xx 는 거절의 증거가 아니다.
+        return isinstance(status, int) and 100 <= status < 500
     return type(exc) is RuntimeError and str(exc).startswith("Kiwoom API error")
 
 
@@ -1742,6 +1746,7 @@ def _submit_orders(
     order_type: str = "MARKET",
     attempt: int = 1,
     notifier: Any = None,
+    cutoff_hhmm: str | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
@@ -1772,6 +1777,21 @@ def _submit_orders(
             )
             continue
 
+        if cutoff_hhmm and os.environ.get("ALLOW_LATE_LIVE_ORDERS") != "1":
+            _now = _now_kst()
+            _cut = dt.datetime.combine(_now.date(), _parse_hhmm(cutoff_hhmm), tzinfo=_now.tzinfo)
+            if _now >= _cut:
+                logger.error(f"[안전차단] {side} {ticker}: 제출 시각이 컷오프({cutoff_hhmm}) 이후 → 미전송")
+                results.append(
+                    {
+                        "ticker": ticker, "display_name": display_name, "side": side,
+                        "attempt": attempt, "order_type": order_type, "qty": qty,
+                        "requested_qty": qty, "filled_qty": 0, "remaining_qty": qty,
+                        "is_filled": False, "submitted": False, "mode": "LIVE",
+                        "order_id": "", "error": "cutoff passed", "error_code": "CUTOFF_BLOCKED",
+                    }
+                )
+                continue
         intent_id = _write_live_order_intent(side, ticker, qty, attempt)
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
@@ -2003,7 +2023,8 @@ def _wait_for_cancellations(
                 continue
             # remaining==0 은 '전량체결'과 '취소'를 모두 의미할 수 있다 → 체결수량으로 구분.
             pending.pop(order_id)
-            row["filled_qty"] = max(filled, 0)
+            filled = max(filled, int(row.get("filled_qty", 0)))  # 체결수량은 감소하지 않는다
+            row["filled_qty"] = filled
             row["requested_qty"] = order_qty
             row["remaining_qty"] = 0
             if filled >= order_qty:
@@ -2041,6 +2062,7 @@ def _refresh_order_statuses(
         try:
             status = api.get_order_status(order_id, today=today_krx)
         except Exception as exc:
+            row["status_error"] = f"refresh failed: {exc}"
             logger.info(f"[상태재조회] {order_id} 조회 실패: {exc}")
             continue
         if not status.get("is_found", False) or status.get("remaining_qty") is None:
@@ -2056,7 +2078,13 @@ def _refresh_order_statuses(
         row["remaining_qty"] = max(remaining_qty, 0)
         if order_qty > 0:
             row["requested_qty"] = order_qty
-        row["is_filled"] = bool(status.get("is_filled", False)) and row["remaining_qty"] == 0
+        row.pop("status_error", None)  # 재조회 성공 → 이전 일시 오류 해소
+        # 일부 증권사(KIS)는 부분체결 후 취소도 is_filled=True 로 보고한다 → 체결수량으로 재검증.
+        row["is_filled"] = (
+            bool(status.get("is_filled", False))
+            and row["remaining_qty"] == 0
+            and row["filled_qty"] >= row.get("requested_qty", 0) > 0
+        )
         logger.info(
             f"[상태재조회] {row.get('display_name', row.get('ticker', order_id))} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"
@@ -2073,7 +2101,10 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ticker = str(row.get("ticker", "")).strip()
         if not ticker or not row.get("submitted") or not row.get("order_id"):
             continue
-        if row.get("is_filled") or row.get("status_error") and row.get("cancel_confirmed") is not True:
+        if row.get("is_filled"):
+            continue
+        if row.get("status_error"):
+            logger.error(f"[재시도-차단] {ticker}: 최종 체결 재조회 실패 — 수량 불확실, 재주문 생략")
             continue
         req_qty = int(row.get("requested_qty", row.get("qty", 0)))
         unfilled = max(req_qty - int(row.get("filled_qty", 0)), 0)
@@ -2457,8 +2488,8 @@ def run_daily() -> None:
     if plan["sell_orders"]:
         logger.info("\n[주문] ─── 매도 단계 ───")
         sell_results = _submit_orders(
-            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier
-        )
+            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier, cutoff_hhmm=cfg.sell_cutoff_time
+)
         if sell_results:
             for r in sell_results:
                 status_txt = (
@@ -2520,8 +2551,8 @@ def run_daily() -> None:
                         dry_run=False,
                         order_type=cfg.retry_order_type,
                         attempt=2,
-                        notifier=notifier,
-                    )
+                        notifier=notifier, cutoff_hhmm=cfg.sell_cutoff_time
+)
                     sell_retry_results = _poll_and_finalize_orders(
                         api=api,
                         submitted_results=sell_retry_results,
@@ -2782,12 +2813,12 @@ def run_daily() -> None:
                     except Exception:
                         pass
                 buy_results.extend(
-                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier)
+                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier, cutoff_hhmm=cfg.buy_cutoff_time)
                 )
         else:
             buy_results = _submit_orders(
-                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier
-            )
+                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier, cutoff_hhmm=cfg.buy_cutoff_time
+)
         if buy_results:
             for r in buy_results:
                 status_txt = (
@@ -2852,8 +2883,8 @@ def run_daily() -> None:
                         dry_run=False,
                         order_type=cfg.retry_order_type,
                         attempt=2,
-                        notifier=notifier,
-                    )
+                        notifier=notifier, cutoff_hhmm=cfg.buy_cutoff_time
+)
                     buy_retry_results = _poll_and_finalize_orders(
                         api=api,
                         submitted_results=buy_retry_results,
@@ -2984,6 +3015,13 @@ def main() -> None:
             raise
         except Exception as exc:
             logger.exception("실행 중 예외 발생: %s", exc)
+            for _r in getattr(exc, "results", []) or []:
+                if _r.get("submitted"):
+                    logger.error(
+                        "[수동대조필요] 접수된 주문이 관리되지 않고 남아 있을 수 있음: "
+                        f"{_r.get('side')} {_r.get('ticker')} qty={_r.get('qty')} "
+                        f"order_id={_r.get('order_id')}"
+                    )
             if TelegramNotifier is not None:
                 try:
                     notifier = TelegramNotifier()

@@ -211,7 +211,9 @@ class KbAdapter:
             "Authorization": f"Bearer {self.access_token}",
         }
 
-    def _call(self, api_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _call(
+        self, api_id: str, body: dict[str, Any], retry_network: bool = True
+    ) -> dict[str, Any]:
         """POST /api/v1/{apiId} with dataHeader/dataBody envelope."""
         url = f"{self.base_url}/api/v1/{api_id.lower()}"
         envelope = {
@@ -224,7 +226,7 @@ class KbAdapter:
             try:
                 resp = self._session.post(url, headers=self._headers(), json=envelope, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self.http_max_retries:
+                if retry_network and attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2**attempt), 10.0)
                     logger.debug("[KB][재시도] 네트워크 %s -> %.1fs", type(e).__name__, delay)
                     time.sleep(delay)
@@ -378,7 +380,7 @@ class KbAdapter:
             body["ord_prc"] = str(int(price))
         # 시장가면 가격 미전송
 
-        data = self._call(api_id, body)
+        data = self._call(api_id, body, retry_network=False)
         # order_id 추출 후보
         body_resp = data.get("dataBody", data) if isinstance(data.get("dataBody"), dict) else data
         order_id = ""

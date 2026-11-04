@@ -221,11 +221,102 @@ class LiveOrderSafetyTests(unittest.TestCase):
                 r = subprocess.run([sys.executable, "-c", code, str(lock)])
                 self.assertEqual(r.returncode, 7)
 
-    def test_late_live_requires_explicit_opt_in(self):
-        src = SOURCE.read_text(encoding="utf-8")
-        i = src.index('os.environ.get("ALLOW_LATE_LIVE_ORDERS") != "1"')
-        self.assertIn("return", src[i:i + 300])
+    def _submit_ns2(self, tmp, hhmm_now=(9, 6)):
+        ns = self._submit_ns(tmp)
+        ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, *hhmm_now, tzinfo=dt.timezone.utc)
+        ns["_parse_hhmm"] = lambda v: dt.time(int(v[:2]), int(v[3:]))
+        return ns
 
+    def test_submit_after_cutoff_blocked_without_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns2(tmp)
+            called = []
+            class Broker:
+                def place_order(self, **kw):
+                    called.append(1); return {"order_id": "1"}
+            os.environ.pop("ALLOW_LATE_LIVE_ORDERS", None)
+            res = ns["_submit_orders"](Broker(), "BUY", [{"ticker": "a", "qty": 1}], False, cutoff_hhmm="09:05")
+            self.assertEqual(called, [])
+            self.assertFalse(res[0]["submitted"])
+            self.assertEqual(res[0]["error_code"], "CUTOFF_BLOCKED")
+            self.assertFalse(ns["LIVE_ORDER_JOURNAL"].exists())
+
+    def test_submit_after_cutoff_allowed_with_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns2(tmp)
+            class Broker:
+                def place_order(self, **kw):
+                    return {"order_id": "1"}
+            os.environ["ALLOW_LATE_LIVE_ORDERS"] = "1"
+            try:
+                res = ns["_submit_orders"](Broker(), "BUY", [{"ticker": "a", "qty": 1}], False, cutoff_hhmm="09:05")
+            finally:
+                os.environ.pop("ALLOW_LATE_LIVE_ORDERS", None)
+            self.assertTrue(res[0]["submitted"])
+
+    def test_before_cutoff_submits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns2(tmp, (9, 1))
+            class Broker:
+                def place_order(self, **kw):
+                    return {"order_id": "1"}
+            os.environ.pop("ALLOW_LATE_LIVE_ORDERS", None)
+            res = ns["_submit_orders"](Broker(), "BUY", [{"ticker": "a", "qty": 1}], False, cutoff_hhmm="09:05")
+            self.assertTrue(res[0]["submitted"])
+
+    def test_kis_network_error_is_uncertain_not_rejection(self):
+        ns = isolated_functions("_is_definite_rejection")
+        class KisErr(Exception):
+            def __init__(self, cd, st):
+                self.msg_cd, self.http_status = cd, st
+        f = ns["_is_definite_rejection"]
+        self.assertFalse(f(KisErr("NETWORK_ERROR", 0)))
+        self.assertFalse(f(KisErr("PARSE_ERROR", 200)))
+        self.assertFalse(f(KisErr("X", 503)))
+        self.assertTrue(f(KisErr("40250000", 200)))
+        self.assertTrue(f(KisErr("EGW", 403)))
+        self.assertFalse(f(TimeoutError()))
+
+    def _refresh_ns(self):
+        ns = isolated_functions("_refresh_order_statuses", "_build_retry_orders")
+        ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+        return ns
+
+    def _cancelled_row(self):
+        return {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
+                "filled_qty": 4, "remaining_qty": 0, "cancel_submitted": True,
+                "cancel_confirmed": True}
+
+    def test_kis_partial_cancel_refresh_keeps_retry(self):
+        ns = self._refresh_ns()
+        row = self._cancelled_row()
+        class Broker:  # KIS: filled>0 and remaining==0 -> is_filled=True even when cancelled
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": True}
+        ns["_refresh_order_statuses"](Broker(), [row])
+        self.assertFalse(row["is_filled"])
+        self.assertEqual([r["qty"] for r in ns["_build_retry_orders"]([row])], [6])
+
+    def test_refresh_failure_blocks_retry(self):
+        ns = self._refresh_ns()
+        for exc_or_status in (TimeoutError("x"), {"is_found": False, "remaining_qty": 0}):
+            row = self._cancelled_row()
+            class Broker:
+                def get_order_status(self, oid, today):
+                    if isinstance(exc_or_status, Exception):
+                        raise exc_or_status
+                    return exc_or_status
+            ns["_refresh_order_statuses"](Broker(), [row])
+            self.assertEqual(ns["_build_retry_orders"]([row]), [])
+
+    def test_late_fill_seen_at_refresh_reduces_retry_qty(self):
+        ns = self._refresh_ns()
+        row = self._cancelled_row()
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 6, "remaining_qty": 0, "is_filled": True}
+        ns["_refresh_order_statuses"](Broker(), [row])
+        self.assertEqual([r["qty"] for r in ns["_build_retry_orders"]([row])], [4])
 
 if __name__ == "__main__":
     unittest.main()
