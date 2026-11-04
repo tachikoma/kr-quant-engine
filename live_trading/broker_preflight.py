@@ -154,11 +154,9 @@ def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
 
     - 퍼센트 인코딩(%XX 연속은 UTF-8 로 디코딩, hex 대소문자 무관)
     - JSON 이스케이프: \\uXXXX(서로게이트 쌍 결합), \\n \\r \\t \\b \\f \\/ \\" \\\\
-    - '+' 는 '+' 또는 공백 둘 다 후보(폼 인코딩)
-    정규식을 쓰지 않으므로 역추적이 없고 입력 길이에 선형이다.
+    - '+' 는 매칭 단계에서 공백과 같은 부류로 취급(폼 인코딩)
+    잘못된 UTF-8 바이트는 각각 자기 구간만 소유하는 대체문자 1개가 된다(좌표가 어긋나지 않는다).
     """
-    import codecs
-
     chars: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
@@ -167,17 +165,22 @@ def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
     while i < n:
         c = text[i]
         if c == "%" and _is_pct(text, i):
-            dec = codecs.getincrementaldecoder("utf-8")("replace")
-            seg_start = j = i
+            j = i
             while j < n and _is_pct(text, j):
-                out = dec.decode(bytes([int(text[j + 1:j + 3], 16)]))
                 j += 3
-                if out:
-                    for ch in out:
-                        chars.append(ch); starts.append(seg_start); ends.append(j)
-                    seg_start = j
-            for ch in dec.decode(b"", final=True):  # 미완결 바이트는 대체문자로
-                chars.append(ch); starts.append(seg_start); ends.append(j)
+            raw = bytes(int(text[k + 1:k + 3], 16) for k in range(i, j, 3))
+            p = 0
+            while p < len(raw):
+                for ln in (1, 2, 3, 4):  # 엄격한 UTF-8: 유효한 최단 시퀀스, 아니면 이 1바이트만 대체문자
+                    try:
+                        ch = raw[p:p + ln].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    ch, ln = "\ufffd", 1
+                chars.append(ch); starts.append(i + 3 * p); ends.append(i + 3 * (p + ln))
+                p += ln
             i = j
         elif c == "\\" and i + 1 < n:
             nxt = text[i + 1]
@@ -199,7 +202,7 @@ def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
                 chars.append(c); starts.append(i); ends.append(i + 1)
                 i += 1
         elif c == "+":
-            chars.append("+ "); starts.append(i); ends.append(i + 1)
+            chars.append("+"); starts.append(i); ends.append(i + 1)
             i += 1
         else:
             chars.append(c); starts.append(i); ends.append(i + 1)
@@ -207,20 +210,50 @@ def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
     return chars, starts, ends
 
 
-def _match_spans(chars: list[str], starts: list[int], ends: list[int],
-                 buckets: dict[str, list[str]]) -> list[tuple[int, int]]:
-    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간."""
+_PLUS_CLASS = "\x00"  # '+' 와 ' ' 를 같은 부류로 보는 정규화 기호 (폼 인코딩; 과대 마스킹만 가능, 누락 없음)
+
+
+def _norm_unit(ch: str) -> str:
+    return _PLUS_CLASS if ch in ("+", " ") else ch
+
+
+def _build_automaton(forms) -> tuple[list[dict], list[int], list[list[int]]]:
+    """Aho-Corasick: 전이표, 실패 링크, 상태별 (끝나는) 패턴 길이 목록."""
+    goto: list[dict] = [{}]
+    out: list[list[int]] = [[]]
+    for f in forms:
+        st = 0
+        for ch in map(_norm_unit, f):
+            nxt = goto[st].get(ch)
+            if nxt is None:
+                goto.append({}); out.append([])
+                nxt = goto[st][ch] = len(goto) - 1
+            st = nxt
+        out[st].append(len(f))
+    fail = [0] * len(goto)
+    queue = list(goto[0].values())
+    for head in queue:  # BFS (queue 는 순회 중 확장)
+        for ch, nxt in goto[head].items():
+            f = fail[head]
+            while f and ch not in goto[f]:
+                f = fail[f]
+            fail[nxt] = goto[f].get(ch, 0)
+            out[nxt] = out[nxt] + out[fail[nxt]]
+            queue.append(nxt)
+    return goto, fail, out
+
+
+def _match_spans(chars: list[str], starts: list[int], ends: list[int], automaton) -> list[tuple[int, int]]:
+    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간. 시간 O(입력 + 일치 수)."""
+    goto, fail, out = automaton
     spans: list[tuple[int, int]] = []
-    total = len(chars)
-    for k in range(total):
-        alts = chars[k]
-        for first in alts:
-            for f in buckets.get(first, ()):
-                m = len(f)
-                if k + m > total:
-                    continue
-                if all(f[t] in chars[k + t] for t in range(1, m)):
-                    spans.append((starts[k], ends[k + m - 1]))
+    st = 0
+    for k, ch in enumerate(map(_norm_unit, chars)):
+        while st and ch not in goto[st]:
+            st = fail[st]
+        st = goto[st].get(ch, 0)
+        for m in out[st]:
+            spans.append((starts[k - m + 1], ends[k]))
     return spans
 
 
@@ -230,7 +263,7 @@ def _scrub(text: str) -> str:
     본문을 (a) 원문 문자 열과 (b) 디코딩된 문자 열(퍼센트/JSON 이스케이프/'+') 두 가지로 보고,
     모든 자격증명의 기준 문자열이 나타나는 모든 구간(서로 겹쳐도)의 **합집합**을 `***`로 바꾼다.
     인코딩이 섞인 경우, 겹치는 자격증명, 줄바꿈 등 짧은 이스케이프도 처리한다.
-    4자 미만 값과 퇴화 형태는 치환하지 않는다. 정규식을 쓰지 않아 역추적이 없다.
+    4자 미만 값과 퇴화 형태는 치환하지 않는다. 정규식 없이 Aho-Corasick 으로 매칭한다.
     """
     text = str(text)
     forms: set[str] = set()
@@ -239,11 +272,9 @@ def _scrub(text: str) -> str:
             forms |= _credential_forms(os.environ.get(n, ""))
     if not forms or not text:
         return text
-    buckets: dict[str, list[str]] = {}
-    for f in forms:
-        buckets.setdefault(f[0], []).append(f)
-    spans = _match_spans(list(text), list(range(len(text))), list(range(1, len(text) + 1)), buckets)
-    spans += _match_spans(*_decoded_units(text), buckets)
+    automaton = _build_automaton(forms)
+    spans = _match_spans(list(text), list(range(len(text))), list(range(1, len(text) + 1)), automaton)
+    spans += _match_spans(*_decoded_units(text), automaton)
     if not spans:
         return text
     spans.sort()

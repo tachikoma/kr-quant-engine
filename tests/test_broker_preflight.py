@@ -667,6 +667,43 @@ class ScrubTests(unittest.TestCase):
             hit = bp._scrub("pre" + "\\" * 40 + "X" + "post")
         self.assertEqual(hit, "pre***post")
 
+    def test_prefix_heavy_input_is_not_quadratic(self):
+        """최악 입력(값 'a'*m+'b', 본문 'a'*2m)에서도 입력 길이에 선형 (이전 구현은 ~m*m 비교)."""
+        import time as _t
+
+        from live_trading import broker_preflight as bp
+
+        m = 20_000
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "a" * m + "b"}):
+            text = "a" * (2 * m)
+            t0 = _t.perf_counter()
+            out = bp._scrub(text)
+            elapsed = _t.perf_counter() - t0
+            self.assertEqual(out, text)
+            self.assertLess(elapsed, 3.0, f"{elapsed:.2f}s")
+            self.assertEqual(bp._scrub("x" + "a" * m + "b" + "y"), "x***y")
+
+    def test_automaton_finds_overlapping_and_nested_forms(self):
+        from live_trading import broker_preflight as bp
+
+        env = {"KIS_APP_KEY": "abcdef", "KIS_APP_SECRET": "cdef", "KBSEC_APP_KEY": "bcdefg"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(bp._scrub("..abcdefg.."), "..***..")  # 포함·겹침의 합집합
+            self.assertEqual(bp._scrub("cdefcdef"), "***")
+
+    def test_invalid_utf8_percent_bytes_own_only_their_span(self):
+        from live_trading import broker_preflight as bp
+
+        # 값 '¢abc' (¢ = C2 A2). 앞의 잘못된 선행 바이트 E2 는 대체문자 1개일 뿐, ¢ 의 %C2 를 삼키지 않는다.
+        with mock.patch.dict(os.environ, {"KIS_APP_KEY": "\u00a2abc"}):
+            self.assertEqual(bp._scrub("k=%E2%C2%A2abc;"), "k=%E2***;")
+        # 값 'Abcd' (%41 = 'A'). 앞의 %E2 는 무관하므로 그대로 남는다.
+        with mock.patch.dict(os.environ, {"KIS_APP_KEY": "Abcd"}):
+            self.assertEqual(bp._scrub("k=%E2%41bcd;"), "k=%E2***;")
+        # 값 '€xyz' (€ = E2 82 AC) 정상 3바이트 + 잘린 시퀀스 뒤 이어지는 일반 문자
+        with mock.patch.dict(os.environ, {"KIS_APP_KEY": "\u20acxyz"}):
+            self.assertEqual(bp._scrub("%E2%82%ACxyz|%E2%82x"), "***|%E2%82x")
+
     def test_overlapping_credentials_leave_no_suffix(self):
         from live_trading import broker_preflight as bp
 
@@ -748,11 +785,17 @@ class KbOrderMappingGuardTests(unittest.TestCase):
         self.assertIsNotNone(idx["_assert_order_mapping_verified"])
         guard = fn.body[idx["_assert_order_mapping_verified"]]
         self.assertIsInstance(guard, ast.If)
-        cond = ast.unparse(guard.test)
-        self.assertIn("cfg.enable_live_order", cond)
-        self.assertIn("api is not None", cond)
-        self.assertNotIn("or", cond.split())  # 조건이 느슨해져 우회되지 않도록
-        self.assertEqual(len(guard.body), 1)  # 검사만 수행
+        # 조건은 정확히 이 형태여야 한다 (`and False` 등 추가로 무력화 불가)
+        self.assertEqual(ast.unparse(guard.test), "cfg.enable_live_order and api is not None")
+        self.assertEqual(guard.orelse, [])
+        # 본문은 검사 호출 단 한 문장 (중첩 `if False:` 등으로 감쌀 수 없다)
+        self.assertEqual(len(guard.body), 1)
+        stmt = guard.body[0]
+        self.assertIsInstance(stmt, ast.Expr)
+        self.assertIsInstance(stmt.value, ast.Call)
+        self.assertEqual(ast.unparse(stmt.value.func), "_assert_order_mapping_verified")
+        # 그 호출이 가드 밖(다른 위치)에서 또 쓰이지 않아도 되지만, 가드보다 앞서는 문장에 숨은 호출은 없어야 한다
+        self.assertEqual(sum(1 for st in fn.body if calls(st, "_assert_order_mapping_verified")), 1)
         self.assertLess(idx["_assert_order_mapping_verified"], idx["_build_plan"])
         self.assertLess(idx["_assert_order_mapping_verified"], idx["_submit_orders"])
 
