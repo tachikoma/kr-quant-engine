@@ -278,8 +278,12 @@ def _load_state() -> dict[str, Any]:
 
 def _save_state(state: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with STATE_PATH.open("w", encoding="utf-8") as f:
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_PATH)
 
 
 def _extract_exec_price(row: dict) -> float | None:
@@ -1642,29 +1646,84 @@ def _build_plan(
 
 
 
-def _write_live_order_intent(side: str, ticker: str, qty: int, attempt: int) -> None:
-    """Persist an uncertain order intent BEFORE broker submission.
+class OrderSubmissionUncertain(RuntimeError):
+    """주문 전송 결과를 알 수 없음(타임아웃/전송 오류). 이후 모든 주문 제출을 중단해야 한다."""
 
-    Once written, a future LIVE run fails closed until an operator reconciles
-    the broker order history and archives the journal explicitly.
-    """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    entries = []
-    if LIVE_ORDER_JOURNAL.exists():
+    def __init__(self, message: str, results: list[dict[str, Any]] | None = None):
+        super().__init__(message)
+        self.results = results or []
+
+
+def _is_definite_rejection(exc: Exception) -> bool:
+    """증권사가 응답을 돌려주며 명시적으로 거절한 경우만 True (타임아웃/연결오류는 False)."""
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return False
+    if hasattr(exc, "msg_cd"):
+        return int(getattr(exc, "http_status", 200) or 200) < 500
+    return type(exc) is RuntimeError and str(exc).startswith("Kiwoom API error")
+
+
+def _load_live_order_journal() -> list[dict[str, Any]]:
+    if not LIVE_ORDER_JOURNAL.exists():
+        return []
+    try:
         entries = json.loads(LIVE_ORDER_JOURNAL.read_text(encoding="utf-8"))
-        if not isinstance(entries, list):
-            raise RuntimeError("Invalid live order journal: manual reconciliation needed")
-    entries.append({
-        "trading_date": _date_to_iso(_today_kst()),
-        "side": side, "ticker": ticker, "qty": qty, "attempt": attempt,
-        "status": "BROKER_SUBMISSION_UNCERTAIN",
-    })
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Live order journal unreadable/corrupt ({LIVE_ORDER_JOURNAL}): manual reconciliation needed"
+        ) from exc
+    if not isinstance(entries, list):
+        raise RuntimeError("Invalid live order journal: manual reconciliation needed")
+    return entries
+
+
+def _persist_live_order_journal(entries: list[dict[str, Any]]) -> None:
+    """원자적 + fsync + 디렉터리 fsync + 0600. 실패 시 예외(=주문 전송 차단)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = LIVE_ORDER_JOURNAL.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(entries, f, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, LIVE_ORDER_JOURNAL)
+    dfd = os.open(STATE_DIR, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _write_live_order_intent(side: str, ticker: str, qty: int, attempt: int) -> str:
+    """브로커 전송 '전에' 의도를 영속화한다. intent_id 반환.
+
+    원장이 남아 있으면 이후 LIVE 실행은 운영자가 증권사 주문내역을 대조해
+    원장을 보관(archive)할 때까지 실패-폐쇄(fail-closed)한다.
+    """
+    entries = _load_live_order_journal()
+    intent_id = f"{_date_to_iso(_today_kst())}-{len(entries) + 1}-{side}-{ticker}-{attempt}"
+    entries.append({
+        "intent_id": intent_id,
+        "trading_date": _date_to_iso(_today_kst()),
+        "side": side, "ticker": ticker, "qty": qty, "attempt": attempt,
+        "status": "BROKER_SUBMISSION_UNCERTAIN",
+    })
+    _persist_live_order_journal(entries)
+    return intent_id
+
+
+def _update_live_order_intent(intent_id: str, status: str, order_id: str = "") -> None:
+    """응답 수신 후 상태 갱신(ACKED/REJECTED). 갱신 실패해도 UNCERTAIN으로 남아 안전."""
+    try:
+        entries = _load_live_order_journal()
+        for e in entries:
+            if e.get("intent_id") == intent_id:
+                e["status"] = status
+                if order_id:
+                    e["order_id"] = order_id
+        _persist_live_order_journal(entries)
+    except Exception as exc:
+        logger.error(f"[원장] 상태 갱신 실패(원장은 UNCERTAIN 유지): {exc}")
 
 
 def _assert_live_order_journal_clear() -> None:
@@ -1713,10 +1772,17 @@ def _submit_orders(
             )
             continue
 
-        _write_live_order_intent(side, ticker, qty, attempt)
+        intent_id = _write_live_order_intent(side, ticker, qty, attempt)
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
             order_id = response.get("order_id", "")
+            if not order_id:
+                # 접수 여부 불명 (주문번호 없음) → 추가 주문 차단
+                raise OrderSubmissionUncertain(
+                    f"Broker response without order_id for {side} {ticker}; reconcile broker first",
+                    results,
+                )
+            _update_live_order_intent(intent_id, "ACKED", str(order_id))
             results.append(
                 {
                     "ticker": ticker,
@@ -1737,8 +1803,13 @@ def _submit_orders(
             )
             if notifier is not None:
                 notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
+        except OrderSubmissionUncertain:
+            raise
         except Exception as exc:
             error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
+            definite = _is_definite_rejection(exc)
+            if definite:
+                _update_live_order_intent(intent_id, "REJECTED")
             results.append(
                 {
                     "ticker": ticker,
@@ -1760,8 +1831,12 @@ def _submit_orders(
             )
             if notifier is not None:
                 notifier.notify_order_error(side, display_name, qty, exc)
-            # A transport exception does not prove broker rejection; stop all further submissions.
-            raise RuntimeError(f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first") from exc
+            if not definite:
+                # 전송 예외는 거절의 증거가 아님 → 이후 모든 제출 중단 (원장 유지)
+                raise OrderSubmissionUncertain(
+                    f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first",
+                    results,
+                ) from exc
 
     return results
 
@@ -1903,18 +1978,45 @@ def _wait_for_cancellations(
     logger.info(f"[취소확인] {len(cancel_rows)}건 취소 완료 대기 중 (최대 {timeout_sec}초)...")
     pending = {str(r["order_id"]): r for r in cancel_rows}
 
-    while pending and _now_kst() < deadline:
+    # 최소 1회는 조회한다 (timeout 0이어도 판정 없이 통과하지 않도록).
+    first = True
+    while pending and (first or _now_kst() < deadline):
+        first = False
         for order_id in list(pending.keys()):
             try:
                 status = api.get_order_status(order_id, today=today_krx)
             except Exception as exc:
                 logger.info(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
                 continue
-            remaining = int(status.get("remaining_qty", 1))
-            if status.get("is_found", True) and remaining == 0:
-                row = pending.pop(order_id)
+            if not status.get("is_found", False):
+                continue  # 조회 실패/미발견은 취소 증거가 아니다
+            raw_remaining = status.get("remaining_qty")
+            if raw_remaining is None:
+                continue
+            remaining = int(raw_remaining)
+            if remaining != 0:
+                continue
+            row = pending[order_id]
+            order_qty = int(status.get("order_qty", 0))
+            filled = int(status.get("filled_qty", 0))
+            if order_qty <= 0:
+                continue
+            # remaining==0 은 '전량체결'과 '취소'를 모두 의미할 수 있다 → 체결수량으로 구분.
+            pending.pop(order_id)
+            row["filled_qty"] = max(filled, 0)
+            row["requested_qty"] = order_qty
+            row["remaining_qty"] = 0
+            if filled >= order_qty:
+                row["is_filled"] = True
+                row["cancel_confirmed"] = False
+                logger.info(f"[취소확인] {order_id} → 취소 전 전량 체결 (filled={filled})")
+            else:
                 row["cancel_confirmed"] = True
-                logger.info(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
+                row["cancelled_qty"] = order_qty - filled
+                logger.info(
+                    f"[취소확인] {order_id} → 취소 확정 (filled={filled}/{order_qty}, "
+                    f"취소수량={order_qty - filled})"
+                )
         if pending:
             time.sleep(max(poll_interval_sec, 1))
 
@@ -1941,9 +2043,15 @@ def _refresh_order_statuses(
         except Exception as exc:
             logger.info(f"[상태재조회] {order_id} 조회 실패: {exc}")
             continue
+        if not status.get("is_found", False) or status.get("remaining_qty") is None:
+            row["status_error"] = "order not found in status refresh"
+            logger.error(f"[상태재조회] {order_id} 미발견 → 기존 값 유지(재주문 판단에 사용 안 함)")
+            continue
         filled_qty = int(status.get("filled_qty", 0))
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
         remaining_qty = int(status.get("remaining_qty", 0))
+        if filled_qty < int(row.get("filled_qty", 0)):
+            filled_qty = int(row.get("filled_qty", 0))  # 체결수량은 감소하지 않는다
         row["filled_qty"] = max(filled_qty, 0)
         row["remaining_qty"] = max(remaining_qty, 0)
         if order_qty > 0:
@@ -1956,32 +2064,29 @@ def _refresh_order_statuses(
 
 
 def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """취소 확정(cancel_confirmed)된 주문의 미체결 수량만 재주문한다.
+
+    remaining_qty는 취소 후 0으로 보고되므로 재주문 수량은 requested - filled 로 계산한다.
+    """
     retry_orders: list[dict[str, Any]] = []
     for row in results:
-        req_qty = int(row.get("requested_qty", row.get("qty", 0)))
-        filled_qty = int(row.get("filled_qty", 0))
-        remaining_qty = row.get("remaining_qty")
-        if remaining_qty is None:
-            remaining_qty = max(req_qty - filled_qty, 0)
-        else:
-            remaining_qty = max(int(remaining_qty), 0)
         ticker = str(row.get("ticker", "")).strip()
-        if not ticker:
+        if not ticker or not row.get("submitted") or not row.get("order_id"):
             continue
-        if remaining_qty == 0 and (req_qty - filled_qty) > 0:
-            logger.info(
-                f"[재시도-스킵] {ticker}: API 잔량=0, 자체계산={req_qty - filled_qty} — 재시도 생략"
-            )
-        if remaining_qty <= 0:
+        if row.get("is_filled") or row.get("status_error") and row.get("cancel_confirmed") is not True:
             continue
-        if not row.get("submitted") or not row.get("order_id") or row.get("cancel_confirmed") is not True:
+        req_qty = int(row.get("requested_qty", row.get("qty", 0)))
+        unfilled = max(req_qty - int(row.get("filled_qty", 0)), 0)
+        if unfilled <= 0:
+            continue
+        if row.get("cancel_confirmed") is not True:
             logger.error(f"[재시도-차단] {ticker}: 취소 완료를 확인하지 못해 재주문을 생략합니다.")
             continue
         retry_orders.append(
             {
                 "ticker": ticker,
                 "display_name": row.get("display_name", ticker),
-                "qty": remaining_qty,
+                "qty": unfilled,
                 "retry_from_order_id": row.get("order_id", ""),
             }
         )
@@ -2867,7 +2972,8 @@ def main() -> None:
         logger.warning("[경고] --force-live: 컷오프 안전차단 우회")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LIVE_RUN_LOCK.open("a+") as lock:
+    _lock_fd = os.open(LIVE_RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(_lock_fd, "a+") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2881,7 +2987,7 @@ def main() -> None:
             if TelegramNotifier is not None:
                 try:
                     notifier = TelegramNotifier()
-                    notifier.send(f"⚠️ <b>실행 실패</b>\\n{exc}")
+                    notifier.send(f"⚠️ <b>실행 실패</b>\n{exc}")
                 except Exception:
                     pass
             sys.exit(1)
