@@ -15,6 +15,7 @@ ETF 하루 1회 실행 러너
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import logging
 import os
@@ -140,6 +141,8 @@ from pykrx_utils import (
 
 STATE_DIR = PROJECT_ROOT / "runtime_state"
 STATE_PATH = STATE_DIR / "etf_daily_state.json"
+LIVE_ORDER_JOURNAL = STATE_DIR / "live_order_intents.json"
+LIVE_RUN_LOCK = STATE_DIR / ".etf_live_run.lock"
 OUTPUT_DIR = PROJECT_ROOT / "outputs_etf_only"
 
 logger = logging.getLogger(__name__)
@@ -1638,6 +1641,40 @@ def _build_plan(
     }
 
 
+
+def _write_live_order_intent(side: str, ticker: str, qty: int, attempt: int) -> None:
+    """Persist an uncertain order intent BEFORE broker submission.
+
+    Once written, a future LIVE run fails closed until an operator reconciles
+    the broker order history and archives the journal explicitly.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    entries = []
+    if LIVE_ORDER_JOURNAL.exists():
+        entries = json.loads(LIVE_ORDER_JOURNAL.read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            raise RuntimeError("Invalid live order journal: manual reconciliation needed")
+    entries.append({
+        "trading_date": _date_to_iso(_today_kst()),
+        "side": side, "ticker": ticker, "qty": qty, "attempt": attempt,
+        "status": "BROKER_SUBMISSION_UNCERTAIN",
+    })
+    tmp = LIVE_ORDER_JOURNAL.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, LIVE_ORDER_JOURNAL)
+
+
+def _assert_live_order_journal_clear() -> None:
+    if LIVE_ORDER_JOURNAL.exists():
+        raise RuntimeError(
+            f"Live order journal requires broker reconciliation: {LIVE_ORDER_JOURNAL}. "
+            "Check orders/fills before manually archiving the journal."
+        )
+
+
 def _submit_orders(
     api: Any,
     side: str,
@@ -1676,6 +1713,7 @@ def _submit_orders(
             )
             continue
 
+        _write_live_order_intent(side, ticker, qty, attempt)
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
             order_id = response.get("order_id", "")
@@ -1722,6 +1760,8 @@ def _submit_orders(
             )
             if notifier is not None:
                 notifier.notify_order_error(side, display_name, qty, exc)
+            # A transport exception does not prove broker rejection; stop all further submissions.
+            raise RuntimeError(f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first") from exc
 
     return results
 
@@ -2096,6 +2136,8 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
 def run_daily() -> None:
     cfg = _read_env_config()
     setup_logging(cfg.log_level, cfg.log_file)
+    if cfg.enable_live_order:
+        _assert_live_order_journal_clear()
     state = _load_state()
     today = _date_to_iso(_today_kst())
 
@@ -2748,6 +2790,8 @@ def run_daily() -> None:
         **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
+    if cfg.enable_live_order and run_status == "DONE" and LIVE_ORDER_JOURNAL.exists():
+        LIVE_ORDER_JOURNAL.unlink()
     try:
         _record_oos_equity_history(today, plan, run_status, run_id)
     except Exception as exc:
@@ -2798,35 +2842,34 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="ETF 하루 1회 실행 러너")
     parser.add_argument(
-        "--force-live",
-        action="store_true",
-        help=(
-            "컷오프 이후에도 실주문 실행을 강제로 허용합니다. "
-            "매우 위험하니 프로덕션에서 신중히 사용하세요."
-        ),
+        "--force-live", action="store_true",
+        help="컷오프 이후 실주문 허용 (운영에서 신중히 사용)",
     )
     args = parser.parse_args()
-
     if args.force_live:
-        # 프로세스 환경변수로 안전차단 플래그를 덮어써서 컷오프 검사 우회
         os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
         os.environ["ALLOW_LATE_LIVE_ORDERS"] = "1"
-        logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
+        logger.warning("[경고] --force-live: 컷오프 안전차단 우회")
 
-    try:
-        run_daily()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        # 미처리 예외로 프로세스가 죽을 때 텔레그램으로 알린다 (동기 발송 — 종료 전 전달 보장).
-        logger.exception("실행 중 예외 발생: %s", exc)
-        if TelegramNotifier is not None:
-            try:
-                notifier = TelegramNotifier()
-                notifier.send(f"⚠️ <b>실행 실패</b>\n{exc}")
-            except Exception:
-                pass
-        sys.exit(1)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LIVE_RUN_LOCK.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("ETF runner already active: concurrent execution blocked")
+        try:
+            run_daily()
+        except SystemExit:
+            raise
+        except Exception as exc:
+            logger.exception("실행 중 예외 발생: %s", exc)
+            if TelegramNotifier is not None:
+                try:
+                    notifier = TelegramNotifier()
+                    notifier.send(f"⚠️ <b>실행 실패</b>\\n{exc}")
+                except Exception:
+                    pass
+            sys.exit(1)
 
 
 if __name__ == "__main__":
