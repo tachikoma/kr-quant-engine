@@ -457,6 +457,10 @@ class ScrubTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"KIS_ACCOUNT_NO": "12345678 -01"}):
             out = bp._scrub("cano=12345678 failed")
         self.assertNotIn("12345678", out)
+        # 조각 뒤에 공백이 오지 않는 형태(콤마/따옴표/줄 끝)도 가려야 한다
+        with mock.patch.dict(os.environ, {"KIS_ACCOUNT_NO": "12345678 -01"}):
+            for echoed in ("cano=12345678,", 'cano="12345678"', "cano:12345678"):
+                self.assertNotIn("12345678", bp._scrub(echoed), echoed)
 
     def test_url_encoded_and_json_escaped_forms_are_masked(self):
         from live_trading import broker_preflight as bp
