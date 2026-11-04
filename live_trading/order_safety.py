@@ -118,7 +118,10 @@ class OrderIntentJournal:
             used.add(i)
             requested = int(row.get("requested_qty", row.get("qty", 0)))
             filled = int(row.get("filled_qty", 0))
-            fully_filled = (\n                requested > 0 and filled >= requested\n                and bool(row.get("is_filled")) and bool(row.get("status_verified"))\n            )
+            fully_filled = (
+                requested > 0 and filled >= requested
+                and bool(row.get("is_filled")) and bool(row.get("status_verified"))
+            )
             cancelled = (
                 bool(row.get("cancel_confirmed"))
                 and bool(row.get("status_verified"))
