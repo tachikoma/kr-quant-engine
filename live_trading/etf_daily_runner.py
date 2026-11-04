@@ -1687,58 +1687,52 @@ def _submit_orders(
             deadline = dt.datetime.combine(_today_kst(), _parse_hhmm(cutoff_time_hhmm), tzinfo=_now_kst().tzinfo)
             if _now_kst() >= deadline:
                 raise OrderSafetyBlocked(f"{side} {ticker}: 컷오프 {cutoff_time_hhmm} 이후 새 주문 차단")
-        intent_index = journal.before_submit(side=side, ticker=ticker, qty=qty, attempt=attempt) if journal else None
+        intent_index = (
+            journal.before_submit(side=side, ticker=ticker, qty=qty, attempt=attempt)
+            if journal else None
+        )
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
             order_id = response.get("order_id", "")
             if journal is not None:
                 journal.mark_accepted(intent_index, order_id)
-            results.append(
-                {
-                    "ticker": ticker,
-                    "display_name": display_name,
-                    "side": side,
-                    "attempt": attempt,
-                    "order_type": order_type,
-                    "qty": qty,
-                    "requested_qty": qty,
-                    "filled_qty": 0,
-                    "remaining_qty": qty,
-                    "is_filled": False,
-                    "submitted": True,
-                    "mode": "LIVE",
-                    "order_id": order_id,
-                    "response": response.get("response", {}),
-                }
-            )
-            if notifier is not None:
-                notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
         except Exception as exc:
             if journal is not None:
                 journal.mark_unknown(intent_index)
-                raise OrderSafetyBlocked(f"{side} {ticker} 주문 결과 불확실: 브로커 대조 전 재실행 금지") from exc
+                raise OrderSafetyBlocked(
+                    f"{side} {ticker} 주문 결과 불확실: 브로커 대조 전 재실행 금지"
+                ) from exc
             error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
             results.append(
                 {
-                    "ticker": ticker,
-                    "display_name": display_name,
-                    "side": side,
-                    "attempt": attempt,
-                    "order_type": order_type,
-                    "qty": qty,
-                    "requested_qty": qty,
-                    "filled_qty": 0,
-                    "remaining_qty": qty,
-                    "is_filled": False,
-                    "submitted": False,
-                    "mode": "LIVE",
-                    "order_id": "",
-                    "error": str(exc),
-                    "error_code": error_code,
+                    "ticker": ticker, "display_name": display_name, "side": side,
+                    "attempt": attempt, "order_type": order_type, "qty": qty,
+                    "requested_qty": qty, "filled_qty": 0, "remaining_qty": qty,
+                    "is_filled": False, "submitted": False, "mode": "LIVE",
+                    "order_id": "", "error": str(exc), "error_code": error_code,
                 }
             )
             if notifier is not None:
-                notifier.notify_order_error(side, display_name, qty, exc)
+                try:
+                    notifier.notify_order_error(side, display_name, qty, exc)
+                except Exception as notify_exc:
+                    logger.warning("[알림오류] 주문 오류 알림 실패: %s", notify_exc)
+            continue
+
+        results.append(
+            {
+                "ticker": ticker, "display_name": display_name, "side": side,
+                "attempt": attempt, "order_type": order_type, "qty": qty,
+                "requested_qty": qty, "filled_qty": 0, "remaining_qty": qty,
+                "is_filled": False, "submitted": True, "mode": "LIVE",
+                "order_id": order_id, "response": response.get("response", {}),
+            }
+        )
+        if notifier is not None:
+            try:
+                notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
+            except Exception as notify_exc:
+                logger.warning("[알림오류] 접수 알림 실패: %s", notify_exc)
 
     return results
 
