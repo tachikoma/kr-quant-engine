@@ -4,8 +4,9 @@
 이 절차는 **모의계좌(`MODE=demo`)에서만** 수행한다. 실계좌 키·계좌번호가 `.env`에 섞이지 않도록 한다.
 
 > **KB는 모의투자를 지원하지 않는다.** KB는 이 문서의 모의 검증 대상이 아니다. `MODE=demo`로 설정해도
-> 실서버/실계좌에 붙으며, 주문 검증은 [KB 검증](#kb-모의투자-미지원-별도-절차)의 별도 절차(사전 승인 필요)만 가능하다.
-> 아래 표·절차에서 KIS/키움/NH만 모의 대상이다.
+> 실서버/실계좌에 붙는다. 게다가 KB 어댑터의 주문 필드 매핑이 확정되지 않아(아래 KB 절차 참고) 프리플라이트는
+> **KB 주문 검증 자체를 거부**한다 — [KB 절차](#kb-모의투자-미지원-주문-매핑-미확정)를 본다.
+> 아래 표·절차에서 KIS/키움/NH만 검증 대상이다.
 
 > 단위 테스트(mock)는 증권사 실제 응답 계약을 증명하지 못한다. 아래 2·4단계의 실측 값이
 > 코드 가정과 다르면 **배포하지 말고** 어댑터 판정을 수정한다.
@@ -17,14 +18,15 @@
 | KIWOOM | `KIWOOM_APPKEY`, `KIWOOM_SECRETKEY` | `KIWOOM_ACCOUNT_NO` (**불필요**, 비워 둠) | `MODE=demo` → `mockapi.kiwoom.com` | 키 이름에 밑줄 없음 (`APP_KEY` 아님) |
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` | `KIS_ACCOUNT_PROD_CD` (기본 `01`) | `MODE=demo` → vps | 계좌 `12345678-01` 형식 가능 |
 | NH | `NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET`, `NHPLUG_ACCT_NO` | — | `MODE=demo` → `moapi.nhplug.com` | 토큰은 실전 도메인에서 발급. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
-| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **모의투자 미지원** (모드 분기 없음) | 항상 실서버/실계좌. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
+| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **모의투자 미지원** (모드 분기 없음) | 항상 실서버/실계좌. 주문 필드 매핑 미확정(TODO) → 프리플라이트 주문 검증 거부. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
 
 `broker_preflight.py`의 Stage 0은 **필수/선택 인증 변수**(표의 `KIS_ACCOUNT_PROD_CD`, `KIWOOM_ACCOUNT_NO` 등)만
 검사한다(값은 마스킹). `KBSEC_IP_ADDR`/`KBSEC_MAC_ADDR`와 `KBSEC_BASE_URL`은 검사하지 않는다.
 필수 목록은 `tests/test_broker_preflight.py`가 정확한 값과 어댑터 소스 양쪽으로 대조한다.
 출력/리포트의 메모에서는 위 변수 값의 여러 형태(원본, 앞뒤 공백 제거본, 하이픈 제거본, 6자 이상 하이픈 조각,
 URL 인코딩, JSON 이스케이프)를 모든 자격증명에 걸쳐 길이 내림차순으로 **길이 제한 전에** `***`로 치환한다
-(`_scrub`). 4자 미만 값(예: `KIS_ACCOUNT_PROD_CD=01`)과 파생 형태가 4자 미만이거나 `-`/공백뿐인 경우는
+(`_scrub`). URL 인코딩은 대·소문자 hex, JSON 이스케이프는 `\uXXXX`(비ASCII, 대·소문자 hex)와 `\/` 변형을
+포함한다. 4자 미만 값(예: `KIS_ACCOUNT_PROD_CD=01`)과 파생 형태가 4자 미만이거나 `-`/공백뿐인 경우는
 비밀이 아니거나 진단 메모를 망가뜨리므로 치환하지 않는다(긴 값에서 나온 짧은 조각도 포함).
 그 밖의 인코딩(예: base64)이나 증권사가 값을 가공해 되돌려 주는 경우는 막지 못한다. 이 변수에 없는 값(토큰 등)이나 증권사 오류 본문은 그대로 남을 수 있으므로
 로그를 첨부할 때 눈으로 한 번 확인한다.
@@ -58,6 +60,9 @@ NH는 먼저 `LIVE_ORDER_ENABLED=1`을 설정한다(NH 어댑터가 전역 변�
 uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode demo --with-order
 ```
 - 1주 시장가 매수 → 체결 대기 → 매도, 이어서 -25% 지정가 매수 → 취소.
+  지정가는 현재가×0.75를 **호가단위(ETF 5원, `ETF_TICK_KRW` — KRX 규정으로 확인 필요)로 내림**한다.
+  현재가를 얻지 못하거나 계산 가격이 호가단위 미만이면 임의 가격으로 주문하지 않고
+  `limit_price` FAIL + `stage2_unresolved`로 중단한다.
   시장가 매수가 체결되지 않아 취소되면 왕복을 검증하지 못한 것이므로 `roundtrip` FAIL
   (incomplete)로 기록한다. 장중 유동성이 있는 시간대에 재시도한다.
 - `mode=real`이면 `--allow-real`을 주지 않는 한 거부한다.
@@ -65,8 +70,10 @@ uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode d
   (키움 `mockapi.kiwoom.com`, KIS `openapivts.koreainvestment.com`, NH `moapi.nhplug.com`).
   https가 아니거나, userinfo(`user@host`)가 있거나, 호스트가 다르면(접두/접미 도메인, 경로·쿼리에 표식만
   있는 경우 포함) 주문 전에 거부한다. `mode=real`도 `--allow-real` 없이는 거부한다.
-  KB는 모의 호스트가 없으므로 `--mode demo`의 주문 검증은 `--allow-real`이 있어도 항상 거부한다
-  (실계좌 주문을 모의로 오인하지 않도록). KB 실계좌 1주 테스트는 `--mode real --allow-real`만 가능하다.
+  KB는 모의 호스트가 없고 주문 필드 매핑도 미확정이라(`kb_adapter.place_order`의 "주문 구분/가격 필드명
+  확정" TODO) **mode/`--allow-real`과 무관하게 주문 검증을 거부**한다(`ORDER_MAPPING_UNVERIFIED`).
+  가드는 `run_preflight`뿐 아니라 `_stage2_orders` 자체에도 있어, 이 함수를 직접 호출해도
+  `broker`/`mode`(필수 인자)와 같은 검사를 다시 수행하고 실패하면 `stage2-authorization` FAIL을 남긴다.
 - **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. "체결"은 발견됨 & 체결수량≥주문수량
   & **잔량 0**일 때만 인정한다(수량 불일치는 미해결). 취소 요청이 실패해도 최종 상태를 조회하며,
   `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하거나 Stage 2 안에서 예상치 못한
@@ -128,20 +135,26 @@ uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode d
 
 ## 알려진 한계
 - 프리플라이트 Stage 2와 위 시나리오는 실제 증권사 모의 서버로 실행해 본 적이 없다(작성 시점 기준 mock 검증만 완료).
-- KB는 모의투자가 없어 이 게이트로 주문 동작을 검증할 수 없다. 아래 별도 절차를 따르거나 KB를 운영에 쓰지 않는다.
+- KB는 모의투자가 없고 주문 필드 매핑이 미확정이라 이 게이트로 주문 동작을 검증할 수 없다. 아래 KB 절차의 선행 조건을 충족하기 전에는 KB를 운영에 쓰지 않는다.
 - DEBUG 로그에는 키움·KB·NH 토큰 응답이 남을 수 있다. 검증·운영 모두 `LOG_LEVEL=INFO`.
 
-## KB (모의투자 미지원, 별도 절차)
-KB증권은 모의투자를 제공하지 않으므로 위 2~5단계의 "모의 서버 검증"을 수행할 수 없다.
-`docs/broker_onboarding.md`의 정책(모의 미제공 시 실계좌 1주 테스트로 폴백, **사전 승인 필요**)을 따른다.
+## KB (모의투자 미지원, 주문 매핑 미확정)
+KB증권은 모의투자를 제공하지 않으므로 위 2~5단계의 "모의 서버 검증"을 수행할 수 없다. 또한
+`kb_adapter.place_order`는 시장가/지정가 구분 필드를 보내지 않고(시장가는 가격 생략), 코드에
+"apidoc_b2c에서 주문 구분/가격 필드명 확정" TODO가 남아 있어 **의도한 주문 유형이 KB에 전달되는지
+검증되지 않았다.** 따라서 프리플라이트는 KB 주문 검증(`--with-order`)을 거부한다.
 
-1. **읽기 전용 점검:** `uv run python live_trading/broker_preflight.py --broker KB --mode real`
-   — 주문 없이 조회만 하지만 **실계좌에 대한 호출**이다. Stage 0에 `mock_support SKIP`이 표시된다.
-2. **실계좌 1주 주문 테스트(승인 후):** `LIVE_ORDER_ENABLED=1`로 `--broker KB --mode real --allow-real --with-order`.
-   유동성이 높은 ETF 1주(시장가 매수·매도)와 -25% 지정가 매수·취소만 수행하며, 실패(`stage2_unresolved`,
-   `roundtrip` FAIL) 시 즉시 증권사 앱에서 미체결·보유를 정리한다. 금액은 1주 가격 이내로 한정된다.
-3. **러너 시나리오(4장)는 KB에서 수행하지 않는다.** 실주문이 나가므로, 승인 없이 KB로 러너를 실행하지 않는다.
-   러너의 취소·재주문 경로(`remaining_qty` 의미 등)는 KB 응답으로 검증된 적이 없으므로
-   KB를 운영에 연결하기 전에 2번의 `cancel_semantics` 결과를 반드시 확인한다.
-4. KB의 모의 호스트가 없다는 점은 코드로 증명할 수 없다(`KBSEC_BASE_URL` 기본값은 `developer.kbsec.com`).
-   증권사 문서/담당자로 재확인한다.
+- **지금 가능한 것:** 읽기 전용 점검 `uv run python live_trading/broker_preflight.py --broker KB --mode real`.
+  주문은 없지만 **실계좌에 대한 호출**이다. Stage 0에 `mock_support SKIP`이 표시된다.
+- **KB를 운영에 연결하기 전 선행 조건:**
+  1. 증권사 API 문서로 주문 필드 매핑(주문 구분, 가격 필드)을 확정하고 `kb_adapter.place_order`를 수정한다.
+  2. 그 변경을 리뷰한 뒤 `broker_preflight.ORDER_MAPPING_UNVERIFIED`에서 `KB`를 제거한다(코드 변경이므로 PR 승인 필요).
+  3. `docs/broker_onboarding.md` 정책에 따라 사전 승인을 받은 뒤 실계좌에서
+     `--broker KB --mode real --allow-real --with-order`(`LIVE_ORDER_ENABLED=1`)로 1주 테스트를 수행한다.
+- **실계좌 1주 테스트의 실제 노출(승인 시):** 수량은 주문당 1주지만 **금액 상한은 없다.** 시장가 매수·매도는
+  체결가 변동과 수수료·세금이 붙고, -25% 지정가 매수가 체결되면(급락 등) 1주가 추가로 남아 수동 매도가
+  필요하다. `stage2_unresolved`/`roundtrip` FAIL 시 즉시 증권사 앱에서 미체결·보유를 정리한다.
+- **러너 시나리오(4장)는 KB에서 수행하지 않는다.** 러너의 취소·재주문 경로(`remaining_qty` 의미 등)는 KB 응답으로
+  검증된 적이 없다. 매핑이 확정되기 전에는 KB로 러너(`BROKER_TYPE=KB`)를 실행하지 않는다.
+- KB의 모의 호스트가 없다는 점은 코드로 증명할 수 없다(`KBSEC_BASE_URL` 기본값은 `developer.kbsec.com`).
+  증권사 문서/담당자로 재확인한다.
