@@ -3,6 +3,10 @@
 대상: PR #2 (`fix/live-order-fail-closed-20261104-review2`) — 취소 확정/원장/잠금/컷오프/주문 재전송 금지 변경.
 이 절차는 **모의계좌(`MODE=demo`)에서만** 수행한다. 실계좌 키·계좌번호가 `.env`에 섞이지 않도록 한다.
 
+> **KB는 모의투자를 지원하지 않는다.** KB는 이 문서의 모의 검증 대상이 아니다. `MODE=demo`로 설정해도
+> 실서버/실계좌에 붙으며, 주문 검증은 [KB 검증](#kb-모의투자-미지원-별도-절차)의 별도 절차(사전 승인 필요)만 가능하다.
+> 아래 표·절차에서 KIS/키움/NH만 모의 대상이다.
+
 > 단위 테스트(mock)는 증권사 실제 응답 계약을 증명하지 못한다. 아래 2·4단계의 실측 값이
 > 코드 가정과 다르면 **배포하지 말고** 어댑터 판정을 수정한다.
 
@@ -13,7 +17,7 @@
 | KIWOOM | `KIWOOM_APPKEY`, `KIWOOM_SECRETKEY` | `KIWOOM_ACCOUNT_NO` (**불필요**, 비워 둠) | `MODE=demo` → `mockapi.kiwoom.com` | 키 이름에 밑줄 없음 (`APP_KEY` 아님) |
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` | `KIS_ACCOUNT_PROD_CD` (기본 `01`) | `MODE=demo` → vps | 계좌 `12345678-01` 형식 가능 |
 | NH | `NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET`, `NHPLUG_ACCT_NO` | — | `MODE=demo` → `moapi.nhplug.com` | 토큰은 실전 도메인에서 발급. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
-| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **코드상 모드 분기 없음** | 모의/실전은 `KBSEC_BASE_URL`로 구분해야 함(미검증). 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
+| KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **모의투자 미지원** (모드 분기 없음) | 항상 실서버/실계좌. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
 
 `broker_preflight.py`의 Stage 0은 **필수/선택 인증 변수**(표의 `KIS_ACCOUNT_PROD_CD`, `KIWOOM_ACCOUNT_NO` 등)만
 검사한다(값은 마스킹). `KBSEC_IP_ADDR`/`KBSEC_MAC_ADDR`와 `KBSEC_BASE_URL`은 검사하지 않는다.
@@ -29,7 +33,7 @@ URL 인코딩, JSON 이스케이프)를 모든 자격증명에 걸쳐 길이 내
 이전에는 NH가 `BROKER_MODE/ENV_MODE`만, KIS 클라이언트가 `ENV_MODE`만 읽어
 `MODE=demo`만 설정하면 **인증은 모의, 주문 계층은 실전으로 동작**할 수 있었다.
 이제 키움·KIS·NH가 `config_utils.get_mode()` (`MODE` > `BROKER_MODE` > `ENV_MODE`)를 따른다.
-**예외:** KB는 모드 개념이 없고, NH는 `NHPLUG_BASE_URL`이 설정되면 모드보다 우선한다
+**예외:** KB는 모의투자가 없어 모드 개념이 없고(항상 실계좌), NH는 `NHPLUG_BASE_URL`이 설정되면 모드보다 우선한다
 (그래서 아래 "주문 목적지 가드"가 필요하다).
 프리플라이트는 `--mode` 값을 `MODE/BROKER_MODE/ENV_MODE` 모두에 덮어써서 `.env`의 `MODE=real`로
 붙는 사고를 막는다.
@@ -37,21 +41,21 @@ URL 인코딩, JSON 이스케이프)를 모든 자격증명에 걸쳐 길이 내
 ## 1. 준비
 1. 검증 커밋을 체크아웃하고 `python3 -B -m unittest tests.test_live_order_safety_guards tests.test_broker_preflight`
    가 전부 통과하는지 확인한다.
-2. `.env`: `MODE=demo`, `BROKER_TYPE=<브로커>`, 모의 키, `LOG_LEVEL=INFO`.
+2. `.env`: `MODE=demo`, `BROKER_TYPE=<KIS|KIWOOM|NH>`, 모의 키, `LOG_LEVEL=INFO`. (KB는 아래 별도 절차)
 3. 평일 장중(09:00~15:30)에 진행한다.
 4. `runtime_state/live_order_intents.json`이 없는지 확인한다.
 
 ## 2. 읽기 전용 점검
 ```
-uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH|KB> --mode demo
+uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode demo
 ```
 Stage 0(키 존재)·Stage 1(잔고/보유/시세/호가/주문가능) 전부 PASS여야 한다.
 로그: `runtime_state/preflight_<broker>_<날짜>.json`.
 
 ## 3. 주문·취소 왕복
-NH/KB는 먼저 `LIVE_ORDER_ENABLED=1`을 설정한다(모의 환경에 한함).
+NH는 먼저 `LIVE_ORDER_ENABLED=1`을 설정한다(NH 어댑터가 전역 변수를 요구하며, 모의 환경에 한함).
 ```
-uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with-order
+uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode demo --with-order
 ```
 - 1주 시장가 매수 → 체결 대기 → 매도, 이어서 -25% 지정가 매수 → 취소.
   시장가 매수가 체결되지 않아 취소되면 왕복을 검증하지 못한 것이므로 `roundtrip` FAIL
@@ -61,7 +65,8 @@ uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with
   (키움 `mockapi.kiwoom.com`, KIS `openapivts.koreainvestment.com`, NH `moapi.nhplug.com`).
   https가 아니거나, userinfo(`user@host`)가 있거나, 호스트가 다르면(접두/접미 도메인, 경로·쿼리에 표식만
   있는 경우 포함) 주문 전에 거부한다. `mode=real`도 `--allow-real` 없이는 거부한다.
-  KB는 모의 URL을 코드로 확인할 수 없어 `--allow-real`로 명시 승인해야만 진행한다.
+  KB는 모의 호스트가 없으므로 `--mode demo`의 주문 검증은 `--allow-real`이 있어도 항상 거부한다
+  (실계좌 주문을 모의로 오인하지 않도록). KB 실계좌 1주 테스트는 `--mode real --allow-real`만 가능하다.
 - **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. "체결"은 발견됨 & 체결수량≥주문수량
   & **잔량 0**일 때만 인정한다(수량 불일치는 미해결). 취소 요청이 실패해도 최종 상태를 조회하며,
   `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하거나 Stage 2 안에서 예상치 못한
@@ -81,7 +86,7 @@ uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with
 | 없는 주문번호 조회 | `is_found=False` | 미발견은 취소 증거가 아님 |
 | 취소 반영 지연 | 몇 초 | `_wait_for_cancellations` 기본 대기(5초) 충분 여부 |
 
-## 4. 러너 시나리오 (모의계좌)
+## 4. 러너 시나리오 (모의계좌: KIS/키움/NH)
 러너는 `LIVE_ORDER_ENABLED=1`(또는 `{BROKER}_LIVE_ORDER_ENABLED=1`)이 필요하다. 모의 환경에서만 설정한다.
 
 | # | 시나리오 | 방법 | 기대 결과 |
@@ -123,5 +128,20 @@ uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with
 
 ## 알려진 한계
 - 프리플라이트 Stage 2와 위 시나리오는 실제 증권사 모의 서버로 실행해 본 적이 없다(작성 시점 기준 mock 검증만 완료).
-- KB는 모의 환경 구분 방법이 코드에 없다. 사용 전 별도 확인 필요.
+- KB는 모의투자가 없어 이 게이트로 주문 동작을 검증할 수 없다. 아래 별도 절차를 따르거나 KB를 운영에 쓰지 않는다.
 - DEBUG 로그에는 키움·KB·NH 토큰 응답이 남을 수 있다. 검증·운영 모두 `LOG_LEVEL=INFO`.
+
+## KB (모의투자 미지원, 별도 절차)
+KB증권은 모의투자를 제공하지 않으므로 위 2~5단계의 "모의 서버 검증"을 수행할 수 없다.
+`docs/broker_onboarding.md`의 정책(모의 미제공 시 실계좌 1주 테스트로 폴백, **사전 승인 필요**)을 따른다.
+
+1. **읽기 전용 점검:** `uv run python live_trading/broker_preflight.py --broker KB --mode real`
+   — 주문 없이 조회만 하지만 **실계좌에 대한 호출**이다. Stage 0에 `mock_support SKIP`이 표시된다.
+2. **실계좌 1주 주문 테스트(승인 후):** `LIVE_ORDER_ENABLED=1`로 `--broker KB --mode real --allow-real --with-order`.
+   유동성이 높은 ETF 1주(시장가 매수·매도)와 -25% 지정가 매수·취소만 수행하며, 실패(`stage2_unresolved`,
+   `roundtrip` FAIL) 시 즉시 증권사 앱에서 미체결·보유를 정리한다. 금액은 1주 가격 이내로 한정된다.
+3. **러너 시나리오(4장)는 KB에서 수행하지 않는다.** 실주문이 나가므로, 승인 없이 KB로 러너를 실행하지 않는다.
+   러너의 취소·재주문 경로(`remaining_qty` 의미 등)는 KB 응답으로 검증된 적이 없으므로
+   KB를 운영에 연결하기 전에 2번의 `cancel_semantics` 결과를 반드시 확인한다.
+4. KB의 모의 호스트가 없다는 점은 코드로 증명할 수 없다(`KBSEC_BASE_URL` 기본값은 `developer.kbsec.com`).
+   증권사 문서/담당자로 재확인한다.

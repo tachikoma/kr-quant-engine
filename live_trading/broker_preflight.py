@@ -80,6 +80,8 @@ CRED_OPTIONAL: dict[str, list[str]] = {
 }
 # 어댑터의 주문 전송이 전역 LIVE_ORDER_ENABLED=1 을 요구하는 브로커
 LIVE_FLAG_REQUIRED = {"NH", "KB"}
+# 모의투자를 지원하지 않는 브로커 (주문 검증은 실계좌 1주 테스트뿐 — 사전 승인 필요)
+NO_MOCK_BROKERS = {"KB"}
 
 DEFAULT_TICKERS = ["069500", "229200"]  # KODEX 200, KODEX 200 TR 등 유동성 높은 ETF
 TEST_TICKER = "069500"
@@ -231,8 +233,9 @@ def order_destination_ok(api: Any, broker: str, mode: str, allow_real: bool) -> 
         return (allow_real, f"mode={mode}: 실계좌 주문 — --allow-real 명시 필요 (endpoint host={_host_of(url)})")
     expected = DEMO_ENDPOINT_HOST.get(broker.upper())
     if expected is None:
-        return (allow_real, f"{broker.upper()}: 모의 엔드포인트를 코드로 검증할 수 없음 (host={_host_of(url)}); "
-                            "증권사 문서로 모의 여부 확인 후 --allow-real 로 명시 승인 필요")
+        # 모의투자를 지원하지 않는 브로커(KB): --mode demo 는 의미가 없고 주문은 항상 실계좌다.
+        return (False, f"{broker.upper()}: 모의투자 미지원 — --mode demo 로는 주문 검증을 할 수 없음 "
+                       f"(host={_host_of(url)}). 실계좌 1주 테스트는 사전 승인 후 --mode real --allow-real")
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
@@ -437,6 +440,9 @@ def run_preflight(
            f"09:00~15:30 KST, now={now:%H:%M}")
     # credential presence (키 존재 여부만, 값은 마스킹)
     # 어댑터가 실제로 읽는 변수명 기준 (live_trading/*_adapter.py). 값은 마스킹.
+    if broker.upper() in NO_MOCK_BROKERS:
+        record("0", "mock_support", "SKIP",
+               f"{broker.upper()}는 모의투자 미지원 — 읽기 전용 호출도 실서버/실계좌에 대해 수행됨, 주문 검증은 --mode real --allow-real 만 가능")
     for k in CRED_REQUIRED.get(broker.upper(), []):
         v = os.environ.get(k)
         record("0", f"env:{k}", "PASS" if v else "FAIL", _mask(v) if v else "missing")

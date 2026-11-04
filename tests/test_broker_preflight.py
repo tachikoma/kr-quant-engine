@@ -286,13 +286,21 @@ class DestinationGuardTests(unittest.TestCase):
         self.assertEqual(self._guard(rep), ["PASS"])
         stage2.assert_called_once()
 
-    def test_kb_demo_requires_explicit_approval(self):
+    def test_kb_has_no_mock_so_demo_orders_are_always_refused(self):
         api = FakeBroker(base_url="https://developer.kbsec.com:32484")
-        rep, stage2 = self._preflight("KB", "demo", api)
-        self.assertEqual(self._guard(rep), ["FAIL"])
+        for allow in (False, True):  # --allow-real 이 있어도 demo 로는 KB 주문 검증 불가
+            rep, stage2 = self._preflight("KB", "demo", api, allow_real=allow)
+            self.assertEqual(self._guard(rep), ["FAIL"], allow)
+            stage2.assert_not_called()
+        self.assertTrue(any(r["label"] == "mock_support" and r["status"] == "SKIP" for r in rep["results"]))
+
+    def test_kb_real_order_test_needs_real_mode_and_allow_real(self):
+        api = FakeBroker(base_url="https://developer.kbsec.com:32484")
+        rep, stage2 = self._preflight("KB", "real", api, allow_real=False)
         stage2.assert_not_called()
-        rep, stage2 = self._preflight("KB", "demo", api, allow_real=True)
+        rep, stage2 = self._preflight("KB", "real", api, allow_real=True)
         self.assertEqual(self._guard(rep), ["PASS"])
+        stage2.assert_called_once()
 
     def test_kiwoom_real_url_with_demo_mode_refused(self):
         rep, stage2 = self._preflight("KIWOOM", "demo", FakeBroker(base_url="https://api.kiwoom.com"))
