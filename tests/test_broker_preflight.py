@@ -24,6 +24,16 @@ class PreflightCredentialTests(unittest.TestCase):
             for name in CRED_REQUIRED[broker] + CRED_OPTIONAL[broker]:
                 self.assertIn(name, read, f"{broker}: preflight checks {name} but adapter never reads it")
 
+    def test_every_credential_like_env_read_by_adapters_is_classified(self):
+        """어댑터에 새 인증 변수가 추가되면 프리플라이트 목록 갱신 없이는 실패한다 (역방향 대조)."""
+        from live_trading.broker_preflight import CRED_OPTIONAL, CRED_REQUIRED
+
+        pat = re.compile(r'environ\.get\(\s*"([A-Z0-9_]*(?:APP_?KEY|SECRET|ACCT_NO|ACCOUNT_NO|ACCOUNT_PROD)[A-Z0-9_]*)"')
+        for broker, src in ADAPTER_SRC.items():
+            found = set(pat.findall(src.read_text(encoding="utf-8")))
+            known = set(CRED_REQUIRED[broker]) | set(CRED_OPTIONAL[broker])
+            self.assertEqual(found - known, set(), f"{broker}: adapter reads unclassified credential env vars")
+
     def test_required_credentials_exact(self):
         from live_trading.broker_preflight import CRED_REQUIRED
 
@@ -222,6 +232,8 @@ class Stage2Tests(unittest.TestCase):
         rows = self._run(b)
         self.assertNotIn("SELL", [p[0] for p in b.places])
         self.assertFalse(self._failed(rows, "stage2_unresolved"))
+        # 시장가 체결/매도 경로를 검증하지 못했으므로 전체 결과는 성공이 될 수 없다
+        self.assertTrue(self._failed(rows, "roundtrip"))
 
     def test_sell_timeout_is_failure_and_stops(self):
         F = FakeBroker
@@ -296,6 +308,73 @@ class DestinationGuardTests(unittest.TestCase):
         self.assertFalse(bp.order_destination_ok(real, "KIS", "demo", False)[0])
 
 
+class AdversarialDestinationTests(unittest.TestCase):
+    def _ok(self, broker, url, mode="demo", allow_real=False):
+        from live_trading import broker_preflight as bp
+
+        return bp.order_destination_ok(FakeBroker(base_url=url), broker, mode, allow_real)[0]
+
+    def test_exact_demo_hosts_pass(self):
+        self.assertTrue(self._ok("NH", "https://moapi.nhplug.com:8443"))
+        self.assertTrue(self._ok("KIWOOM", "https://mockapi.kiwoom.com"))
+
+    def test_url_tricks_are_rejected(self):
+        for url in (
+            "https://moapi.nhplug.com@api.nhplug.com:8443",        # userinfo trick: 실제 호스트는 실전
+            "https://api.nhplug.com:8443/?h=moapi.nhplug.com",     # 쿼리에 표식
+            "https://api.nhplug.com:8443/moapi.nhplug.com",        # 경로에 표식
+            "https://moapi.nhplug.com.evil.example",               # 접미사 도메인
+            "https://evilmoapi.nhplug.com",                        # 접두 도메인
+            "http://moapi.nhplug.com:8443",                        # 평문 스킴
+            "https://api.nhplug.com:8443",
+            "",
+        ):
+            self.assertFalse(self._ok("NH", url), url)
+
+    def test_real_mode_requires_allow_real_inside_guard(self):
+        self.assertFalse(self._ok("KIWOOM", "https://api.kiwoom.com", mode="real"))
+        self.assertTrue(self._ok("KIWOOM", "https://api.kiwoom.com", mode="real", allow_real=True))
+
+    def test_stage2_unexpected_exception_is_recorded_as_failure(self):
+        from live_trading import broker_preflight as bp
+
+        api = FakeBroker(base_url="https://moapi.nhplug.com:8443")
+        with mock.patch.dict(os.environ, {"LIVE_ORDER_ENABLED": "1"}), \
+                mock.patch.object(bp, "_build_adapter", return_value=api), \
+                mock.patch.object(bp, "_is_market_hours", return_value=True), \
+                mock.patch.object(bp, "_stage2_orders", side_effect=RuntimeError("boom")):
+            rep = bp.run_preflight("NH", "demo", True, ["069500"])
+        self.assertTrue(any(r["label"] == "stage2_unresolved" and r["status"] == "FAIL" for r in rep["results"]))
+
+
+class FillConsistencyTests(unittest.TestCase):
+    def test_filled_but_remaining_nonzero_is_not_terminal(self):
+        from live_trading.broker_preflight import fully_filled as f
+
+        self.assertFalse(f({"is_found": True, "order_qty": 1, "filled_qty": 1, "remaining_qty": 1}))
+        self.assertFalse(f({"is_found": True, "order_qty": 1, "filled_qty": 1}))
+        self.assertTrue(f({"is_found": True, "order_qty": 1, "filled_qty": 1, "remaining_qty": 0}))
+        self.assertFalse(f({"is_found": False, "order_qty": 1, "filled_qty": 1, "remaining_qty": 0}))
+        self.assertFalse(f({"is_found": True, "order_qty": 0, "filled_qty": 0, "remaining_qty": 0}))
+
+    def test_inconsistent_status_stops_stage2_without_next_order(self):
+        from live_trading import broker_preflight as bp
+
+        incons = {"is_found": True, "order_qty": 1, "filled_qty": 1, "remaining_qty": 1, "is_filled": True}
+        b = FakeBroker(buy_status=incons)
+        rows = []
+        with mock.patch.object(bp.time, "sleep", lambda x: None):
+            bp._stage2_orders(b, lambda st, lb, s_, n="": rows.append((lb, s_, n)))
+        self.assertEqual([p[0] for p in b.places], ["BUY"])
+        self.assertTrue(any(l == "stage2_unresolved" and s_ == "FAIL" for l, s_, _ in rows))
+
+    def test_status_regression_keeps_max_fill(self):
+        from live_trading.broker_preflight import cancel_confirmed
+
+        regressed = {"is_found": True, "order_qty": 1, "filled_qty": 0, "remaining_qty": 0}
+        self.assertFalse(cancel_confirmed(regressed, prior_filled=1))
+
+
 class ScrubTests(unittest.TestCase):
     def test_credential_values_are_masked_in_notes(self):
         from live_trading import broker_preflight as bp
@@ -304,6 +383,28 @@ class ScrubTests(unittest.TestCase):
             out = bp._scrub("auth failed secret=TopSecretValue123 acct 12345678-01")
         self.assertNotIn("TopSecretValue123", out)
         self.assertNotIn("12345678", out)
+
+    def test_secret_straddling_truncation_boundary_is_not_leaked(self):
+        """실제 경로: 어댑터 초기화 예외 메시지의 비밀값이 기록 길이 한도(400자) 경계에 걸쳐도 노출되지 않는다."""
+        from live_trading import broker_preflight as bp
+
+        secret = "S3cretValueThatIsLongEnough0123456789"
+        for pad in (370, 380, 395, 399):  # 경계 전후로 위치를 바꿔 본다
+            with mock.patch.dict(os.environ, {"KIWOOM_SECRETKEY": secret}), \
+                    mock.patch.object(bp, "_build_adapter",
+                                      side_effect=RuntimeError("x" * pad + secret)):
+                rep = bp.run_preflight("KIWOOM", "demo", False, ["069500"])
+            notes = " ".join(r["note"] for r in rep["results"])
+            self.assertNotIn(secret[:6], notes, f"pad={pad}")
+            self.assertTrue(any(r["label"] == "adapter_init" and r["status"] == "FAIL" for r in rep["results"]))
+
+    def test_nh_normalized_account_is_masked(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"NHPLUG_ACCT_NO": "500-01-002017"}):
+            out = bp._scrub("act_no=50001002017 failed; raw 500-01-002017")
+        self.assertNotIn("50001002017", out)
+        self.assertNotIn("002017", out)
 
 
 if __name__ == "__main__":

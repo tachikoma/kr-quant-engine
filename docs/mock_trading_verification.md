@@ -18,8 +18,9 @@
 `broker_preflight.py`의 Stage 0은 **필수/선택 인증 변수**(표의 `KIS_ACCOUNT_PROD_CD`, `KIWOOM_ACCOUNT_NO` 등)만
 검사한다(값은 마스킹). `KBSEC_IP_ADDR`/`KBSEC_MAC_ADDR`와 `KBSEC_BASE_URL`은 검사하지 않는다.
 필수 목록은 `tests/test_broker_preflight.py`가 정확한 값과 어댑터 소스 양쪽으로 대조한다.
-출력/리포트의 메모에는 위 변수의 값이 포함되면 `***`로 치환한다(`_scrub`). 그 외 증권사 오류 본문은
-그대로 남을 수 있으므로 로그를 첨부할 때 눈으로 한 번 확인한다.
+출력/리포트의 메모에서는 위 변수의 값(원본, 하이픈 제거본, 6자 이상 하이픈 조각)을 **길이 제한 전에**
+`***`로 치환한다(`_scrub`). 이 변수에 없는 값(토큰 등)이나 증권사 오류 본문은 그대로 남을 수 있으므로
+로그를 첨부할 때 눈으로 한 번 확인한다.
 
 ### 모드 해석 (수정됨)
 이전에는 NH가 `BROKER_MODE/ENV_MODE`만, KIS 클라이언트가 `ENV_MODE`만 읽어
@@ -50,14 +51,18 @@ NH/KB는 먼저 `LIVE_ORDER_ENABLED=1`을 설정한다(모의 환경에 한함).
 uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with-order
 ```
 - 1주 시장가 매수 → 체결 대기 → 매도, 이어서 -25% 지정가 매수 → 취소.
+  시장가 매수가 체결되지 않아 취소되면 왕복을 검증하지 못한 것이므로 `roundtrip` FAIL
+  (incomplete)로 기록한다. 장중 유동성이 있는 시간대에 재시도한다.
 - `mode=real`이면 `--allow-real`을 주지 않는 한 거부한다.
-- **주문 목적지 가드:** `--mode`가 아니라 어댑터가 실제로 쓰는 URL을 검사한다
-  (키움 `mockapi.kiwoom.com`, KIS `openapivts`, NH `moapi.nhplug.com`). 모의 URL이 아니면
-  주문 전에 거부한다(예: `NHPLUG_BASE_URL`이 실전). KB는 모의 URL을 코드로 확인할 수 없어
-  `--allow-real`로 명시 승인해야만 진행한다.
-- **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. 취소 요청이 실패해도 최종 상태를
-  조회하며, `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하면
-  `stage2_unresolved` FAIL을 기록하고 이후 주문을 내지 않는다 — 이때는 증권사 앱에서
+- **주문 목적지 가드:** `--mode`가 아니라 어댑터가 실제로 쓰는 URL을 **파싱해 호스트명을 정확히 비교**한다
+  (키움 `mockapi.kiwoom.com`, KIS `openapivts.koreainvestment.com`, NH `moapi.nhplug.com`).
+  https가 아니거나, userinfo(`user@host`)가 있거나, 호스트가 다르면(접두/접미 도메인, 경로·쿼리에 표식만
+  있는 경우 포함) 주문 전에 거부한다. `mode=real`도 `--allow-real` 없이는 거부한다.
+  KB는 모의 URL을 코드로 확인할 수 없어 `--allow-real`로 명시 승인해야만 진행한다.
+- **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. "체결"은 발견됨 & 체결수량≥주문수량
+  & **잔량 0**일 때만 인정한다(수량 불일치는 미해결). 취소 요청이 실패해도 최종 상태를 조회하며,
+  `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하거나 Stage 2 안에서 예상치 못한
+  예외가 나면 `stage2_unresolved` FAIL을 기록하고 이후 주문을 내지 않는다 — 이때는 증권사 앱에서
   미체결 주문과 보유 1주를 수동으로 확인·정리한다.
 - 출력되는 주문 상태 필드(`is_found/order_qty/filled_qty/remaining_qty/is_filled`)를 기록한다.
 - `cancel_semantics` 항목이 러너의 취소 확정 조건(발견됨 & `remaining==0` & 관측한 최대 체결수량
