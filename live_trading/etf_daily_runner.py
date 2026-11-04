@@ -22,7 +22,6 @@ import sys
 import time
 import uuid
 
-from live_trading.order_safety import OrderIntentJournal, OrderSafetyBlocked, exclusive_runner_lock
 from dataclasses import dataclass
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -31,6 +30,8 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from live_trading.order_safety import OrderIntentJournal, OrderSafetyBlocked, exclusive_runner_lock
 
 
 def _load_dotenv(dotenv_path: Path | None = None) -> None:
@@ -1651,6 +1652,7 @@ def _submit_orders(
     attempt: int = 1,
     notifier: Any = None,
     journal: OrderIntentJournal | None = None,
+    cutoff_time_hhmm: str | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
@@ -1681,6 +1683,10 @@ def _submit_orders(
             )
             continue
 
+        if journal is not None and cutoff_time_hhmm is not None:
+            deadline = dt.datetime.combine(_today_kst(), _parse_hhmm(cutoff_time_hhmm), tzinfo=_now_kst().tzinfo)
+            if _now_kst() >= deadline:
+                raise OrderSafetyBlocked(f"{side} {ticker}: 컷오프 {cutoff_time_hhmm} 이후 새 주문 차단")
         intent_index = journal.before_submit(side=side, ticker=ticker, qty=qty, attempt=attempt) if journal else None
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
@@ -2110,6 +2116,9 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
 def run_daily() -> None:
     cfg = _read_env_config()
     setup_logging(cfg.log_level, cfg.log_file)
+    if cfg.enable_live_order and not cfg.block_live_after_cutoff and os.environ.get("_EXPLICIT_FORCE_LIVE") != "1":
+        logger.warning("[주문보호] 환경변수 컷오프 OFF 무시, 명시적 --force-live 없으면 차단 활성화")
+        cfg.block_live_after_cutoff = True
     journal = OrderIntentJournal(ORDER_INTENT_PATH) if cfg.enable_live_order else None
     if journal is not None:
         journal.assert_clear()
@@ -2326,7 +2335,8 @@ def run_daily() -> None:
     if plan["sell_orders"]:
         logger.info("\n[주문] ─── 매도 단계 ───")
         sell_results = _submit_orders(
-            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal
+            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal,
+            cutoff_time_hhmm=cfg.sell_cutoff_time if cfg.block_live_after_cutoff else None
         )
         if sell_results:
             for r in sell_results:
@@ -2391,6 +2401,8 @@ def run_daily() -> None:
                         attempt=2,
                         notifier=notifier,
                         journal=journal,
+                        cutoff_time_hhmm=cfg.buy_cutoff_time if cfg.block_live_after_cutoff else None,
+                        cutoff_time_hhmm=cfg.sell_cutoff_time if cfg.block_live_after_cutoff else None,
                     )
                     sell_retry_results = _poll_and_finalize_orders(
                         api=api,
@@ -2652,11 +2664,13 @@ def run_daily() -> None:
                     except Exception:
                         pass
                 buy_results.extend(
-                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal)
+                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal,
+                                   cutoff_time_hhmm=cfg.buy_cutoff_time if cfg.block_live_after_cutoff else None)
                 )
         else:
             buy_results = _submit_orders(
-                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal
+                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal,
+                cutoff_time_hhmm=cfg.buy_cutoff_time if cfg.block_live_after_cutoff else None
             )
         if buy_results:
             for r in buy_results:
@@ -2830,6 +2844,7 @@ def main() -> None:
     if args.force_live:
         # 프로세스 환경변수로 안전차단 플래그를 덮어써서 컷오프 검사 우회
         os.environ["BLOCK_LIVE_AFTER_CUTOFF"] = "0"
+        os.environ["_EXPLICIT_FORCE_LIVE"] = "1"
         logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
 
     try:
