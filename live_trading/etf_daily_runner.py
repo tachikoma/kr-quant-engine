@@ -21,6 +21,8 @@ import os
 import sys
 import time
 import uuid
+
+from live_trading.order_safety import OrderIntentJournal, OrderSafetyBlocked, exclusive_runner_lock
 from dataclasses import dataclass
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -140,6 +142,8 @@ from pykrx_utils import (
 
 STATE_DIR = PROJECT_ROOT / "runtime_state"
 STATE_PATH = STATE_DIR / "etf_daily_state.json"
+ORDER_INTENT_PATH = STATE_DIR / "live_order_intent.json"
+RUN_LOCK_PATH = STATE_DIR / ".etf_daily_runner.lock"
 OUTPUT_DIR = PROJECT_ROOT / "outputs_etf_only"
 
 logger = logging.getLogger(__name__)
@@ -1646,6 +1650,7 @@ def _submit_orders(
     order_type: str = "MARKET",
     attempt: int = 1,
     notifier: Any = None,
+    journal: OrderIntentJournal | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
@@ -1676,9 +1681,12 @@ def _submit_orders(
             )
             continue
 
+        intent_index = journal.before_submit(side=side, ticker=ticker, qty=qty, attempt=attempt) if journal else None
         try:
             response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
             order_id = response.get("order_id", "")
+            if journal is not None:
+                journal.mark_accepted(intent_index, order_id)
             results.append(
                 {
                     "ticker": ticker,
@@ -1700,6 +1708,9 @@ def _submit_orders(
             if notifier is not None:
                 notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
         except Exception as exc:
+            if journal is not None:
+                journal.mark_unknown(intent_index)
+                raise OrderSafetyBlocked(f"{side} {ticker} 주문 결과 불확실: 브로커 대조 전 재실행 금지") from exc
             error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
             results.append(
                 {
@@ -1764,6 +1775,10 @@ def _poll_and_finalize_orders(
                 row["status_error"] = str(exc)
                 continue
 
+            if not status.get("is_found", False):
+                row["status_verified"] = False
+                continue
+            row["status_verified"] = True
             filled_qty = int(status.get("filled_qty", 0))
             order_qty = int(status.get("order_qty", req_qty))
             if order_qty > 0:
@@ -1826,7 +1841,7 @@ def _poll_and_finalize_orders(
                     row.get("side", ""), row.get("display_name", ticker), filled, total
                 )
 
-        row["is_filled"] = bool(row.get("remaining_qty", 0) == 0)
+        row["is_filled"] = bool(row.get("is_filled")) and bool(row.get("status_verified"))
         row["timed_out"] = True
 
     return results
@@ -1870,11 +1885,16 @@ def _wait_for_cancellations(
             except Exception as exc:
                 logger.info(f"[취소확인] {order_id} 상태 조회 실패: {exc}")
                 continue
-            remaining = int(status.get("remaining_qty", 1))
-            if remaining == 0 or not status.get("is_found", True):
+            if not status.get("is_found", False):
+                continue
+            remaining = int(status.get("remaining_qty", -1))
+            if remaining == 0:
                 row = pending.pop(order_id)
                 row["cancel_confirmed"] = True
-                logger.info(f"[취소확인] {order_id} → 취소/체결 완료 (remaining={remaining})")
+                row["status_verified"] = True
+                row["filled_qty"] = max(int(status.get("filled_qty", 0)), 0)
+                row["remaining_qty"] = 0
+                logger.info(f"[취소확인] {order_id} → 원주문 비활성 확인")
         if pending:
             time.sleep(max(poll_interval_sec, 1))
 
@@ -1901,6 +1921,10 @@ def _refresh_order_statuses(
         except Exception as exc:
             logger.info(f"[상태재조회] {order_id} 조회 실패: {exc}")
             continue
+        if not status.get("is_found", False):
+            row["status_verified"] = False
+            continue
+        row["status_verified"] = True
         filled_qty = int(status.get("filled_qty", 0))
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
         remaining_qty = int(status.get("remaining_qty", 0))
@@ -1916,32 +1940,25 @@ def _refresh_order_statuses(
 
 
 def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    retry_orders: list[dict[str, Any]] = []
+    """Retry only unfilled quantity after broker-verified original termination."""
+    retry_orders = []
     for row in results:
         req_qty = int(row.get("requested_qty", row.get("qty", 0)))
-        filled_qty = int(row.get("filled_qty", 0))
-        remaining_qty = row.get("remaining_qty")
-        if remaining_qty is None:
-            remaining_qty = max(req_qty - filled_qty, 0)
-        else:
-            remaining_qty = max(int(remaining_qty), 0)
+        unfilled = max(req_qty - int(row.get("filled_qty", 0)), 0)
         ticker = str(row.get("ticker", "")).strip()
-        if not ticker:
+        if not ticker or unfilled <= 0:
             continue
-        if remaining_qty == 0 and (req_qty - filled_qty) > 0:
-            logger.info(
-                f"[재시도-스킵] {ticker}: API 잔량=0, 자체계산={req_qty - filled_qty} — 재시도 생략"
-            )
-        if remaining_qty <= 0:
+        if not (
+            row.get("submitted") and row.get("order_id")
+            and row.get("cancel_confirmed") and row.get("status_verified")
+            and int(row.get("remaining_qty", -1)) == 0
+        ):
+            logger.warning("[재주문-차단] %s: 원주문 종료 미확정", ticker)
             continue
-        retry_orders.append(
-            {
-                "ticker": ticker,
-                "display_name": row.get("display_name", ticker),
-                "qty": remaining_qty,
-                "retry_from_order_id": row.get("order_id", ""),
-            }
-        )
+        retry_orders.append({
+            "ticker": ticker, "display_name": row.get("display_name", ticker),
+            "qty": unfilled, "retry_from_order_id": row["order_id"],
+        })
     return retry_orders
 
 
@@ -2093,6 +2110,9 @@ def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
 def run_daily() -> None:
     cfg = _read_env_config()
     setup_logging(cfg.log_level, cfg.log_file)
+    journal = OrderIntentJournal(ORDER_INTENT_PATH) if cfg.enable_live_order else None
+    if journal is not None:
+        journal.assert_clear()
     state = _load_state()
     today = _date_to_iso(_today_kst())
 
@@ -2287,6 +2307,8 @@ def run_daily() -> None:
         _wait_until(cfg.market_open_time)
 
     dry_run = (not cfg.enable_live_order) or (api is None)
+    if not dry_run and journal is None:
+        raise OrderSafetyBlocked("실주문 journal 초기화 실패")
     if dry_run:
         logger.info(
             "[안전모드] LIVE_ORDER_ENABLED=0 또는 어댑터 미사용 상태입니다. 실제 주문은 전송하지 않습니다."
@@ -2304,7 +2326,7 @@ def run_daily() -> None:
     if plan["sell_orders"]:
         logger.info("\n[주문] ─── 매도 단계 ───")
         sell_results = _submit_orders(
-            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier
+            api, "SELL", plan["sell_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal
         )
         if sell_results:
             for r in sell_results:
@@ -2368,6 +2390,7 @@ def run_daily() -> None:
                         order_type=cfg.retry_order_type,
                         attempt=2,
                         notifier=notifier,
+                        journal=journal,
                     )
                     sell_retry_results = _poll_and_finalize_orders(
                         api=api,
@@ -2629,11 +2652,11 @@ def run_daily() -> None:
                     except Exception:
                         pass
                 buy_results.extend(
-                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier)
+                    _submit_orders(api, "BUY", [_bo], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal)
                 )
         else:
             buy_results = _submit_orders(
-                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier
+                api, "BUY", plan["buy_orders"], dry_run=dry_run, attempt=1, notifier=notifier, journal=journal
             )
         if buy_results:
             for r in buy_results:
@@ -2700,6 +2723,7 @@ def run_daily() -> None:
                         order_type=cfg.retry_order_type,
                         attempt=2,
                         notifier=notifier,
+                        journal=journal,
                     )
                     buy_retry_results = _poll_and_finalize_orders(
                         api=api,
@@ -2742,6 +2766,8 @@ def run_daily() -> None:
         **_risk_state_fields(plan, state),
     }
     _save_state(new_state)
+    if journal is not None and not journal.clear_if_verified(executed_orders):
+        logger.error("[주문보호] 미해결 주문 intent 보존: 다음 실주문 실행 차단")
     try:
         _record_oos_equity_history(today, plan, run_status, run_id)
     except Exception as exc:
@@ -2807,7 +2833,8 @@ def main() -> None:
         logger.warning("[경고] --force-live: 컷오프 안전차단을 우회합니다. 실제 주문이 발생합니다.")
 
     try:
-        run_daily()
+        with exclusive_runner_lock(RUN_LOCK_PATH):
+            run_daily()
     except SystemExit:
         raise
     except Exception as exc:
