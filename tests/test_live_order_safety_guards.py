@@ -298,6 +298,38 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertFalse(row["is_filled"])
         self.assertEqual([r["qty"] for r in ns["_build_retry_orders"]([row])], [6])
 
+    def test_cancel_reversed_by_refresh_blocks_retry(self):
+        """취소 확정 후 재조회에서 잔량 8주가 다시 나타나면 재주문 0건 (원주문이 살아 있을 수 있다)."""
+        ns = self._refresh_ns()
+        row = self._cancelled_row()
+        row.update(requested_qty=10, filled_qty=2)
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 2, "remaining_qty": 8, "is_filled": False}
+        ns["_refresh_order_statuses"](Broker(), [row])
+        self.assertIsNot(row.get("cancel_confirmed"), True)
+        self.assertIn("cancel reversed", row.get("status_error", ""))
+        self.assertEqual(ns["_build_retry_orders"]([row]), [])
+
+    def test_build_retry_itself_refuses_rows_with_remaining(self):
+        """재조회를 거치지 않은 행에 플래그가 남아 있어도 잔량이 있으면 재주문하지 않는다."""
+        ns = isolated_functions("_build_retry_orders")
+        row = {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "filled_qty": 2, "remaining_qty": 8, "cancel_confirmed": True}
+        self.assertEqual(ns["_build_retry_orders"]([row]), [])
+
+    def test_contradictory_quantities_block_retry(self):
+        ns = self._refresh_ns()
+        for filled, remaining in ((12, 0), (4, 20), (6, 6)):  # 체결>주문, 잔량>주문, 합>주문
+            row = self._cancelled_row()
+            class Broker:
+                def get_order_status(self, oid, today, f=filled, r=remaining):
+                    return {"is_found": True, "order_qty": 10, "filled_qty": f, "remaining_qty": r, "is_filled": False}
+            ns["_refresh_order_statuses"](Broker(), [row])
+            self.assertTrue(row.get("status_error"), (filled, remaining))  # 어느 경로로든 차단 사유가 남는다
+            self.assertIsNot(row.get("cancel_confirmed"), True, (filled, remaining))
+            self.assertEqual(ns["_build_retry_orders"]([row]), [], (filled, remaining))
+
     def test_refresh_failure_blocks_retry(self):
         ns = self._refresh_ns()
         for exc_or_status in (TimeoutError("x"), {"is_found": False, "remaining_qty": 0}):

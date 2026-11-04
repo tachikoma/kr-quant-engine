@@ -102,7 +102,9 @@ uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode d
 | 취소 반영 지연 | 몇 초 | `_wait_for_cancellations` 기본 대기(5초) 충분 여부 |
 
 ## 4. 러너 시나리오 (모의계좌: KIS/키움/NH)
-러너는 `LIVE_ORDER_ENABLED=1`(또는 `{BROKER}_LIVE_ORDER_ENABLED=1`)이 필요하다. 모의 환경에서만 설정한다.
+러너는 **전역** `LIVE_ORDER_ENABLED=1`이 필요하다. 모의 환경에서만 설정한다.
+(`{BROKER}_LIVE_ORDER_ENABLED`는 러너가 직접 읽지 않는다. `config_utils.get_live_enabled()`에는 있으나 러너는 쓰지 않으며,
+GitHub 워크플로(`daily_runner*.yml`)가 이 값을 전역 `LIVE_ORDER_ENABLED`로 옮겨 줄 때만 효과가 있다. 수동 실행에서는 전역 값만 설정한다.)
 
 | # | 시나리오 | 방법 | 기대 결과 |
 |---|---|---|---|

@@ -2110,6 +2110,29 @@ def _refresh_order_statuses(
         if order_qty > 0:
             row["requested_qty"] = order_qty
         row.pop("status_error", None)  # 재조회 성공 → 이전 일시 오류 해소
+        # 취소 확정 이후 재조회에서 잔량이 다시 보이면(상태 반영 지연/불일치) 원주문이 살아 있을 수 있다
+        # → 취소 확정을 무효화하고 재주문을 막는다. 수량이 모순돼도 마찬가지.
+        eff_order_qty = order_qty if order_qty > 0 else int(row.get("requested_qty", 0))
+        contradictory = eff_order_qty > 0 and (
+            row["filled_qty"] > eff_order_qty
+            or row["remaining_qty"] > eff_order_qty
+            or row["filled_qty"] + row["remaining_qty"] > eff_order_qty
+        )
+        if row.get("cancel_confirmed") is True and row["remaining_qty"] > 0:
+            row["cancel_confirmed"] = False
+            row["status_error"] = (
+                f"cancel reversed: remaining={row['remaining_qty']} after cancel confirmation"
+            )
+            logger.error(
+                f"[상태재조회] {order_id} 취소 확정 후 잔량 {row['remaining_qty']} 재출현 → 재주문 차단"
+            )
+        elif contradictory:
+            row["cancel_confirmed"] = False
+            row["status_error"] = (
+                f"inconsistent quantities: order={eff_order_qty} filled={row['filled_qty']} "
+                f"remaining={row['remaining_qty']}"
+            )
+            logger.error(f"[상태재조회] {order_id} 수량 모순 → 재주문 차단: {row['status_error']}")
         # 일부 증권사(KIS)는 부분체결 후 취소도 is_filled=True 로 보고한다 → 체결수량으로 재검증.
         row["is_filled"] = (
             bool(status.get("is_filled", False))
@@ -2140,6 +2163,10 @@ def _build_retry_orders(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         req_qty = int(row.get("requested_qty", row.get("qty", 0)))
         unfilled = max(req_qty - int(row.get("filled_qty", 0)), 0)
         if unfilled <= 0:
+            continue
+        if int(row.get("remaining_qty", 0) or 0) > 0:
+            # 취소 확정 플래그가 있어도 잔량이 있으면 원주문이 살아 있을 수 있다 (이중 방어)
+            logger.error(f"[재시도-차단] {ticker}: 잔량 {row.get('remaining_qty')} 남아 있어 재주문 생략")
             continue
         if row.get("cancel_confirmed") is not True:
             logger.error(f"[재시도-차단] {ticker}: 취소 완료를 확인하지 못해 재주문을 생략합니다.")
