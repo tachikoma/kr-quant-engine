@@ -78,7 +78,15 @@ class NhAdapter:
         if _raw_base:
             self.base_url = _raw_base.rstrip("/")
         else:
-            _mode = (os.environ.get("BROKER_MODE") or os.environ.get("ENV_MODE") or "real").lower()
+            try:
+                from config_utils import get_mode
+
+                _mode = get_mode(default="real").lower()
+            except Exception:
+                _mode = (
+                    os.environ.get("MODE") or os.environ.get("BROKER_MODE")
+                    or os.environ.get("ENV_MODE") or "real"
+                ).lower()
             _is_demo = _mode in {"demo", "mock", "paper", "test"}
             self.base_url = (
                 "https://moapi.nhplug.com:8443" if _is_demo else "https://api.nhplug.com:8443"
