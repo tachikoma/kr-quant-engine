@@ -138,8 +138,10 @@ class FakeBroker:
     """주문/상태/취소를 시나리오대로 흉내내는 가짜 어댑터 (네트워크 없음)."""
 
     def __init__(self, base_url="https://mockapi.kiwoom.com", *, empty_id_first=False,
-                 buy_status=None, sell_status=None, limit_status=None, cancel_raises=False):
+                 buy_status=None, sell_status=None, limit_status=None, cancel_raises=False,
+                 price=10000):
         self.base_url = base_url
+        self.price = price
         self.places, self.cancels = [], []
         self.empty_id_first = empty_id_first
         self.cancel_raises = cancel_raises
@@ -154,7 +156,7 @@ class FakeBroker:
         return {}
 
     def get_prices(self, tickers):
-        return {t: 10000 for t in tickers}
+        return {t: self.price for t in tickers} if self.price is not None else {}
 
     def place_order(self, side, ticker, qty, price=None, order_type="MARKET"):
         kind = "LIMIT" if order_type == "LIMIT" else side
@@ -189,7 +191,7 @@ class Stage2Tests(unittest.TestCase):
         rows = []
         record = lambda stage, label, status, note="": rows.append((label, status, note))
         with mock.patch.object(bp.time, "sleep", lambda x: None):
-            bp._stage2_orders(broker, record)
+            bp._stage2_orders(broker, record, broker="KIWOOM", mode="demo")
         return rows
 
     def _failed(self, rows, label_part):
@@ -286,21 +288,21 @@ class DestinationGuardTests(unittest.TestCase):
         self.assertEqual(self._guard(rep), ["PASS"])
         stage2.assert_called_once()
 
-    def test_kb_has_no_mock_so_demo_orders_are_always_refused(self):
+    def test_kb_orders_refused_in_every_mode_while_mapping_unverified(self):
         api = FakeBroker(base_url="https://developer.kbsec.com:32484")
-        for allow in (False, True):  # --allow-real 이 있어도 demo 로는 KB 주문 검증 불가
-            rep, stage2 = self._preflight("KB", "demo", api, allow_real=allow)
-            self.assertEqual(self._guard(rep), ["FAIL"], allow)
-            stage2.assert_not_called()
-        self.assertTrue(any(r["label"] == "mock_support" and r["status"] == "SKIP" for r in rep["results"]))
-
-    def test_kb_real_order_test_needs_real_mode_and_allow_real(self):
-        api = FakeBroker(base_url="https://developer.kbsec.com:32484")
-        rep, stage2 = self._preflight("KB", "real", api, allow_real=False)
-        stage2.assert_not_called()
-        rep, stage2 = self._preflight("KB", "real", api, allow_real=True)
-        self.assertEqual(self._guard(rep), ["PASS"])
-        stage2.assert_called_once()
+        for mode in ("demo", "real"):
+            for allow in (False, True):
+                rep, stage2 = self._preflight("KB", mode, api, allow_real=allow)
+                stage2.assert_not_called()
+                self.assertGreater(rep["summary"]["fail"], 0, (mode, allow))
+                labels = {(r["label"], r["status"]) for r in rep["results"]}
+                if mode == "real" and not allow:
+                    self.assertIn(("real-mode guard", "FAIL"), labels)
+                else:
+                    self.assertIn(("order-destination guard", "FAIL"), labels, (mode, allow))
+                self.assertIn(("mock_support", "SKIP"), labels)
+        fail_note = [r["note"] for r in rep["results"] if r["label"] == "order-destination guard"][0]
+        self.assertIn("TODO", fail_note)
 
     def test_kiwoom_real_url_with_demo_mode_refused(self):
         rep, stage2 = self._preflight("KIWOOM", "demo", FakeBroker(base_url="https://api.kiwoom.com"))
@@ -382,6 +384,76 @@ class AdversarialDestinationTests(unittest.TestCase):
         self.assertFalse(bp.order_destination_ok(NoUrl(), "NH", "demo", False)[0])
 
 
+
+class DirectStage2Tests(unittest.TestCase):
+    """_stage2_orders 를 run_preflight 없이 직접 호출해도 승인 검사를 우회할 수 없다."""
+
+    def _direct(self, api, **kw):
+        from live_trading import broker_preflight as bp
+
+        rows = []
+        with mock.patch.object(bp.time, "sleep", lambda x: None):
+            bp._stage2_orders(api, lambda st, lb, s_, n="": rows.append((lb, s_, n)), **kw)
+        return rows
+
+    def test_missing_authorization_arguments_is_an_error(self):
+        from live_trading import broker_preflight as bp
+
+        with self.assertRaises(TypeError):
+            bp._stage2_orders(FakeBroker(), lambda *a, **k: None)
+
+    def test_kb_direct_call_places_nothing(self):
+        for mode, allow in (("demo", False), ("demo", True), ("real", True)):
+            api = FakeBroker(base_url="https://developer.kbsec.com:32484")
+            rows = self._direct(api, broker="KB", mode=mode, allow_real=allow)
+            self.assertEqual(api.places, [], (mode, allow))
+            self.assertIn(("stage2-authorization", "FAIL"), [(l, s_) for l, s_, _ in rows])
+
+    def test_real_endpoint_with_demo_mode_places_nothing(self):
+        api = FakeBroker(base_url="https://api.kiwoom.com")
+        self._direct(api, broker="KIWOOM", mode="demo")
+        self.assertEqual(api.places, [])
+
+    def test_real_mode_without_allow_real_places_nothing(self):
+        api = FakeBroker(base_url="https://api.kiwoom.com")
+        rows = self._direct(api, broker="KIWOOM", mode="real")
+        self.assertEqual(api.places, [])
+        self.assertIn(("stage2-authorization", "FAIL"), [(l, s_) for l, s_, _ in rows])
+
+
+class LimitPriceTests(unittest.TestCase):
+    def _run(self, **kw):
+        from live_trading import broker_preflight as bp
+
+        F = FakeBroker
+        b = F(buy_status=F.FILLED, sell_status=F.FILLED,
+              limit_status=_after_cancel(F.OPEN, F.CANCELLED), **kw)
+        rows = []
+        with mock.patch.object(bp.time, "sleep", lambda x: None):
+            bp._stage2_orders(b, lambda st, lb, s_, n="": rows.append((lb, s_, n)),
+                              broker="KIWOOM", mode="demo")
+        return b, rows
+
+    def test_limit_price_is_rounded_down_to_tick(self):
+        for quote, expected in ((10000, 7500), (10003, 7500), (10010, 7505), (12345, 9255)):
+            b, _ = self._run(price=quote)
+            limit = [p for p in b.places if p[1] == "LIMIT"][0][2]
+            self.assertEqual(limit, expected, quote)
+            self.assertEqual(limit % 5, 0)
+
+    def test_missing_quote_aborts_without_limit_order(self):
+        for quote in (None, 0):
+            b, rows = self._run(price=quote)
+            self.assertNotIn("LIMIT", [p[1] for p in b.places], quote)
+            self.assertTrue(any(l == "limit_price" and s_ == "FAIL" for l, s_, _ in rows))
+            self.assertTrue(any(l == "stage2_unresolved" and s_ == "FAIL" for l, s_, _ in rows))
+
+    def test_price_below_tick_aborts(self):
+        b, rows = self._run(price=4)
+        self.assertNotIn("LIMIT", [p[1] for p in b.places])
+        self.assertTrue(any(l == "limit_price" and s_ == "FAIL" for l, s_, _ in rows))
+
+
 class FillConsistencyTests(unittest.TestCase):
     def test_filled_but_remaining_nonzero_is_not_terminal(self):
         from live_trading.broker_preflight import fully_filled as f
@@ -399,7 +471,8 @@ class FillConsistencyTests(unittest.TestCase):
         b = FakeBroker(buy_status=incons)
         rows = []
         with mock.patch.object(bp.time, "sleep", lambda x: None):
-            bp._stage2_orders(b, lambda st, lb, s_, n="": rows.append((lb, s_, n)))
+            bp._stage2_orders(b, lambda st, lb, s_, n="": rows.append((lb, s_, n)),
+                              broker="KIWOOM", mode="demo")
         self.assertEqual([p[0] for p in b.places], ["BUY"])
         self.assertTrue(any(l == "stage2_unresolved" and s_ == "FAIL" for l, s_, _ in rows))
 
@@ -474,13 +547,33 @@ class ScrubTests(unittest.TestCase):
         from live_trading import broker_preflight as bp
 
         with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": "abcd/efgh"}):
-            for echoed in ("abcd/efgh", "abcd%2Fefgh", "abcd\\/efgh"):
+            for echoed in ("abcd/efgh", "abcd%2Fefgh", "abcd%2fefgh", "abcd\\/efgh"):
                 out = bp._scrub(f"resp: {echoed} bad")
                 self.assertNotIn("abcd", out, echoed)
                 self.assertNotIn("efgh", out, echoed)
+                self.assertEqual(out, "resp: *** bad", echoed)  # 주변 진단 문구는 보존
         with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": 'ab"cd"ef'}):
             out = bp._scrub('{"secret":"ab\\"cd\\"ef"}')
         self.assertNotIn('cd', out)
+
+    def test_non_ascii_secret_in_every_common_encoding(self):
+        import json
+        from urllib.parse import quote
+
+        from live_trading import broker_preflight as bp
+
+        secret = "한글비밀값"
+        echoes = [
+            secret,
+            json.dumps(secret)[1:-1],                              # \ud55c\uae00... (Python 기본)
+            json.dumps(secret)[1:-1].upper().replace("\\U", "\\u"),  # 대문자 hex
+            quote(secret, safe=""),                                # %ED%95%9C...
+            quote(secret, safe="").lower(),                        # %ed%95%9c...
+        ]
+        with mock.patch.dict(os.environ, {"KBSEC_APP_SECRET": secret}):
+            for e in echoes:
+                out = bp._scrub(f"err[{e}]end")
+                self.assertEqual(out, "err[***]end", repr(e))
 
     def test_short_non_secret_values_are_left_alone(self):
         from live_trading import broker_preflight as bp

@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -82,6 +83,11 @@ CRED_OPTIONAL: dict[str, list[str]] = {
 LIVE_FLAG_REQUIRED = {"NH", "KB"}
 # 모의투자를 지원하지 않는 브로커 (주문 검증은 실계좌 1주 테스트뿐 — 사전 승인 필요)
 NO_MOCK_BROKERS = {"KB"}
+# 어댑터의 주문 필드 매핑(시장가/지정가 구분 등)이 증권사 API 문서로 확정되지 않은 브로커.
+# kb_adapter.place_order 에 "주문 구분/가격 필드명 확정" TODO 가 남아 있다. 확정·검증 후 이 집합에서 제거한다.
+ORDER_MAPPING_UNVERIFIED = {"KB"}
+# KRX ETF 호가가격단위(원). 지정가는 이 단위로 내림한다 (규정 확인 필요 — 틀리면 증권사가 주문을 거부한다).
+ETF_TICK_KRW = 5
 
 DEFAULT_TICKERS = ["069500", "229200"]  # KODEX 200, KODEX 200 TR 등 유동성 높은 ETF
 TEST_TICKER = "069500"
@@ -132,10 +138,14 @@ def _credential_forms(raw: str) -> set[str]:
     base |= {p.strip() for p in v.split("-") if len(p.strip()) >= 6}
     forms = set(base)
     for f in base:  # 오류 본문이 값을 URL 인코딩/JSON 이스케이프해 되울리는 경우
-        forms.add(quote(f, safe=""))
-        forms.add(json.dumps(f, ensure_ascii=False)[1:-1])
-        # 일부 직렬화기(PHP/JS 계열)는 '/' 를 '\\/' 로 이스케이프한다
-        forms.add(json.dumps(f, ensure_ascii=False)[1:-1].replace("/", "\\/"))
+        pct = quote(f, safe="")
+        forms.add(pct)
+        forms.add(re.sub(r"%[0-9A-F]{2}", lambda m: m.group().lower(), pct))  # 소문자 퍼센트 인코딩
+        for ascii_only in (False, True):  # True: 비ASCII 를 \\uXXXX 로 (Python 기본 json.dumps)
+            js = json.dumps(f, ensure_ascii=ascii_only)[1:-1]
+            forms.add(js)
+            forms.add(js.replace("/", "\\/"))  # PHP/JS 계열은 '/' 를 '\\/' 로 이스케이프
+            forms.add(re.sub(r"\\u([0-9a-f]{4})", lambda m: "\\u" + m.group(1).upper(), js))  # 대문자 hex
     # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
     return {f for f in forms if len(f) >= 4 and f.strip(" -")}
 
@@ -229,6 +239,9 @@ def order_destination_ok(api: Any, broker: str, mode: str, allow_real: bool) -> 
     from urllib.parse import urlsplit
 
     url = _endpoint_of(api)
+    if broker.upper() in ORDER_MAPPING_UNVERIFIED:
+        return (False, f"{broker.upper()}: 어댑터 주문 필드 매핑(시장가/지정가 구분·가격 필드)이 증권사 API 문서로 "
+                       "확정되지 않음(kb_adapter.place_order TODO) — 주문 검증 거부 (mode/--allow-real 무관)")
     if mode != "demo":
         return (allow_real, f"mode={mode}: 실계좌 주문 — --allow-real 명시 필요 (endpoint host={_host_of(url)})")
     expected = DEMO_ENDPOINT_HOST.get(broker.upper())
@@ -291,9 +304,22 @@ def _fmt_status(st: Any) -> str:
     return " ".join(f"{k}={st.get(k)}" for k in keys)
 
 
-def _stage2_orders(api: Any, record, tickers_hint: str = TEST_TICKER) -> None:
+def _stage2_orders(
+    api: Any, record, tickers_hint: str = TEST_TICKER, *, broker: str, mode: str, allow_real: bool = False
+) -> None:
     """주문 왕복/취소 검증. 모든 주문은 최종 상태(체결 또는 취소 확정)까지 확인하고,
-    확정하지 못하면 FAIL 기록 후 이후 주문을 중단한다 (미해결 주문/포지션을 남기지 않기 위함)."""
+    확정하지 못하면 FAIL 기록 후 이후 주문을 중단한다 (미해결 주문/포지션을 남기지 않기 위함).
+
+    broker/mode 는 필수 키워드 인자다: 이 함수를 직접 호출해도 run_preflight 와 동일한 승인 검사
+    (실전 모드 승인, 주문 목적지, 매핑 미확정 브로커 차단)를 스스로 수행한다.
+    """
+    if mode != "demo" and not allow_real:
+        record("2", "stage2-authorization", "FAIL", "mode=real 주문은 --allow-real 필요 — 주문 거부")
+        return
+    ok, detail = order_destination_ok(api, broker, mode, allow_real)
+    if not ok:
+        record("2", "stage2-authorization", "FAIL", detail)
+        return
     ticker = tickers_hint
     today_krx = _now_kst().strftime("%Y%m%d")
     before = api.get_holdings() if hasattr(api, "get_holdings") else None
@@ -387,7 +413,17 @@ def _stage2_orders(api: Any, record, tickers_hint: str = TEST_TICKER) -> None:
         cur = float(px) if px else None
     except Exception:
         cur = None
-    limit_price = max(1, int((cur or 30000) * 0.75))
+    if not cur or cur <= 0:
+        # 임의 가격으로 지정가를 내지 않는다 (가격제한/호가단위 위반 또는 의도치 않은 체결 위험)
+        record("2", "limit_price", "FAIL", "현재가를 얻지 못해 지정가 취소 테스트를 수행하지 않음")
+        abort("지정가 단계 생략 — 현재가 조회 실패")
+        return
+    # -25% 후 호가단위(ETF 5원)로 내림. 현재가가 호가단위 미만이면 주문하지 않는다.
+    limit_price = int(cur * 0.75) // ETF_TICK_KRW * ETF_TICK_KRW
+    if limit_price < ETF_TICK_KRW:
+        record("2", "limit_price", "FAIL", f"계산된 지정가({limit_price})가 호가단위 미만 — 주문하지 않음")
+        abort("지정가 단계 생략 — 가격 계산 불가")
+        return
     loid = place("place_order(BUY 1주 LIMIT -25%)", "BUY", limit_price, "LIMIT")
     if loid is None:
         abort("지정가 주문 미확정")
@@ -544,7 +580,8 @@ def run_preflight(
         else:
             record("2", "order-destination guard", "PASS", detail)
             try:
-                _stage2_orders(api, record, tickers_hint=TEST_TICKER)
+                _stage2_orders(api, record, tickers_hint=TEST_TICKER,
+                               broker=broker, mode=mode, allow_real=allow_real)
             except Exception as e:  # noqa: BLE001
                 record("2", "stage2_unresolved", "FAIL",
                        f"unexpected {type(e).__name__}: {e} — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
