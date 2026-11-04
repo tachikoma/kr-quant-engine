@@ -72,5 +72,85 @@ class OrderSafetyTests(unittest.TestCase):
             pass
 
 
+class LiveFunctionRegressionTests(unittest.TestCase):
+    """Execute the exact production helper functions without importing pykrx."""
+
+    @staticmethod
+    def function_from_source(name):
+        import ast
+        import datetime as dt
+        import logging
+        from typing import Any
+
+        file_path = Path(__file__).resolve().parents[1] / "live_trading" / "etf_daily_runner.py"
+        parsed = ast.parse(file_path.read_text(encoding="utf-8"))
+        fn = next(node for node in parsed.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        code = compile(ast.Module(body=[fn], type_ignores=[]), str(file_path), "exec")
+        env = {
+            "__name__": "offline_safety_test",
+            "Any": Any,
+            "OrderIntentJournal": OrderIntentJournal,
+            "OrderSafetyBlocked": OrderSafetyBlocked,
+            "logger": logging.getLogger("offline_test"),
+            "dt": dt,
+            "_today_kst": lambda: dt.date(2026, 11, 4),
+            "_now_kst": lambda: dt.datetime(2026, 11, 4, 9, 6, tzinfo=dt.timezone(dt.timedelta(hours=9))),
+            "_parse_hhmm": lambda value: dt.time.fromisoformat(value),
+        }
+        exec(code, env)
+        return env[name]
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "intent.json"
+
+    def test_expired_cutoff_prevents_actual_api_call(self):
+        submit = self.function_from_source("_submit_orders")
+        class FakeBroker:
+            calls = 0
+            def place_order(self, **kwargs):
+                self.calls += 1
+                return {"order_id": "123"}
+        broker = FakeBroker()
+        with self.assertRaises(OrderSafetyBlocked):
+            submit(broker, "BUY", [{"ticker": "069500", "qty": 2}],
+                   dry_run=False, journal=OrderIntentJournal(self.path),
+                   cutoff_time_hhmm="09:05")
+        self.assertEqual(broker.calls, 0)
+        self.assertFalse(self.path.exists())
+
+    def test_unknown_broker_response_leaves_marker(self):
+        submit = self.function_from_source("_submit_orders")
+        class FakeBroker:
+            def place_order(self, **kwargs):
+                raise TimeoutError("broker reply lost")
+        with self.assertRaises(OrderSafetyBlocked):
+            submit(FakeBroker(), "BUY", [{"ticker": "069500", "qty": 2}],
+                   dry_run=False, journal=OrderIntentJournal(self.path))
+        self.assertEqual(json.loads(self.path.read_text())["records"][0]["state"], "UNKNOWN")
+
+    def test_cancel_unconfirmed_never_retries(self):
+        build = self.function_from_source("_build_retry_orders")
+        record = {
+            "ticker": "069500", "order_id": "o-1", "side": "SELL",
+            "submitted": True, "requested_qty": 8, "filled_qty": 2,
+            "remaining_qty": 6, "cancel_submitted": True,
+        }
+        self.assertEqual(build([record]), [])
+        record.update(cancel_confirmed=True, status_verified=True, remaining_qty=0)
+        self.assertEqual(build([record])[0]["qty"], 6)
+
+    def test_missing_order_id_blocks_new_order(self):
+        submit = self.function_from_source("_submit_orders")
+        class FakeBroker:
+            def place_order(self, **kwargs):
+                return {"order_id": ""}
+        with self.assertRaises(OrderSafetyBlocked):
+            submit(FakeBroker(), "SELL", [{"ticker": "069500", "qty": 1}],
+                   dry_run=False, journal=OrderIntentJournal(self.path))
+        self.assertTrue(self.path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
