@@ -330,6 +330,19 @@ class LiveOrderSafetyTests(unittest.TestCase):
             self.assertIsNot(row.get("cancel_confirmed"), True, (filled, remaining))
             self.assertEqual(ns["_build_retry_orders"]([row]), [], (filled, remaining))
 
+    def test_each_contradiction_branch_is_detected_without_cancel_flag(self):
+        """cancel_confirmed 가 없는 행에서 '수량 모순' 분기를 직접 검증 (취소 번복 분기에 가려지지 않게)."""
+        ns = self._refresh_ns()
+        for filled, remaining in ((12, 0), (4, 20), (6, 6)):  # 체결>주문, 잔량>주문, 합>주문
+            row = {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
+                   "filled_qty": 0, "remaining_qty": 0, "cancel_submitted": True}
+            class Broker:
+                def get_order_status(self, oid, today, f=filled, r=remaining):
+                    return {"is_found": True, "order_qty": 10, "filled_qty": f, "remaining_qty": r, "is_filled": False}
+            ns["_refresh_order_statuses"](Broker(), [row])
+            self.assertIn("inconsistent quantities", row.get("status_error", ""), (filled, remaining))
+            self.assertEqual(ns["_build_retry_orders"]([row]), [], (filled, remaining))
+
     def test_refresh_failure_blocks_retry(self):
         ns = self._refresh_ns()
         for exc_or_status in (TimeoutError("x"), {"is_found": False, "remaining_qty": 0}):
