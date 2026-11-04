@@ -24,6 +24,16 @@ class PreflightCredentialTests(unittest.TestCase):
             for name in CRED_REQUIRED[broker] + CRED_OPTIONAL[broker]:
                 self.assertIn(name, read, f"{broker}: preflight checks {name} but adapter never reads it")
 
+    def test_required_credentials_exact(self):
+        from live_trading.broker_preflight import CRED_REQUIRED
+
+        self.assertEqual(CRED_REQUIRED, {
+            "KIS": ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"],
+            "KIWOOM": ["KIWOOM_APPKEY", "KIWOOM_SECRETKEY"],
+            "NH": ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"],
+            "KB": ["KBSEC_APP_KEY", "KBSEC_APP_SECRET"],
+        })
+
     def test_kiwoom_needs_no_account_number(self):
         from live_trading.broker_preflight import CRED_REQUIRED
 
@@ -47,6 +57,8 @@ class CancelSemanticsTests(unittest.TestCase):
         self.assertFalse(c({"is_found": True, "order_qty": 1, "filled_qty": 0, "remaining_qty": 1}))
         self.assertFalse(c({"is_found": False, "order_qty": 0, "filled_qty": 0, "remaining_qty": 0}))
         self.assertFalse(c({"is_found": True, "order_qty": 1, "filled_qty": 0}))
+        # 전량체결을 한 번 관측한 뒤 지연된 0/0 응답이 와도 취소로 판정하지 않는다 (러너와 동일)
+        self.assertFalse(c({"is_found": True, "order_qty": 1, "filled_qty": 0, "remaining_qty": 0}, prior_filled=1))
 
 
 class ModeResolutionTests(unittest.TestCase):
@@ -107,6 +119,191 @@ class ModeResolutionTests(unittest.TestCase):
             rep = bp.run_preflight("KIWOOM", "real", True, ["069500"])
         fake.place_order.assert_not_called()
         self.assertTrue(any(r["label"] == "real-mode guard" and r["status"] == "FAIL" for r in rep["results"]))
+
+
+
+class FakeBroker:
+    """주문/상태/취소를 시나리오대로 흉내내는 가짜 어댑터 (네트워크 없음)."""
+
+    def __init__(self, base_url="https://mockapi.kiwoom.com", *, empty_id_first=False,
+                 buy_status=None, sell_status=None, limit_status=None, cancel_raises=False):
+        self.base_url = base_url
+        self.places, self.cancels = [], []
+        self.empty_id_first = empty_id_first
+        self.cancel_raises = cancel_raises
+        self.policy = {"BUY": buy_status, "SELL": sell_status, "LIMIT": limit_status}
+        self.kind, self.calls = {}, {}
+
+    FILLED = {"is_found": True, "order_qty": 1, "filled_qty": 1, "remaining_qty": 0, "is_filled": True}
+    OPEN = {"is_found": True, "order_qty": 1, "filled_qty": 0, "remaining_qty": 1, "is_filled": False}
+    CANCELLED = {"is_found": True, "order_qty": 1, "filled_qty": 0, "remaining_qty": 0, "is_filled": False}
+
+    def get_holdings(self):
+        return {}
+
+    def get_prices(self, tickers):
+        return {t: 10000 for t in tickers}
+
+    def place_order(self, side, ticker, qty, price=None, order_type="MARKET"):
+        kind = "LIMIT" if order_type == "LIMIT" else side
+        self.places.append((side, order_type, price))
+        if self.empty_id_first and len(self.places) == 1:
+            return {"order_id": ""}
+        oid = f"O{len(self.places)}"
+        self.kind[oid], self.calls[oid] = kind, 0
+        return {"order_id": oid}
+
+    def get_order_status(self, order_id, today=None):
+        self.calls[order_id] += 1
+        pol = self.policy[self.kind[order_id]]
+        return dict(pol(self, order_id) if callable(pol) else pol)
+
+    def cancel_order(self, order_id, ticker, qty):
+        self.cancels.append(order_id)
+        if self.cancel_raises:
+            raise TimeoutError("cancel timeout")
+        self.cancelled = getattr(self, "cancelled", set()) | {order_id}
+        return {}
+
+
+def _after_cancel(open_state, done_state):
+    return lambda b, oid: done_state if oid in getattr(b, "cancelled", set()) else open_state
+
+
+class Stage2Tests(unittest.TestCase):
+    def _run(self, broker):
+        from live_trading import broker_preflight as bp
+
+        rows = []
+        record = lambda stage, label, status, note="": rows.append((label, status, note))
+        with mock.patch.object(bp.time, "sleep", lambda x: None):
+            bp._stage2_orders(broker, record)
+        return rows
+
+    def _failed(self, rows, label_part):
+        return any(label_part in lbl and st == "FAIL" for lbl, st, _ in rows)
+
+    def test_happy_path_roundtrip_and_cancel(self):
+        F = FakeBroker
+        b = F(buy_status=F.FILLED, sell_status=F.FILLED,
+              limit_status=_after_cancel(F.OPEN, F.CANCELLED))
+        rows = self._run(b)
+        self.assertEqual([p[0] for p in b.places], ["BUY", "SELL", "BUY"])
+        self.assertFalse(any(st == "FAIL" for _, st, _ in rows), rows)
+        self.assertTrue(any("cancel_semantics" in l and st == "PASS" for l, st, _ in rows))
+
+    def test_missing_order_id_stops_all_further_orders(self):
+        F = FakeBroker
+        b = F(empty_id_first=True, buy_status=F.FILLED, sell_status=F.FILLED, limit_status=F.OPEN)
+        rows = self._run(b)
+        self.assertEqual(len(b.places), 1)
+        self.assertTrue(self._failed(rows, "BUY 1주 MARKET"))
+        self.assertTrue(self._failed(rows, "stage2_unresolved"))
+
+    def test_buy_unfilled_cancel_fails_unresolved_no_sell(self):
+        F = FakeBroker
+        b = F(buy_status=F.OPEN, cancel_raises=True)
+        rows = self._run(b)
+        self.assertEqual([p[0] for p in b.places], ["BUY"])
+        self.assertTrue(self._failed(rows, "stage2_unresolved"))
+
+    def test_buy_cancel_race_filled_triggers_sell(self):
+        F = FakeBroker
+        b = F(buy_status=_after_cancel(F.OPEN, F.FILLED), sell_status=F.FILLED,
+              limit_status=_after_cancel(F.OPEN, F.CANCELLED))
+        rows = self._run(b)
+        self.assertIn("SELL", [p[0] for p in b.places])
+        self.assertFalse(any(st == "FAIL" for _, st, _ in rows), rows)
+
+    def test_buy_cancelled_skips_sell_and_continues(self):
+        F = FakeBroker
+        b = F(buy_status=_after_cancel(F.OPEN, F.CANCELLED),
+              limit_status=_after_cancel(F.OPEN, F.CANCELLED))
+        rows = self._run(b)
+        self.assertNotIn("SELL", [p[0] for p in b.places])
+        self.assertFalse(self._failed(rows, "stage2_unresolved"))
+
+    def test_sell_timeout_is_failure_and_stops(self):
+        F = FakeBroker
+        b = F(buy_status=F.FILLED, sell_status=F.OPEN)
+        rows = self._run(b)
+        self.assertEqual(len(b.places), 2)  # BUY, SELL — 지정가 단계로 진행하지 않음
+        self.assertTrue(self._failed(rows, "stage2_unresolved"))
+
+    def test_limit_filled_race_is_failure(self):
+        F = FakeBroker
+        b = F(buy_status=F.FILLED, sell_status=F.FILLED,
+              limit_status=_after_cancel(F.OPEN, F.FILLED))
+        rows = self._run(b)
+        self.assertTrue(self._failed(rows, "cancel_semantics"))
+
+    def test_limit_cancel_unconfirmed_is_unresolved(self):
+        F = FakeBroker
+        b = F(buy_status=F.FILLED, sell_status=F.FILLED, limit_status=F.OPEN)
+        rows = self._run(b)
+        self.assertTrue(self._failed(rows, "stage2_unresolved"))
+
+
+class DestinationGuardTests(unittest.TestCase):
+    def _preflight(self, broker, mode, api, allow_real=False, live="1"):
+        from live_trading import broker_preflight as bp
+
+        env = {"LIVE_ORDER_ENABLED": live}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(bp, "_build_adapter", return_value=api), \
+                mock.patch.object(bp, "_is_market_hours", return_value=True), \
+                mock.patch.object(bp, "_stage2_orders") as stage2, \
+                mock.patch.object(bp.time, "sleep", lambda x: None):
+            rep = bp.run_preflight(broker, mode, True, ["069500"], allow_real=allow_real)
+        return rep, stage2
+
+    def _guard(self, rep):
+        return [r["status"] for r in rep["results"] if r["label"] == "order-destination guard"]
+
+    def test_demo_mode_but_real_nh_url_is_refused(self):
+        api = FakeBroker(base_url="https://api.nhplug.com:8443")
+        rep, stage2 = self._preflight("NH", "demo", api)
+        self.assertEqual(self._guard(rep), ["FAIL"])
+        stage2.assert_not_called()
+
+    def test_nh_moapi_passes(self):
+        api = FakeBroker(base_url="https://moapi.nhplug.com:8443")
+        rep, stage2 = self._preflight("NH", "demo", api)
+        self.assertEqual(self._guard(rep), ["PASS"])
+        stage2.assert_called_once()
+
+    def test_kb_demo_requires_explicit_approval(self):
+        api = FakeBroker(base_url="https://developer.kbsec.com:32484")
+        rep, stage2 = self._preflight("KB", "demo", api)
+        self.assertEqual(self._guard(rep), ["FAIL"])
+        stage2.assert_not_called()
+        rep, stage2 = self._preflight("KB", "demo", api, allow_real=True)
+        self.assertEqual(self._guard(rep), ["PASS"])
+
+    def test_kiwoom_real_url_with_demo_mode_refused(self):
+        rep, stage2 = self._preflight("KIWOOM", "demo", FakeBroker(base_url="https://api.kiwoom.com"))
+        self.assertEqual(self._guard(rep), ["FAIL"])
+        stage2.assert_not_called()
+
+    def test_kis_uses_auth_base_url(self):
+        from types import SimpleNamespace
+
+        demo = SimpleNamespace(_auth=SimpleNamespace(base_url="https://openapivts.koreainvestment.com:29443"))
+        real = SimpleNamespace(_auth=SimpleNamespace(base_url="https://openapi.koreainvestment.com:9443"))
+        from live_trading import broker_preflight as bp
+
+        self.assertTrue(bp.order_destination_ok(demo, "KIS", "demo", False)[0])
+        self.assertFalse(bp.order_destination_ok(real, "KIS", "demo", False)[0])
+
+
+class ScrubTests(unittest.TestCase):
+    def test_credential_values_are_masked_in_notes(self):
+        from live_trading import broker_preflight as bp
+
+        with mock.patch.dict(os.environ, {"KIWOOM_SECRETKEY": "TopSecretValue123", "KIS_ACCOUNT_NO": "12345678"}):
+            out = bp._scrub("auth failed secret=TopSecretValue123 acct 12345678-01")
+        self.assertNotIn("TopSecretValue123", out)
+        self.assertNotIn("12345678", out)
 
 
 if __name__ == "__main__":

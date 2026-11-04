@@ -15,13 +15,18 @@
 | NH | `NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET`, `NHPLUG_ACCT_NO` | — | `MODE=demo` → `moapi.nhplug.com` | 토큰은 실전 도메인에서 발급. 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
 | KB | `KBSEC_APP_KEY`, `KBSEC_APP_SECRET` | `KBSEC_IP_ADDR`, `KBSEC_MAC_ADDR` | **코드상 모드 분기 없음** | 모의/실전은 `KBSEC_BASE_URL`로 구분해야 함(미검증). 주문은 전역 `LIVE_ORDER_ENABLED=1` 필요 |
 
-`broker_preflight.py`의 Stage 0은 위 목록을 검사한다(값은 마스킹). 목록은
-`tests/test_broker_preflight.py`가 어댑터 소스와 대조해 어긋남을 막는다.
+`broker_preflight.py`의 Stage 0은 **필수/선택 인증 변수**(표의 `KIS_ACCOUNT_PROD_CD`, `KIWOOM_ACCOUNT_NO` 등)만
+검사한다(값은 마스킹). `KBSEC_IP_ADDR`/`KBSEC_MAC_ADDR`와 `KBSEC_BASE_URL`은 검사하지 않는다.
+필수 목록은 `tests/test_broker_preflight.py`가 정확한 값과 어댑터 소스 양쪽으로 대조한다.
+출력/리포트의 메모에는 위 변수의 값이 포함되면 `***`로 치환한다(`_scrub`). 그 외 증권사 오류 본문은
+그대로 남을 수 있으므로 로그를 첨부할 때 눈으로 한 번 확인한다.
 
 ### 모드 해석 (수정됨)
 이전에는 NH가 `BROKER_MODE/ENV_MODE`만, KIS 클라이언트가 `ENV_MODE`만 읽어
 `MODE=demo`만 설정하면 **인증은 모의, 주문 계층은 실전으로 동작**할 수 있었다.
-이제 모든 어댑터가 `config_utils.get_mode()` (`MODE` > `BROKER_MODE` > `ENV_MODE`)를 따른다.
+이제 키움·KIS·NH가 `config_utils.get_mode()` (`MODE` > `BROKER_MODE` > `ENV_MODE`)를 따른다.
+**예외:** KB는 모드 개념이 없고, NH는 `NHPLUG_BASE_URL`이 설정되면 모드보다 우선한다
+(그래서 아래 "주문 목적지 가드"가 필요하다).
 프리플라이트는 `--mode` 값을 `MODE/BROKER_MODE/ENV_MODE` 모두에 덮어써서 `.env`의 `MODE=real`로
 붙는 사고를 막는다.
 
@@ -46,9 +51,19 @@ uv run python live_trading/broker_preflight.py --broker <...> --mode demo --with
 ```
 - 1주 시장가 매수 → 체결 대기 → 매도, 이어서 -25% 지정가 매수 → 취소.
 - `mode=real`이면 `--allow-real`을 주지 않는 한 거부한다.
+- **주문 목적지 가드:** `--mode`가 아니라 어댑터가 실제로 쓰는 URL을 검사한다
+  (키움 `mockapi.kiwoom.com`, KIS `openapivts`, NH `moapi.nhplug.com`). 모의 URL이 아니면
+  주문 전에 거부한다(예: `NHPLUG_BASE_URL`이 실전). KB는 모의 URL을 코드로 확인할 수 없어
+  `--allow-real`로 명시 승인해야만 진행한다.
+- **미해결 주문 처리:** 모든 주문은 체결 또는 취소 확정까지 확인한다. 취소 요청이 실패해도 최종 상태를
+  조회하며, `order_id`가 비어 있으면(접수 여부 불명) 즉시 중단한다. 확정하지 못하면
+  `stage2_unresolved` FAIL을 기록하고 이후 주문을 내지 않는다 — 이때는 증권사 앱에서
+  미체결 주문과 보유 1주를 수동으로 확인·정리한다.
 - 출력되는 주문 상태 필드(`is_found/order_qty/filled_qty/remaining_qty/is_filled`)를 기록한다.
-- `cancel_semantics` 항목이 **러너의 취소 확정 조건**(발견됨 & `remaining==0` & `filled<order_qty`)과
-  실제 응답이 일치하는지를 자동 판정한다. FAIL이면 해당 증권사는 현재 코드로 재주문을 확정하지 못한다.
+- `cancel_semantics` 항목이 러너의 취소 확정 조건(발견됨 & `remaining==0` & 관측한 최대 체결수량
+  `<order_qty`)과 실제 응답이 일치하는지를 자동 판정한다(체결수량은 감소하지 않는 것으로 취급).
+  FAIL이면 해당 증권사는 현재 코드로 재주문을 확정하지 못한다. 러너의 나머지 경로
+  (재조회 실패 시 재주문 차단 등)까지 동일하게 검증하는 것은 아니다.
 
 | 확인 항목 | 기대 | 의미 |
 |---|---|---|

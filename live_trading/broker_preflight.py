@@ -118,6 +118,17 @@ def _mask(s: str | None, keep: int = 4) -> str:
     return s[:2] + "***" + s[-keep:]
 
 
+def _scrub(text: str) -> str:
+    """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹."""
+    out = str(text)
+    for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
+        for n in names:
+            v = os.environ.get(n, "")
+            if len(v) >= 4:
+                out = out.replace(v, "***")
+    return out
+
+
 def _try_call(label: str, fn, *args, **kwargs) -> tuple[str, Any, str]:
     try:
         out = fn(*args, **kwargs)
@@ -161,6 +172,43 @@ def _build_adapter(broker: str, mode: str):
     raise ValueError(f"unknown broker: {broker} (KIS|KIWOOM|NH|KB)")
 
 
+# 모의(demo) 엔드포인트 표식. None = 코드상 모의 구분 불가(명시 승인 필요).
+DEMO_ENDPOINT_MARKER: dict[str, str | None] = {
+    "KIWOOM": "mockapi.kiwoom.com",
+    "KIS": "openapivts",
+    "NH": "moapi.nhplug.com",
+    "KB": None,
+}
+POLL_TRIES = 6
+
+
+def _endpoint_of(api: Any) -> str:
+    for getter in (lambda a: a.base_url, lambda a: a._auth.base_url):
+        try:
+            v = getter(api)
+            if isinstance(v, str) and v:
+                return v
+        except Exception:
+            continue
+    return ""
+
+
+def order_destination_ok(api: Any, broker: str, mode: str, allow_real: bool) -> tuple[bool, str]:
+    """--mode 값이 아니라 어댑터가 실제로 쓰는 주문 목적지를 검증한다.
+
+    NHPLUG_BASE_URL 같은 override 로 --mode demo 인데 실전 서버로 붙는 경우를 차단한다.
+    """
+    url = _endpoint_of(api)
+    if mode == "demo":
+        marker = DEMO_ENDPOINT_MARKER.get(broker.upper())
+        if marker is None:
+            return (allow_real, f"{broker.upper()}: 모의 엔드포인트를 코드로 검증할 수 없음 (url={url or '?'}); "
+                                "증권사 문서로 모의 여부 확인 후 --allow-real 로 명시 승인 필요")
+        if marker not in url:
+            return (False, f"effective endpoint={url or '?'} 는 모의({marker})가 아님 — 주문 거부")
+    return (True, f"endpoint={url or '?'}")
+
+
 def _order_id(out: Any) -> str | None:
     if isinstance(out, dict):
         oid = out.get("order_id") or out.get("odno") or out.get("ord_no")
@@ -168,12 +216,22 @@ def _order_id(out: Any) -> str | None:
     return str(out)[:32] if out else None
 
 
-def cancel_confirmed(st: dict[str, Any]) -> bool:
-    """러너(_wait_for_cancellations)와 동일한 판정: 발견됨 + 잔량 0 + 체결 < 주문수량."""
+def cancel_confirmed(st: dict[str, Any], prior_filled: int = 0) -> bool:
+    """러너(_wait_for_cancellations)와 동일: 발견됨 + 잔량 0 + (관측 최대 체결 < 주문수량).
+
+    prior_filled: 이전 폴링에서 관측한 최대 체결수량 (체결수량은 감소하지 않는다).
+    """
     if not st.get("is_found", False) or st.get("remaining_qty") is None:
         return False
     order_qty = int(st.get("order_qty", 0))
-    return order_qty > 0 and int(st["remaining_qty"]) == 0 and int(st.get("filled_qty", 0)) < order_qty
+    filled = max(int(st.get("filled_qty", 0)), int(prior_filled))
+    return order_qty > 0 and int(st["remaining_qty"]) == 0 and filled < order_qty
+
+
+def fully_filled(st: dict[str, Any], prior_filled: int = 0) -> bool:
+    order_qty = int(st.get("order_qty", 0))
+    filled = max(int(st.get("filled_qty", 0)), int(prior_filled))
+    return bool(st.get("is_found", False)) and order_qty > 0 and filled >= order_qty
 
 
 def _fmt_status(st: Any) -> str:
@@ -184,41 +242,92 @@ def _fmt_status(st: Any) -> str:
 
 
 def _stage2_orders(api: Any, record, tickers_hint: str = TEST_TICKER) -> None:
+    """주문 왕복/취소 검증. 모든 주문은 최종 상태(체결 또는 취소 확정)까지 확인하고,
+    확정하지 못하면 FAIL 기록 후 이후 주문을 중단한다 (미해결 주문/포지션을 남기지 않기 위함)."""
     ticker = tickers_hint
     today_krx = _now_kst().strftime("%Y%m%d")
     before = api.get_holdings() if hasattr(api, "get_holdings") else None
+    unresolved: list[str] = []
+
+    def abort(msg: str) -> None:
+        record("2", "stage2_unresolved", "FAIL", msg + " — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
 
     def status_of(label: str, oid: str) -> dict[str, Any] | None:
         st, out, note = _try_call(label, api.get_order_status, oid, today=today_krx)
         record("2", label, st, note[:200] if note else _fmt_status(out))
         return out if st == "PASS" and isinstance(out, dict) else None
 
-    # (1) 시장가 1주 매수 → 체결 대기 → 매도 (라운드트립)
-    st, out, note = _try_call("buy", api.place_order, "BUY", ticker, 1, None, "MARKET")
-    boid = _order_id(out) if st == "PASS" else None
-    record("2", "place_order(BUY 1주 MARKET)", st, note[:200] if note else f"order_id={_mask(boid)}")
-    filled = False
-    if boid:
-        for _ in range(6):
+    def place(label: str, side: str, price: float | None, otype: str) -> str | None:
+        st, out, note = _try_call(label, api.place_order, side, ticker, 1, price, otype)
+        oid = _order_id(out) if st == "PASS" else None
+        if st != "PASS":
+            record("2", label, "FAIL", note[:200])
+            return None
+        if not oid:
+            # 접수 여부 불명 — 추가 주문 금지 (러너의 OrderSubmissionUncertain 과 동일 원칙)
+            record("2", label, "FAIL", "order_id 없음 — 접수 여부 불명(uncertain), 이후 주문 중단")
+            unresolved.append("order_id missing")
+            return None
+        record("2", label, "PASS", f"order_id={_mask(oid)}")
+        return oid
+
+    def wait_fill(label: str, oid: str) -> tuple[bool, int]:
+        seen = 0
+        for _ in range(POLL_TRIES):
             time.sleep(1.0)
-            r = status_of("get_order_status(BUY)", boid)
-            if r and r.get("is_filled"):
-                filled = True
-                break
-        if not filled and hasattr(api, "cancel_order"):
-            _try_call("cancel", api.cancel_order, boid, ticker, 1)
+            r = status_of(label, oid)
+            if r:
+                seen = max(seen, int(r.get("filled_qty", 0)))
+                if fully_filled(r, seen):
+                    return True, seen
+        return False, seen
+
+    def cancel_and_resolve(label: str, oid: str, seen: int) -> str:
+        """취소 요청 후 최종 상태 확정. 반환: 'filled' | 'cancelled' | 'unresolved'."""
+        s3, o3, n3 = _try_call(label + "_cancel", api.cancel_order, oid, ticker, 1)
+        record("2", f"cancel_order({label})", s3, n3[:200] if n3 else "requested")
+        # 취소 요청 실패여도 최종 상태를 확인한다 (이미 체결/취소되었을 수 있음)
+        for _ in range(POLL_TRIES):
+            time.sleep(1.0)
+            r = status_of(f"get_order_status({label} 취소 후)", oid)
+            if not r:
+                continue
+            seen = max(seen, int(r.get("filled_qty", 0)))
+            if fully_filled(r, seen):
+                return "filled"
+            if cancel_confirmed(r, seen):
+                return "cancelled"
+        return "unresolved"
+
+    # (1) 시장가 1주 매수 → 체결 확인 → 매도
+    boid = place("place_order(BUY 1주 MARKET)", "BUY", None, "MARKET")
+    if boid is None:
+        abort("매수 주문 미확정")
+        return
+    filled, seen = wait_fill("get_order_status(BUY)", boid)
+    if not filled:
+        outcome = cancel_and_resolve("BUY", boid, seen)
+        if outcome == "unresolved":
+            abort("매수 주문의 최종 상태(체결/취소)를 확정하지 못함")
+            return
+        if outcome == "cancelled":
+            record("2", "place_order(SELL)", "SKIP", "buy cancelled (미체결) — 매도 생략, 보유 없음")
+            filled = False
+        else:
+            filled = True  # 취소와 체결이 경합해 체결됨 → 반드시 매도해 원복
     if filled:
-        st, out, note = _try_call("sell", api.place_order, "SELL", ticker, 1, None, "MARKET")
-        soid = _order_id(out) if st == "PASS" else None
-        record("2", "place_order(SELL 1주 MARKET)", st, note[:200] if note else f"order_id={_mask(soid)}")
-        if soid:
-            for _ in range(6):
-                time.sleep(1.0)
-                r = status_of("get_order_status(SELL)", soid)
-                if r and r.get("is_filled"):
-                    break
-    else:
-        record("2", "place_order(SELL)", "SKIP", "buy not filled — sell skipped to avoid naked sell")
+        soid = place("place_order(SELL 1주 MARKET)", "SELL", None, "MARKET")
+        if soid is None:
+            abort("매도 주문 미확정 — 매수 1주가 보유 상태로 남아 있음")
+            return
+        sold, sseen = wait_fill("get_order_status(SELL)", soid)
+        if not sold:
+            outcome = cancel_and_resolve("SELL", soid, sseen)
+            if outcome != "filled":
+                abort("매도 미체결 — 매수 1주가 보유 상태로 남아 있음 (매도 " +
+                      ("취소됨" if outcome == "cancelled" else "상태 불명") + ")")
+                return
+        record("2", "roundtrip", "PASS", "buy→sell 체결")
 
     # (2) 미체결 지정가 → 취소 → 취소 의미 검증
     cur = None
@@ -228,32 +337,27 @@ def _stage2_orders(api: Any, record, tickers_hint: str = TEST_TICKER) -> None:
     except Exception:
         cur = None
     limit_price = max(1, int((cur or 30000) * 0.75))
-    st, out, note = _try_call("limit", api.place_order, "BUY", ticker, 1, limit_price, "LIMIT")
-    loid = _order_id(out) if st == "PASS" else None
-    record("2", "place_order(BUY 1주 LIMIT -25%)", st, note[:200] if note else f"order_id={_mask(loid)}")
-    if not loid:
-        record("2", "cancel_order", "SKIP", "no order_id")
+    loid = place("place_order(BUY 1주 LIMIT -25%)", "BUY", limit_price, "LIMIT")
+    if loid is None:
+        abort("지정가 주문 미확정")
+        return
+    time.sleep(1.0)
+    first = status_of("get_order_status(LIMIT 미체결)", loid)
+    seen = int(first.get("filled_qty", 0)) if first else 0
+    outcome = cancel_and_resolve("LIMIT", loid, seen)
+    if outcome == "cancelled":
+        record("2", "cancel_semantics(found & remaining==0 & filled<order)", "PASS",
+               "러너의 취소 확정 조건과 일치")
+    elif outcome == "filled":
+        record("2", "cancel_semantics", "FAIL", "지정가(-25%)가 체결됨 — 1주 보유 상태, 수동 매도 필요")
     else:
-        time.sleep(1.0)
-        status_of("get_order_status(LIMIT 미체결)", loid)
-        s3, o3, n3 = _try_call("cancel", api.cancel_order, loid, ticker, 1)
-        record("2", "cancel_order", s3, n3[:200] if n3 else "requested")
-        confirmed, last = False, None
-        for _ in range(6):
-            time.sleep(1.0)
-            last = status_of("get_order_status(취소 후)", loid)
-            if last and cancel_confirmed(last):
-                confirmed = True
-                break
-        record("2", "cancel_semantics(found & remaining==0 & filled<order)",
-               "PASS" if confirmed else "FAIL",
-               "러너의 취소 확정 조건과 일치" if confirmed else f"러너가 취소를 확정하지 못함: {_fmt_status(last)}")
+        abort("지정가 주문의 취소를 확정하지 못함 (러너도 재주문을 확정하지 못함)")
+        return
 
     after = api.get_holdings() if hasattr(api, "get_holdings") else None
     flat = before == after
     record("2", "verify_flat_position", "PASS" if flat else "FAIL",
            "holdings unchanged" if flat else "before≠after — 수동 확인/정리 필요")
-
 
 
 def run_preflight(
@@ -267,6 +371,7 @@ def run_preflight(
     results: list[dict[str, Any]] = []
 
     def record(stage: str, label: str, status: str, note: str = "") -> None:
+        note = _scrub(note)
         results.append({"stage": stage, "label": label, "status": status, "note": note})
         icon = {"PASS": "✓", "FAIL": "✗", "SKIP": "-"} .get(status, "?")
         suffix = f" — {note}" if note else ""
@@ -379,7 +484,12 @@ def run_preflight(
         record("2", "place_order", "SKIP",
                f"{broker.upper()} 어댑터는 LIVE_ORDER_ENABLED=1 일 때만 주문 전송 — 모의 검증 시 설정 필요")
     else:
-        _stage2_orders(api, record, tickers_hint=TEST_TICKER)
+        ok, detail = order_destination_ok(api, broker, mode, allow_real)
+        if not ok:
+            record("2", "order-destination guard", "FAIL", detail)
+        else:
+            record("2", "order-destination guard", "PASS", detail)
+            _stage2_orders(api, record, tickers_hint=TEST_TICKER)
 
     # Stage 3: smoke는 문서상 선택 — 여기서는 runner --help 수준만 힌트
     print("\n[Stage 3] Smoke (선택)")
