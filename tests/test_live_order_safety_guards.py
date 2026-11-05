@@ -362,7 +362,7 @@ class LiveOrderSafetyTests(unittest.TestCase):
         primary = {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
                    "filled_qty": 4, "remaining_qty": 0, "cancel_confirmed": True}
         retry = {"ticker": "a", "submitted": True, "order_id": "2", "requested_qty": 6,
-                 "filled_qty": 6, "remaining_qty": 0, "retry_from_order_id": "1"}
+                 "filled_qty": 6, "remaining_qty": 0, "is_filled": True, "retry_from_order_id": "1"}
         self.assertTrue(f([primary], [retry]))
         self.assertFalse(f([primary], [dict(retry, filled_qty=5)]))
         self.assertFalse(f([primary], []))
@@ -451,7 +451,7 @@ class LiveOrderSafetyTests(unittest.TestCase):
                     "remaining_qty": 0, "cancel_confirmed": True}
         def rty(parent, qty, filled):
             return {"ticker": parent, "order_id": "r" + parent, "qty": qty, "requested_qty": qty,
-                    "filled_qty": filled, "remaining_qty": 0, "retry_from_order_id": parent}
+                    "filled_qty": filled, "remaining_qty": 0, "is_filled": True, "retry_from_order_id": parent}
         # A 4/10 + 재주문 7/7 (초과), B 9/10 (미재주문): 합 20/20 이지만 A 초과·B 부족
         self.assertFalse(f([prim("A", 4), prim("B", 9)], [rty("A", 7, 7)]))
         # 정상: A 4 + 6, B 9 + 1
@@ -489,6 +489,23 @@ class LiveOrderSafetyTests(unittest.TestCase):
                 {"ticker": "b", "qty": 1, "retry_from_order_id": "B"},
                 {"ticker": "c", "qty": 2}], False)
             self.assertEqual([r.get("retry_from_order_id") for r in res], ["A", "B", None])
+
+    def test_side_requires_explicit_fill_or_cancel_confirmation(self):
+        """수량은 전량이어도 is_filled 확인이 없으면(timed_out 등) 완료가 아니다. 재주문으로 채운 원주문은 취소 확정 필요."""
+        f = self._side_ns()["_is_side_fully_filled"]
+        full = {"ticker": "a", "submitted": True, "order_id": "1", "qty": 10, "requested_qty": 10,
+                "filled_qty": 10, "remaining_qty": 0, "is_filled": True}
+        self.assertTrue(f([full], []))
+        self.assertFalse(f([dict(full, is_filled=False, timed_out=True)], []))
+        self.assertFalse(f([{k: v for k, v in full.items() if k != "is_filled"}], []))
+        part = {"ticker": "a", "submitted": True, "order_id": "1", "qty": 10, "requested_qty": 10,
+                "filled_qty": 4, "remaining_qty": 0, "cancel_confirmed": True}
+        retry = {"ticker": "a", "submitted": True, "order_id": "2", "qty": 6, "requested_qty": 6,
+                 "filled_qty": 6, "remaining_qty": 0, "is_filled": True, "retry_from_order_id": "1"}
+        self.assertTrue(f([part], [retry]))
+        self.assertFalse(f([dict(part, cancel_confirmed=False)], [retry]))          # 취소 확정 없음
+        self.assertFalse(f([{k: v for k, v in part.items() if k != "cancel_confirmed"}], [retry]))
+        self.assertFalse(f([part], [dict(retry, is_filled=False, timed_out=True)]))  # 재주문 체결 확인 없음
 
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""

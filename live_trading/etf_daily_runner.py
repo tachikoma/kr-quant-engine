@@ -2262,6 +2262,8 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
     - 목표 수량은 **제출한 수량(qty)** 이다. 증권사가 보고한 order_qty(requested_qty)로 덮어써진 값에 의존하지 않는다
       (예: 10주 제출인데 order_qty=6/체결 6 이면 4주가 미확인이므로 완료가 아니다).
     - 과체결(원주문+그 재주문 합이 목표 초과, 재주문 단독 초과)은 모순이므로 완료가 아니다.
+    - 수량이 맞아도 명시적 확인이 필요하다: 직접 전량 체결된 원주문과 모든 재주문은 is_filled=True,
+      부분체결 후 재주문으로 채운 원주문은 cancel_confirmed=True.
     - 재주문은 retry_from_order_id 로 원주문에 묶어 **원주문별로** 합계를 맞춘다 (한 원주문의 초과가
       다른 원주문의 부족을 가리지 못한다). 원주문이 없는(미제출) 목표는 부모 없는 재주문 합과 맞춘다.
     """
@@ -2280,6 +2282,8 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
         rq = int(row.get("qty") or row.get("requested_qty") or 0)
         if rq > 0 and fq > rq:
             return False  # 재주문 단독 과체결
+        if row.get("is_filled") is not True:
+            return False  # 재주문은 명시적 체결 확인(is_filled)이 필요하다
         parent = str(row.get("retry_from_order_id", "") or "")
         retry_by_parent[parent] = retry_by_parent.get(parent, 0) + fq
 
@@ -2296,6 +2300,11 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
         if oid:
             if fq + retry_by_parent.get(oid, 0) != target:
                 return False
+            if fq == target:
+                if row.get("is_filled") is not True:
+                    return False  # 수량은 전량인데 체결 확인 플래그가 없다(상태 불확실/timed_out) → 완료 아님
+            elif row.get("cancel_confirmed") is not True:
+                return False  # 부분체결 후 재주문으로 채운 경우: 원주문 취소 확정이 있어야 한다
         else:
             unsubmitted_required += target
 
