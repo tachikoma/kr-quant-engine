@@ -111,7 +111,7 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertEqual(row["cancelled_qty"], 6)
 
     def test_full_fill_is_not_cancel(self):
-        row = self._wait({"is_found": True, "order_qty": 10, "filled_qty": 10, "remaining_qty": 0})
+        row = self._wait({"is_found": True, "order_qty": 10, "filled_qty": 10, "remaining_qty": 0, "is_filled": True})
         self.assertIs(row["cancel_confirmed"], False)
         self.assertTrue(row["is_filled"])
         ns = isolated_functions("_build_retry_orders")
@@ -556,6 +556,68 @@ class LiveOrderSafetyTests(unittest.TestCase):
                 return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 6, "is_filled": False}
         ref["_refresh_order_statuses"](Reopened(), out)
         self.assertFalse(self._gate()(out, []))
+
+    def test_full_quantities_without_broker_confirmation_in_cancel_wait_are_not_a_fill(self):
+        ns = isolated_functions("_wait_for_cancellations")
+        ns["time"] = SimpleNamespace(sleep=lambda x: None)
+        ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+        row = {"ticker": "a", "order_id": "1", "cancel_submitted": True, "qty": 10, "filled_qty": 0}
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 10, "remaining_qty": 0, "is_filled": False}
+        ns["_wait_for_cancellations"](Broker(), [row], timeout_sec=0)
+        self.assertFalse(row["is_filled"])
+        self.assertIsNot(row.get("cancel_confirmed"), True)
+        self.assertTrue(row.get("status_error"))
+
+    def test_unconfirmed_fill_cannot_be_laundered_through_cancel_wait_and_refresh(self):
+        """Codex 재현: 폴링에서 order_qty=0/체결 10/is_filled=False → 타임아웃 취소 → 취소 대기가 4/10 부분 취소를 보고
+        → 재조회도 같은 보고. 어느 단계에서도 전량 체결 확인이 생기면 안 되고 게이트는 False 여야 한다."""
+        poll = self._poll_ns()
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        cancels = []
+        class Poll:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 0, "filled_qty": 10, "remaining_qty": 0, "is_filled": False}
+            def cancel_order(self, **kw):
+                cancels.append(kw); return {}
+        out = poll["_poll_and_finalize_orders"](Poll(), [row], 1, 1, "09:05", True)
+        self.assertFalse(out[0]["is_filled"])
+        self.assertTrue(out[0].get("cancel_submitted"))
+        wait = isolated_functions("_wait_for_cancellations")
+        wait["time"] = SimpleNamespace(sleep=lambda x: None)
+        wait["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+        partial = {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": False}
+        class Wait:
+            def get_order_status(self, oid, today):
+                return partial
+        wait["_wait_for_cancellations"](Wait(), out, timeout_sec=0)
+        self.assertFalse(out[0]["is_filled"])
+        self.assertIsNot(out[0].get("cancel_confirmed"), True)
+        ref = self._refresh_ns()
+        class Ref:
+            def get_order_status(self, oid, today):
+                return partial
+        ref["_refresh_order_statuses"](Ref(), out)
+        self.assertFalse(out[0]["is_filled"])
+        self.assertEqual(ref["_build_retry_orders"](out), [])
+        self.assertFalse(self._gate()(out, []))
+
+    def test_refresh_preserves_only_broker_confirmed_fills(self):
+        """is_filled=True 라도 증권사 확인 출처(broker_confirmed_fill)가 없으면 오래된 보고에 의해 되돌려진다."""
+        ref = self._refresh_ns()
+        class Stale:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": False}
+        base = {"ticker": "a", "submitted": True, "order_id": "1", "qty": 10, "requested_qty": 10,
+                "filled_qty": 10, "remaining_qty": 0, "is_filled": True}
+        unconfirmed = dict(base)
+        ref["_refresh_order_statuses"](Stale(), [unconfirmed])
+        self.assertFalse(unconfirmed["is_filled"])
+        confirmed = dict(base, broker_confirmed_fill=True)
+        ref["_refresh_order_statuses"](Stale(), [confirmed])
+        self.assertTrue(confirmed["is_filled"])
 
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""

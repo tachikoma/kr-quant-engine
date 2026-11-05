@@ -1963,6 +1963,7 @@ def _poll_and_finalize_orders(
             row["last_status"] = status
 
             if row["is_filled"]:
+                row["broker_confirmed_fill"] = True  # 증권사의 is_filled 로 확인된 체결
                 done_idx.append(i)
                 if notifier is not None:
                     price = _extract_exec_price(row)
@@ -2071,22 +2072,39 @@ def _wait_for_cancellations(
             filled = int(status.get("filled_qty", 0))
             if order_qty <= 0:
                 continue
-            # remaining==0 은 '전량체결'과 '취소'를 모두 의미할 수 있다 → 체결수량으로 구분.
+            # remaining==0 은 '전량체결'과 '취소'를 모두 의미할 수 있다 → 증권사 자신의 보고로 구분한다.
+            # (이전 행에 남은 체결수량과 합친 값만으로 전량 체결을 만들어 내지 않는다.)
             pending.pop(order_id)
-            filled = max(filled, int(row.get("filled_qty", 0)))  # 체결수량은 감소하지 않는다
-            row["filled_qty"] = filled
+            prior = int(row.get("filled_qty", 0))
+            merged = max(filled, prior)  # 체결수량은 감소하지 않는다
+            row["filled_qty"] = merged
             row["requested_qty"] = order_qty
             row["remaining_qty"] = 0
             if filled >= order_qty:
-                row["is_filled"] = True
+                if status.get("is_filled") is True:
+                    row["is_filled"] = True
+                    row["broker_confirmed_fill"] = True
+                    row["cancel_confirmed"] = False
+                    logger.info(f"[취소확인] {order_id} → 취소 전 전량 체결 (filled={filled})")
+                else:
+                    row["is_filled"] = False
+                    row["cancel_confirmed"] = False
+                    row["status_error"] = "full quantity reported without broker fill confirmation"
+                    logger.error(f"[취소확인] {order_id} → 수량은 전량이나 증권사 체결 확인 없음 (재주문 차단)")
+            elif merged >= order_qty:
+                # 증권사는 부분 체결(filled<order)이라고 하는데 이전 행의 수량이 더 크다 → 상태 불확실
+                row["is_filled"] = False
                 row["cancel_confirmed"] = False
-                logger.info(f"[취소확인] {order_id} → 취소 전 전량 체결 (filled={filled})")
+                row["status_error"] = (
+                    f"stale/contradictory fills: broker filled={filled}/{order_qty}, earlier row filled={prior}"
+                )
+                logger.error(f"[취소확인] {order_id} → {row['status_error']} (재주문 차단)")
             else:
                 row["cancel_confirmed"] = True
-                row["cancelled_qty"] = order_qty - filled
+                row["cancelled_qty"] = order_qty - merged
                 logger.info(
-                    f"[취소확인] {order_id} → 취소 확정 (filled={filled}/{order_qty}, "
-                    f"취소수량={order_qty - filled})"
+                    f"[취소확인] {order_id} → 취소 확정 (filled={merged}/{order_qty}, "
+                    f"취소수량={order_qty - merged})"
                 )
         if pending:
             time.sleep(max(poll_interval_sec, 1))
@@ -2119,7 +2137,7 @@ def _refresh_order_statuses(
             row["status_error"] = "order not found in status refresh"
             logger.error(f"[상태재조회] {order_id} 미발견 → 기존 값 유지(재주문 판단에 사용 안 함)")
             continue
-        prev_full = row.get("is_filled") is True
+        prev_full = row.get("is_filled") is True and row.get("broker_confirmed_fill") is True
         prev_req = int(row.get("requested_qty", 0) or 0)
         filled_qty = int(status.get("filled_qty", 0))
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
@@ -2160,6 +2178,8 @@ def _refresh_order_statuses(
             and row["remaining_qty"] == 0
             and row["filled_qty"] >= row.get("requested_qty", 0) > 0
         )
+        if row["is_filled"]:
+            row["broker_confirmed_fill"] = True
         full_target = max(prev_req, int(row.get("qty", 0) or 0))
         if (prev_full and not row["is_filled"] and row["remaining_qty"] == 0
                 and full_target > 0 and row["filled_qty"] >= full_target and not contradictory):
