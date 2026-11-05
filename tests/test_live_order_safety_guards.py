@@ -398,6 +398,81 @@ class LiveOrderSafetyTests(unittest.TestCase):
                    "remaining_qty": 0, "cancel_confirmed": True}
         self.assertFalse(f([primary], out))
 
+    def test_inconsistent_open_order_is_still_cancelled_at_cutoff(self):
+        """수량 모순 행도 폴링/정리 대상에 남는다: 컷오프 후 취소가 전송되고 완료로 처리되지 않는다 (Codex P1 회귀)."""
+        ns = self._poll_ns()
+        cancels = []
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 6, "remaining_qty": 6, "is_filled": False}
+            def cancel_order(self, **kw):
+                cancels.append(kw); return {}
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", True)
+        self.assertEqual(len(cancels), 1)
+        self.assertFalse(out[0]["is_filled"])
+        self.assertTrue(out[0].get("status_error"))
+
+    def test_transient_contradiction_recovers_on_next_poll(self):
+        ns = self._poll_ns()
+        seq = [{"is_found": True, "order_qty": 10, "filled_qty": 6, "remaining_qty": 6, "is_filled": False},
+               {"is_found": True, "order_qty": 10, "filled_qty": 10, "remaining_qty": 0, "is_filled": True}]
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        class Broker:
+            def get_order_status(self, oid, today):
+                return seq.pop(0) if len(seq) > 1 else seq[0]
+            def cancel_order(self, **kw):
+                raise AssertionError("must not cancel after recovery")
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", True)
+        self.assertTrue(out[0]["is_filled"])
+        self.assertNotIn("status_error", out[0])
+
+    def test_gate_uses_submitted_qty_not_broker_reported_order_qty(self):
+        """제출 10주인데 증권사가 order_qty=6/체결 6/잔량 0 으로 보고 → 4주 미확인이므로 완료가 아니다."""
+        ns = self._poll_ns()
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 6, "filled_qty": 6, "remaining_qty": 0, "is_filled": True}
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", False)
+        f = isolated_functions("_is_side_fully_filled")["_is_side_fully_filled"]
+        self.assertFalse(f(out, []))
+        # 12/12 같은 과체결 보고도 제출 10주 대비 모순
+        over = dict(out[0], requested_qty=12, filled_qty=12, remaining_qty=0)
+        self.assertFalse(f([over], []))
+
+    def test_retry_chain_cannot_mask_another_orders_shortfall(self):
+        f = isolated_functions("_is_side_fully_filled")["_is_side_fully_filled"]
+        def prim(oid, filled):
+            return {"ticker": oid, "order_id": oid, "qty": 10, "requested_qty": 10, "filled_qty": filled,
+                    "remaining_qty": 0, "cancel_confirmed": True}
+        def rty(parent, qty, filled):
+            return {"ticker": parent, "order_id": "r" + parent, "qty": qty, "requested_qty": qty,
+                    "filled_qty": filled, "remaining_qty": 0, "retry_from_order_id": parent}
+        # A 4/10 + 재주문 7/7 (초과), B 9/10 (미재주문): 합 20/20 이지만 A 초과·B 부족
+        self.assertFalse(f([prim("A", 4), prim("B", 9)], [rty("A", 7, 7)]))
+        # 정상: A 4 + 6, B 9 + 1
+        self.assertTrue(f([prim("A", 4), prim("B", 9)], [rty("A", 6, 6), rty("B", 1, 1)]))
+        # 재주문 requested_qty 누락 시 qty 로 단독 과체결 검사
+        self.assertFalse(f([prim("A", 4)], [{"qty": 6, "filled_qty": 7, "remaining_qty": 0,
+                                              "retry_from_order_id": "A", "order_id": "rA"}]))
+
+    def test_submit_orders_preserves_retry_parent_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns(tmp)
+            class Broker:
+                n = 0
+                def place_order(self, **kw):
+                    Broker.n += 1; return {"order_id": f"R{Broker.n}"}
+            res = ns["_submit_orders"](Broker(), "SELL", [
+                {"ticker": "a", "qty": 6, "retry_from_order_id": "A"},
+                {"ticker": "b", "qty": 1, "retry_from_order_id": "B"},
+                {"ticker": "c", "qty": 2}], False)
+            self.assertEqual([r.get("retry_from_order_id") for r in res], ["A", "B", None])
+
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))

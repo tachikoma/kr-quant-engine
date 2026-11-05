@@ -1762,6 +1762,12 @@ def _submit_orders(
     cutoff_hhmm: str | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    parents: list[str] = []  # 결과 행과 1:1 (주문당 정확히 한 행) — 재주문의 원주문 연결 보존
+
+    def _attach_parents() -> None:
+        for r, par in zip(results, parents):
+            if par:
+                r["retry_from_order_id"] = par
 
     for order in orders:
         ticker = str(order.get("ticker"))
@@ -1769,6 +1775,7 @@ def _submit_orders(
         qty = int(order.get("qty", 0))
         if qty <= 0:
             continue
+        parents.append(str(order.get("retry_from_order_id", "") or ""))
 
         if dry_run:
             results.append(
@@ -1873,11 +1880,13 @@ def _submit_orders(
                 notifier.notify_order_error(side, display_name, qty, exc)
             if not definite:
                 # 전송 예외는 거절의 증거가 아님 → 이후 모든 제출 중단 (원장 유지)
+                _attach_parents()
                 raise OrderSubmissionUncertain(
                     f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first",
                     results,
                 ) from exc
 
+    _attach_parents()
     return results
 
 
@@ -1947,9 +1956,8 @@ def _poll_and_finalize_orders(
                     f"remaining={row['remaining_qty']}"
                 )
                 logger.error(f"[체결확인] {order_id} 수량 모순 → 완료 처리 안 함: {row['status_error']}")
-                done_idx.append(i)  # 더 폴링하거나 취소를 보내지 않는다 (상태 불확실 → 이후 단계에서 차단)
-                row["last_status"] = status
-                continue
+                # 폴링 대상에서 빼지 않는다: 일시적 불일치면 다음 조회에서 해소되고, 아니면 컷오프 후
+                # 정리(취소)가 계속 수행되어야 한다 (열려 있을 수 있는 주문을 방치하지 않는다).
             row["last_status"] = status
 
             if row["is_filled"]:
@@ -2248,37 +2256,51 @@ def _build_failed_retry_orders(
 def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, Any]]) -> bool:
     """한 쪽(매도/매수)의 모든 주문이 '확정적으로' 전량 체결됐는지.
 
-    체결수량 합만으로 판단하지 않는다: 잔량이 남은 주문(원주문 생존 가능)이나 상태 조회 오류/수량 모순이
-    있으면 완료로 보지 않는다 (매도 완료로 오판해 매수 단계로 넘어가는 것을 막는다).
-    과체결(주문수량 초과 체결, 원주문+재주문 합 초과)은 모순이므로 완료로 보지 않는다.
+    - 잔량(remaining_qty>0)이 남았거나 상태 조회 오류/수량 모순(status_error)이 있으면 완료가 아니다.
+    - 목표 수량은 **제출한 수량(qty)** 이다. 증권사가 보고한 order_qty(requested_qty)로 덮어써진 값에 의존하지 않는다
+      (예: 10주 제출인데 order_qty=6/체결 6 이면 4주가 미확인이므로 완료가 아니다).
+    - 과체결(원주문+그 재주문 합이 목표 초과, 재주문 단독 초과)은 모순이므로 완료가 아니다.
+    - 재주문은 retry_from_order_id 로 원주문에 묶어 **원주문별로** 합계를 맞춘다 (한 원주문의 초과가
+      다른 원주문의 부족을 가리지 못한다). 원주문이 없는(미제출) 목표는 부모 없는 재주문 합과 맞춘다.
     """
-    required = 0
-    filled = 0
-
     for row in (*primary, *retry):
         if row.get("status_error"):
             return False  # 최종 상태 불확실
         if int(row.get("remaining_qty", 0) or 0) > 0:
             return False  # 살아 있는 잔량
 
-    for row in primary:
-        req = int(row.get("requested_qty", row.get("qty", 0)))
-        fq = int(row.get("filled_qty", 0))
-        if req > 0 and fq > req:
-            return False  # 과체결 보고는 모순 → 완료로 보지 않는다 (클램프로 숨기지 않는다)
-        required += req
-        filled += fq
+    def target_of(row: dict[str, Any]) -> int:
+        return int(row.get("qty") or row.get("requested_qty") or 0)
 
+    retry_by_parent: dict[str, int] = {}
     for row in retry:
-        rq = int(row.get("requested_qty", 0) or 0)
         fq = int(row.get("filled_qty", 0))
+        rq = int(row.get("qty") or row.get("requested_qty") or 0)
         if rq > 0 and fq > rq:
-            return False
-        filled += fq
+            return False  # 재주문 단독 과체결
+        parent = str(row.get("retry_from_order_id", "") or "")
+        retry_by_parent[parent] = retry_by_parent.get(parent, 0) + fq
 
-    if required <= 0:
-        return True
-    return filled == required  # 초과 체결(모순)도 완료로 보지 않는다
+    primary_ids = {str(r.get("order_id", "")).strip() for r in primary if str(r.get("order_id", "")).strip()}
+    unsubmitted_required = 0
+    for row in primary:
+        target = target_of(row)
+        fq = int(row.get("filled_qty", 0))
+        oid = str(row.get("order_id", "")).strip()
+        if target <= 0:
+            continue
+        if fq > target:
+            return False  # 과체결 보고는 모순 (클램프로 숨기지 않는다)
+        if oid:
+            if fq + retry_by_parent.get(oid, 0) != target:
+                return False
+        else:
+            unsubmitted_required += target
+
+    orphan_filled = sum(v for k, v in retry_by_parent.items() if k not in primary_ids)
+    if orphan_filled != unsubmitted_required:
+        return False
+    return True
 
 
 def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
