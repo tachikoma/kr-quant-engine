@@ -100,6 +100,10 @@ uv run python live_trading/broker_preflight.py --broker <KIS|KIWOOM|NH> --mode d
 | 취소 후 `is_filled` | False | KIS는 부분체결 취소 시 True일 수 있음 (러너는 체결수량으로 재검증) |
 | 없는 주문번호 조회 | `is_found=False` | 미발견은 취소 증거가 아님 |
 | 취소 반영 지연 | 몇 초 | `_wait_for_cancellations` 기본 대기(5초) 충분 여부 |
+| 전량 체결 직후 `is_filled` | **True** (`order_qty`>0, `filled_qty==order_qty`, `remaining_qty==0`) | 러너 완료 판정은 수량만으로 체결을 인정하지 않고 증권사의 `is_filled=True`를 요구한다. 누락/False면 체결된 주문도 미확인으로 남아 매수가 막힌다 |
+| 응답의 `order_qty` | 제출 수량과 같음, 취소 후에도 그대로 | 판정 목표는 **제출 수량**이다. 취소 뒤 `order_qty`를 줄여 보고하면 보수적으로 완료 불인정(매수 차단) |
+| 부분체결 취소의 `filled_qty` | 취소 시점 체결수량, 이후 조회에서 감소하지 않음 | 체결수량은 단조 증가로 취급한다. 줄어드는 응답이면 상태 불확실(`status_error`) |
+| 같은 주문 반복 조회 | 서로 모순되는 값이 나오지 않음 | 취소 확정 뒤 잔량 재출현, `filled+remaining>order_qty` 등은 재주문/완료를 막는다 |
 
 ## 4. 러너 시나리오 (모의계좌: KIS/키움/NH)
 러너는 **전역** `LIVE_ORDER_ENABLED=1`이 필요하다. 모의 환경에서만 설정한다.
@@ -117,7 +121,21 @@ GitHub 워크플로(`daily_runner*.yml`)가 이 값을 전역 `LIVE_ORDER_ENABLE
 | 7 | 미체결 취소·재주문 | 체결 안 되는 조건 + `CANCEL_UNFILLED_ORDERS=1 RETRY_UNFILLED_ORDERS=1` | 취소 확정 후에만 `requested-filled` 수량 재주문 |
 | 8 | DRY_RUN | `LIVE_ORDER_ENABLED=0` | 주문 0건, 원장 미생성 |
 
+| 9 | 부분체결 후 취소·재주문 완료 | 7과 같은 설정에서 일부만 체결되는 지정가 | 원주문 `cancel_confirmed`, 재주문 수량=제출−체결, 재주문 체결 확인 뒤 `DONE`, 원장 보관(재주문이 있으면 삭제하지 않음) |
+| 10 | 재시도 끄기 + 미체결 매도 | `RETRY_UNFILLED_ORDERS=0`, 체결 안 되는 매도 | 매수 0건, 상태 `BLOCKED_BUY_BY_UNFILLED_SELL`, 이후 원장 차단 |
+| 11 | 매수 미체결 | 체결 안 되는 매수 주문 | 상태 `PARTIAL_FILLED`(`DONE` 아님), 추가 주문 없음 |
+
+시나리오 7·9의 로그에서 `[취소확인]`, `[상태재조회]`, `[재시도-차단]` 줄을 확인한다.
+`stale/contradictory`, `inconsistent quantities`, `cancel reversed`, `증권사 체결 확인 없음`이 **정상 체결 흐름에서**
+나오면 어댑터 응답이 코드 가정과 다르다는 뜻이다 — 중단하고 해당 응답(`last_status`)을 기록해 보고한다.
+
 5·6 이후에는 증권사 주문내역과 대조한 뒤 원장 파일을 **삭제하지 말고 이름을 바꿔 보관**한다.
+
+### 중단 조건 (즉시 멈추고 증권사 앱에서 확인)
+- 증권사 주문내역 건수가 로그의 접수 건수보다 많다(중복 의심).
+- `stage2_unresolved` FAIL 또는 `[수동대조필요]` 로그.
+- `.env`의 `MODE`와 무관하게 주문 목적지 가드가 거부하거나, 실계좌로 보이는 응답(잔고·계좌번호 불일치)이 나온다.
+- 한 번 멈추면 원인 분석 전까지 재실행하지 않는다. 원장 파일은 삭제하지 않는다.
 
 ## 5. 요율제한·인증 만료 재시도
 어댑터는 주문 전송의 네트워크 오류/5xx 재전송을 하지 않지만, 요율제한 코드(KIS `EGW00201/215` 등)와
