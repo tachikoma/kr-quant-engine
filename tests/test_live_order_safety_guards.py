@@ -367,11 +367,36 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertFalse(f([primary], [dict(retry, filled_qty=5)]))
         self.assertFalse(f([primary], []))
 
-    def test_side_overfill_report_does_not_mask_other_unfilled_order(self):
+    def test_side_overfill_is_rejected_not_masked(self):
         f = self._side_ns()["_is_side_fully_filled"]
         a = {"ticker": "a", "order_id": "1", "requested_qty": 10, "filled_qty": 15, "remaining_qty": 0}
-        b = {"ticker": "b", "order_id": "2", "requested_qty": 10, "filled_qty": 5, "remaining_qty": 0}  # 합 20 = 요청 합 20
-        self.assertFalse(f([a, b], []))
+        b = {"ticker": "b", "order_id": "2", "requested_qty": 10, "filled_qty": 5, "remaining_qty": 0}
+        self.assertFalse(f([a, b], []))          # 한 주문 과체결 + 다른 주문 미체결
+        self.assertFalse(f([a], []))             # 단독 과체결도 모순
+        primary = {"ticker": "a", "order_id": "1", "requested_qty": 10, "filled_qty": 4,
+                   "remaining_qty": 0, "cancel_confirmed": True}
+        retry = {"ticker": "a", "order_id": "2", "requested_qty": 6, "filled_qty": 7, "remaining_qty": 0}
+        self.assertFalse(f([primary], [retry]))  # 재주문 과체결 (Codex 재현: 4/10 취소 + 재주문 7/6)
+        self.assertFalse(f([primary], [dict(retry, requested_qty=0, filled_qty=7)]))  # 합 초과
+
+    def test_poll_marks_overfilled_order_inconsistent(self):
+        """실제 폴링 함수가 과체결 상태를 완료로 받아들이지 않고 status_error 를 남긴다."""
+        ns = self._poll_ns()
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 6,
+               "qty": 6, "filled_qty": 0, "remaining_qty": 6, "is_filled": False}
+        class Broker:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 6, "filled_qty": 7, "remaining_qty": 0, "is_filled": True}
+            def cancel_order(self, **kw):
+                return {}
+        out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", False)
+        self.assertFalse(out[0].get("is_filled"))
+        self.assertIn("inconsistent", out[0].get("status_error", ""))
+        # 판정 함수까지 연결: 4/10 취소 확정 + 재주문 7/6 과체결 → 매수 허용 안 됨
+        f = isolated_functions("_is_side_fully_filled")["_is_side_fully_filled"]
+        primary = {"ticker": "a", "order_id": "0", "requested_qty": 10, "filled_qty": 4,
+                   "remaining_qty": 0, "cancel_confirmed": True}
+        self.assertFalse(f([primary], out))
 
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""

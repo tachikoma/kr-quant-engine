@@ -1939,6 +1939,17 @@ def _poll_and_finalize_orders(
                 and row["remaining_qty"] == 0
                 and row["filled_qty"] >= req_qty > 0
             )
+            if req_qty > 0 and row["filled_qty"] + row["remaining_qty"] > req_qty:
+                # 체결/잔량이 주문수량과 모순 → 완료로 보지 않고 불확실로 표시 (매수 단계 진행 차단)
+                row["is_filled"] = False
+                row["status_error"] = (
+                    f"inconsistent quantities: order={req_qty} filled={row['filled_qty']} "
+                    f"remaining={row['remaining_qty']}"
+                )
+                logger.error(f"[체결확인] {order_id} 수량 모순 → 완료 처리 안 함: {row['status_error']}")
+                done_idx.append(i)  # 더 폴링하거나 취소를 보내지 않는다 (상태 불확실 → 이후 단계에서 차단)
+                row["last_status"] = status
+                continue
             row["last_status"] = status
 
             if row["is_filled"]:
@@ -1989,7 +2000,8 @@ def _poll_and_finalize_orders(
 
         # remaining==0 만으로는 전량체결과 (부분체결 후) 취소를 구분할 수 없다 → 체결수량 확인.
         row["is_filled"] = bool(
-            row.get("remaining_qty", 0) == 0
+            not row.get("status_error")
+            and row.get("remaining_qty", 0) == 0
             and int(row.get("filled_qty", 0)) >= int(row.get("requested_qty", row.get("qty", 0)))
             > 0
         )
@@ -2238,7 +2250,7 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
 
     체결수량 합만으로 판단하지 않는다: 잔량이 남은 주문(원주문 생존 가능)이나 상태 조회 오류/수량 모순이
     있으면 완료로 보지 않는다 (매도 완료로 오판해 매수 단계로 넘어가는 것을 막는다).
-    원주문의 체결수량은 자기 요청수량을 넘지 못하게 잘라 과체결 보고가 다른 주문의 미체결을 가리지 않게 한다.
+    과체결(주문수량 초과 체결, 원주문+재주문 합 초과)은 모순이므로 완료로 보지 않는다.
     """
     required = 0
     filled = 0
@@ -2251,15 +2263,22 @@ def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, A
 
     for row in primary:
         req = int(row.get("requested_qty", row.get("qty", 0)))
+        fq = int(row.get("filled_qty", 0))
+        if req > 0 and fq > req:
+            return False  # 과체결 보고는 모순 → 완료로 보지 않는다 (클램프로 숨기지 않는다)
         required += req
-        filled += min(int(row.get("filled_qty", 0)), req) if req > 0 else 0
+        filled += fq
 
     for row in retry:
-        filled += int(row.get("filled_qty", 0))
+        rq = int(row.get("requested_qty", 0) or 0)
+        fq = int(row.get("filled_qty", 0))
+        if rq > 0 and fq > rq:
+            return False
+        filled += fq
 
     if required <= 0:
         return True
-    return filled >= required
+    return filled == required  # 초과 체결(모순)도 완료로 보지 않는다
 
 
 def _print_plan(plan: dict[str, Any], cfg: RunnerConfig) -> None:
