@@ -2009,12 +2009,9 @@ def _poll_and_finalize_orders(
                 )
 
         # remaining==0 만으로는 전량체결과 (부분체결 후) 취소를 구분할 수 없다 → 체결수량 확인.
-        row["is_filled"] = bool(
-            not row.get("status_error")
-            and row.get("remaining_qty", 0) == 0
-            and int(row.get("filled_qty", 0)) >= int(row.get("requested_qty", row.get("qty", 0)))
-            > 0
-        )
+        # 여기 남은 행은 반복 중 증권사의 체결 확인(is_filled)을 받지 못한 행이다. 수량만으로 완료를
+        # 만들어 내지 않는다 (증권사가 명시적으로 미체결/불확실이라고 한 것을 뒤집지 않는다).
+        row["is_filled"] = False
         row["timed_out"] = True
 
     return results
@@ -2122,6 +2119,8 @@ def _refresh_order_statuses(
             row["status_error"] = "order not found in status refresh"
             logger.error(f"[상태재조회] {order_id} 미발견 → 기존 값 유지(재주문 판단에 사용 안 함)")
             continue
+        prev_full = row.get("is_filled") is True
+        prev_req = int(row.get("requested_qty", 0) or 0)
         filled_qty = int(status.get("filled_qty", 0))
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
         remaining_qty = int(status.get("remaining_qty", 0))
@@ -2161,6 +2160,13 @@ def _refresh_order_statuses(
             and row["remaining_qty"] == 0
             and row["filled_qty"] >= row.get("requested_qty", 0) > 0
         )
+        full_target = max(prev_req, int(row.get("qty", 0) or 0))
+        if (prev_full and not row["is_filled"] and row["remaining_qty"] == 0
+                and full_target > 0 and row["filled_qty"] >= full_target and not contradictory):
+            # 체결수량은 감소하지 않는다. 앞서 전량 체결이 확인된 주문에 대해, 모순 없는 뒤늦은/오래된 보고
+            # (예: 4/10, remaining=0, is_filled=False)가 확인을 되돌리지 못하게 한다.
+            row["is_filled"] = True
+            row["requested_qty"] = full_target
         logger.info(
             f"[상태재조회] {row.get('display_name', row.get('ticker', order_id))} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"

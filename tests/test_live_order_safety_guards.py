@@ -507,6 +507,56 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertFalse(f([{k: v for k, v in part.items() if k != "cancel_confirmed"}], [retry]))
         self.assertFalse(f([part], [dict(retry, is_filled=False, timed_out=True)]))  # 재주문 체결 확인 없음
 
+    def _gate(self):
+        return isolated_functions("_is_side_fully_filled")["_is_side_fully_filled"]
+
+    def test_timeout_cleanup_does_not_manufacture_confirmation(self):
+        """증권사가 is_filled=False(order_qty=0, 체결 10/10, 잔량 0)로 답한 주문을 타임아웃 정리가 완료로 만들면 안 된다.
+        원주문(매도/매수)과 재주문 모두, 폴링 → 게이트 경로 전체로 확인."""
+        for side in ("SELL", "BUY"):
+            ns = self._poll_ns()
+            row = {"ticker": "a", "side": side, "submitted": True, "order_id": "1", "requested_qty": 10,
+                   "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+            class Broker:
+                def get_order_status(self, oid, today):
+                    return {"is_found": True, "order_qty": 0, "filled_qty": 10, "remaining_qty": 0, "is_filled": False}
+                def cancel_order(self, **kw):
+                    return {}
+            out = ns["_poll_and_finalize_orders"](Broker(), [row], 1, 1, "09:05", False)
+            self.assertFalse(out[0]["is_filled"], side)
+            self.assertTrue(out[0].get("timed_out"), side)
+            self.assertFalse(self._gate()(out, []), side)                      # 원주문
+            retry = dict(out[0], order_id="2", retry_from_order_id="0", qty=10)
+            part = {"ticker": "a", "order_id": "0", "qty": 10, "requested_qty": 10, "filled_qty": 0,
+                    "remaining_qty": 0, "cancel_confirmed": True}
+            self.assertFalse(self._gate()([part], [retry]), side)               # 재주문
+
+    def test_poll_confirmed_fill_then_stale_refresh_stays_confirmed(self):
+        """폴링으로 10/10 확정 후, 재조회가 오래된 4/10(remaining 0, is_filled False)을 돌려줘도 확인은 유지된다."""
+        poll = self._poll_ns()
+        row = {"ticker": "a", "side": "SELL", "submitted": True, "order_id": "1", "requested_qty": 10,
+               "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+        class Full:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 10, "remaining_qty": 0, "is_filled": True}
+        out = poll["_poll_and_finalize_orders"](Full(), [row], 1, 1, "09:05", False)
+        self.assertTrue(out[0]["is_filled"])
+        ref = self._refresh_ns()
+        class Stale:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": False}
+        ref["_refresh_order_statuses"](Stale(), out)
+        self.assertTrue(out[0]["is_filled"])
+        self.assertEqual(out[0]["filled_qty"], 10)
+        self.assertEqual(ref["_build_retry_orders"](out), [])
+        self.assertTrue(self._gate()(out, []))
+        # 하지만 잔량이 다시 보이는 보고는 확인을 되돌리고 완료로 보지 않는다
+        class Reopened:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 6, "is_filled": False}
+        ref["_refresh_order_statuses"](Reopened(), out)
+        self.assertFalse(self._gate()(out, []))
+
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
