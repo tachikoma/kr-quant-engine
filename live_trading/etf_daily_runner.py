@@ -2140,6 +2140,7 @@ def _refresh_order_statuses(
         prev_full = row.get("is_filled") is True and row.get("broker_confirmed_fill") is True
         prev_req = int(row.get("requested_qty", 0) or 0)
         filled_qty = int(status.get("filled_qty", 0))
+        raw_filled = max(filled_qty, 0)  # 증권사가 이번에 보고한 원본 체결수량 (과거 값과 합치기 전)
         order_qty = int(status.get("order_qty", row.get("requested_qty", 0)))
         remaining_qty = int(status.get("remaining_qty", 0))
         if filled_qty < int(row.get("filled_qty", 0)):
@@ -2173,10 +2174,11 @@ def _refresh_order_statuses(
             )
             logger.error(f"[상태재조회] {order_id} 수량 모순 → 재주문 차단: {row['status_error']}")
         # 일부 증권사(KIS)는 부분체결 후 취소도 is_filled=True 로 보고한다 → 체결수량으로 재검증.
+        # 새 전량 체결 확인은 증권사의 이번 원본 수량으로만 한다 (과거 값과 합친 수량으로 만들어 내지 않는다).
         row["is_filled"] = (
             bool(status.get("is_filled", False))
             and row["remaining_qty"] == 0
-            and row["filled_qty"] >= row.get("requested_qty", 0) > 0
+            and raw_filled >= row.get("requested_qty", 0) > 0
         )
         if row["is_filled"]:
             row["broker_confirmed_fill"] = True
@@ -2187,6 +2189,14 @@ def _refresh_order_statuses(
             # (예: 4/10, remaining=0, is_filled=False)가 확인을 되돌리지 못하게 한다.
             row["is_filled"] = True
             row["requested_qty"] = full_target
+        if (not row["is_filled"] and row["filled_qty"] > raw_filled and not contradictory
+                and not row.get("status_error")):
+            # 과거 행의 체결수량이 증권사의 이번 보고보다 크다(출처 확인 없음) → 상태 불확실, 재주문/완료 차단
+            row["cancel_confirmed"] = False
+            row["status_error"] = (
+                f"stale/contradictory fills: broker filled={raw_filled}, earlier row filled={row['filled_qty']}"
+            )
+            logger.error(f"[상태재조회] {order_id} {row['status_error']} → 재주문/완료 차단")
         logger.info(
             f"[상태재조회] {row.get('display_name', row.get('ticker', order_id))} → "
             f"filled={row['filled_qty']}/{row['requested_qty']}, remaining={row['remaining_qty']}"

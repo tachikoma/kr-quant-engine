@@ -619,6 +619,47 @@ class LiveOrderSafetyTests(unittest.TestCase):
         ref["_refresh_order_statuses"](Stale(), [confirmed])
         self.assertTrue(confirmed["is_filled"])
 
+    def test_kis_shaped_partial_cancel_cannot_launder_unconfirmed_history_via_refresh(self):
+        """Codex 재현(KIS 형태): 폴링 order_qty=0/체결 10/미확인 → 취소 대기 4/10 (is_filled=True, KIS 부분취소) →
+        재조회 동일 보고. 과거 병합 수량(10)으로 전량 체결 확인이 만들어지면 안 된다. 매도/매수 모두."""
+        for side in ("SELL", "BUY"):
+            poll = self._poll_ns()
+            row = {"ticker": "a", "side": side, "submitted": True, "order_id": "1", "requested_qty": 10,
+                   "qty": 10, "filled_qty": 0, "remaining_qty": 10, "is_filled": False}
+            class Poll:
+                def get_order_status(self, oid, today):
+                    return {"is_found": True, "order_qty": 0, "filled_qty": 10, "remaining_qty": 0, "is_filled": False}
+                def cancel_order(self, **kw):
+                    return {}
+            out = poll["_poll_and_finalize_orders"](Poll(), [row], 1, 1, "09:05", True)
+            kis_partial = {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": True}
+            wait = isolated_functions("_wait_for_cancellations")
+            wait["time"] = SimpleNamespace(sleep=lambda x: None)
+            wait["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+            class Br:
+                def get_order_status(self, oid, today):
+                    return kis_partial
+            wait["_wait_for_cancellations"](Br(), out, timeout_sec=0)
+            ref = self._refresh_ns()
+            ref["_refresh_order_statuses"](Br(), out)
+            self.assertFalse(out[0]["is_filled"], side)
+            self.assertIsNot(out[0].get("broker_confirmed_fill"), True, side)
+            self.assertIn("stale/contradictory", out[0].get("status_error", ""), side)  # 사유가 남는다
+            self.assertEqual(ref["_build_retry_orders"](out), [], side)
+            self.assertFalse(self._gate()(out, []), side)
+
+    def test_genuine_kis_partial_cancel_still_retries_after_refresh(self):
+        """정상 KIS 부분취소(과거 값과 모순 없음)는 여전히 4주 체결 + 6주 재주문 대상."""
+        ref = self._refresh_ns()
+        row = {"ticker": "a", "submitted": True, "order_id": "1", "qty": 10, "requested_qty": 10,
+               "filled_qty": 4, "remaining_qty": 0, "cancel_submitted": True, "cancel_confirmed": True}
+        class Br:
+            def get_order_status(self, oid, today):
+                return {"is_found": True, "order_qty": 10, "filled_qty": 4, "remaining_qty": 0, "is_filled": True}
+        ref["_refresh_order_statuses"](Br(), [row])
+        self.assertFalse(row["is_filled"])
+        self.assertEqual([r["qty"] for r in ref["_build_retry_orders"]([row])], [6])
+
     def test_buy_gate_uses_side_check_on_sell_results(self):
         """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
