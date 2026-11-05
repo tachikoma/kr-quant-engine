@@ -460,6 +460,23 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertFalse(f([prim("A", 4)], [{"qty": 6, "filled_qty": 7, "remaining_qty": 0,
                                               "retry_from_order_id": "A", "order_id": "rA"}]))
 
+    def test_retry_parent_link_survives_uncertain_exit(self):
+        """ID 누락(불확실)로 중단돼도 이미 접수된 재주문 행의 원주문 연결이 남는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._submit_ns(tmp)
+            class Broker:
+                n = 0
+                def place_order(self, **kw):
+                    Broker.n += 1
+                    return {"order_id": "R1"} if Broker.n == 1 else {}
+            with self.assertRaises(RuntimeError) as cm:
+                ns["_submit_orders"](Broker(), "SELL", [
+                    {"ticker": "a", "qty": 6, "retry_from_order_id": "A"},
+                    {"ticker": "b", "qty": 1, "retry_from_order_id": "B"}], False)
+            rows = cm.exception.results
+            self.assertEqual(rows[0]["order_id"], "R1")
+            self.assertEqual(rows[0].get("retry_from_order_id"), "A")
+
     def test_submit_orders_preserves_retry_parent_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             ns = self._submit_ns(tmp)

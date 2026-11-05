@@ -1769,124 +1769,126 @@ def _submit_orders(
             if par:
                 r["retry_from_order_id"] = par
 
-    for order in orders:
-        ticker = str(order.get("ticker"))
-        display_name = str(order.get("display_name", ticker))
-        qty = int(order.get("qty", 0))
-        if qty <= 0:
-            continue
-        parents.append(str(order.get("retry_from_order_id", "") or ""))
+    try:
+        for order in orders:
+            ticker = str(order.get("ticker"))
+            display_name = str(order.get("display_name", ticker))
+            qty = int(order.get("qty", 0))
+            if qty <= 0:
+                continue
+            parents.append(str(order.get("retry_from_order_id", "") or ""))
 
-        if dry_run:
-            results.append(
-                {
-                    "ticker": ticker,
-                    "display_name": display_name,
-                    "side": side,
-                    "attempt": attempt,
-                    "order_type": order_type,
-                    "qty": qty,
-                    "requested_qty": qty,
-                    "filled_qty": 0,
-                    "remaining_qty": qty,
-                    "is_filled": False,
-                    "submitted": False,
-                    "mode": "DRY_RUN",
-                    "order_id": "",
-                }
-            )
-            continue
-
-        if cutoff_hhmm and os.environ.get("ALLOW_LATE_LIVE_ORDERS") != "1":
-            _now = _now_kst()
-            _cut = dt.datetime.combine(_now.date(), _parse_hhmm(cutoff_hhmm), tzinfo=_now.tzinfo)
-            if _now >= _cut:
-                logger.error(f"[안전차단] {side} {ticker}: 제출 시각이 컷오프({cutoff_hhmm}) 이후 → 미전송")
+            if dry_run:
                 results.append(
                     {
-                        "ticker": ticker, "display_name": display_name, "side": side,
-                        "attempt": attempt, "order_type": order_type, "qty": qty,
-                        "requested_qty": qty, "filled_qty": 0, "remaining_qty": qty,
-                        "is_filled": False, "submitted": False, "mode": "LIVE",
-                        "order_id": "", "error": "cutoff passed", "error_code": "CUTOFF_BLOCKED",
+                        "ticker": ticker,
+                        "display_name": display_name,
+                        "side": side,
+                        "attempt": attempt,
+                        "order_type": order_type,
+                        "qty": qty,
+                        "requested_qty": qty,
+                        "filled_qty": 0,
+                        "remaining_qty": qty,
+                        "is_filled": False,
+                        "submitted": False,
+                        "mode": "DRY_RUN",
+                        "order_id": "",
                     }
                 )
                 continue
-        try:
-            intent_id = _write_live_order_intent(side, ticker, qty, attempt)
-        except Exception as exc:
-            # 원장 기록 실패 → 이 주문은 전송하지 않음. 이미 접수된 주문 정보는 보존해 알린다.
-            raise OrderSubmissionUncertain(
-                f"Journal write failed before {side} {ticker}; nothing sent for this order", results
-            ) from exc
-        try:
-            response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
-            order_id = response.get("order_id", "")
-            if not order_id:
-                # 접수 여부 불명 (주문번호 없음) → 추가 주문 차단
-                raise OrderSubmissionUncertain(
-                    f"Broker response without order_id for {side} {ticker}; reconcile broker first",
-                    results,
-                )
-            _update_live_order_intent(intent_id, "ACKED", str(order_id))
-            _RUN_ACKED.append({"side": side, "ticker": ticker, "qty": qty, "order_id": str(order_id)})
-            results.append(
-                {
-                    "ticker": ticker,
-                    "display_name": display_name,
-                    "side": side,
-                    "attempt": attempt,
-                    "order_type": order_type,
-                    "qty": qty,
-                    "requested_qty": qty,
-                    "filled_qty": 0,
-                    "remaining_qty": qty,
-                    "is_filled": False,
-                    "submitted": True,
-                    "mode": "LIVE",
-                    "order_id": order_id,
-                    "response": response.get("response", {}),
-                }
-            )
-            if notifier is not None:
-                notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
-        except OrderSubmissionUncertain:
-            raise
-        except Exception as exc:
-            error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
-            definite = _is_definite_rejection(exc)
-            if definite:
-                _update_live_order_intent(intent_id, "REJECTED")
-            results.append(
-                {
-                    "ticker": ticker,
-                    "display_name": display_name,
-                    "side": side,
-                    "attempt": attempt,
-                    "order_type": order_type,
-                    "qty": qty,
-                    "requested_qty": qty,
-                    "filled_qty": 0,
-                    "remaining_qty": qty,
-                    "is_filled": False,
-                    "submitted": False,
-                    "mode": "LIVE",
-                    "order_id": "",
-                    "error": str(exc),
-                    "error_code": error_code,
-                }
-            )
-            if notifier is not None:
-                notifier.notify_order_error(side, display_name, qty, exc)
-            if not definite:
-                # 전송 예외는 거절의 증거가 아님 → 이후 모든 제출 중단 (원장 유지)
-                _attach_parents()
-                raise OrderSubmissionUncertain(
-                    f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first",
-                    results,
-                ) from exc
 
-    _attach_parents()
+            if cutoff_hhmm and os.environ.get("ALLOW_LATE_LIVE_ORDERS") != "1":
+                _now = _now_kst()
+                _cut = dt.datetime.combine(_now.date(), _parse_hhmm(cutoff_hhmm), tzinfo=_now.tzinfo)
+                if _now >= _cut:
+                    logger.error(f"[안전차단] {side} {ticker}: 제출 시각이 컷오프({cutoff_hhmm}) 이후 → 미전송")
+                    results.append(
+                        {
+                            "ticker": ticker, "display_name": display_name, "side": side,
+                            "attempt": attempt, "order_type": order_type, "qty": qty,
+                            "requested_qty": qty, "filled_qty": 0, "remaining_qty": qty,
+                            "is_filled": False, "submitted": False, "mode": "LIVE",
+                            "order_id": "", "error": "cutoff passed", "error_code": "CUTOFF_BLOCKED",
+                        }
+                    )
+                    continue
+            try:
+                intent_id = _write_live_order_intent(side, ticker, qty, attempt)
+            except Exception as exc:
+                # 원장 기록 실패 → 이 주문은 전송하지 않음. 이미 접수된 주문 정보는 보존해 알린다.
+                raise OrderSubmissionUncertain(
+                    f"Journal write failed before {side} {ticker}; nothing sent for this order", results
+                ) from exc
+            try:
+                response = api.place_order(side=side, ticker=ticker, qty=qty, order_type=order_type)
+                order_id = response.get("order_id", "")
+                if not order_id:
+                    # 접수 여부 불명 (주문번호 없음) → 추가 주문 차단
+                    raise OrderSubmissionUncertain(
+                        f"Broker response without order_id for {side} {ticker}; reconcile broker first",
+                        results,
+                    )
+                _update_live_order_intent(intent_id, "ACKED", str(order_id))
+                _RUN_ACKED.append({"side": side, "ticker": ticker, "qty": qty, "order_id": str(order_id)})
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "display_name": display_name,
+                        "side": side,
+                        "attempt": attempt,
+                        "order_type": order_type,
+                        "qty": qty,
+                        "requested_qty": qty,
+                        "filled_qty": 0,
+                        "remaining_qty": qty,
+                        "is_filled": False,
+                        "submitted": True,
+                        "mode": "LIVE",
+                        "order_id": order_id,
+                        "response": response.get("response", {}),
+                    }
+                )
+                if notifier is not None:
+                    notifier.notify_order_submitted(side, display_name, qty, order_id, attempt)
+            except OrderSubmissionUncertain:
+                raise
+            except Exception as exc:
+                error_code = exc.msg_cd if hasattr(exc, "msg_cd") else ""
+                definite = _is_definite_rejection(exc)
+                if definite:
+                    _update_live_order_intent(intent_id, "REJECTED")
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "display_name": display_name,
+                        "side": side,
+                        "attempt": attempt,
+                        "order_type": order_type,
+                        "qty": qty,
+                        "requested_qty": qty,
+                        "filled_qty": 0,
+                        "remaining_qty": qty,
+                        "is_filled": False,
+                        "submitted": False,
+                        "mode": "LIVE",
+                        "order_id": "",
+                        "error": str(exc),
+                        "error_code": error_code,
+                    }
+                )
+                if notifier is not None:
+                    notifier.notify_order_error(side, display_name, qty, exc)
+                if not definite:
+                    # 전송 예외는 거절의 증거가 아님 → 이후 모든 제출 중단 (원장 유지)
+                    raise OrderSubmissionUncertain(
+                        f"Order submission outcome uncertain for {side} {ticker}; reconcile broker first",
+                        results,
+                    ) from exc
+
+    finally:
+        _attach_parents()  # 어떤 예외로 빠져나가도(원장 쓰기 실패·ID 누락·불확실) 연결 정보를 남긴다
+
     return results
 
 
