@@ -2234,12 +2234,25 @@ def _build_failed_retry_orders(
 
 
 def _is_side_fully_filled(primary: list[dict[str, Any]], retry: list[dict[str, Any]]) -> bool:
+    """한 쪽(매도/매수)의 모든 주문이 '확정적으로' 전량 체결됐는지.
+
+    체결수량 합만으로 판단하지 않는다: 잔량이 남은 주문(원주문 생존 가능)이나 상태 조회 오류/수량 모순이
+    있으면 완료로 보지 않는다 (매도 완료로 오판해 매수 단계로 넘어가는 것을 막는다).
+    원주문의 체결수량은 자기 요청수량을 넘지 못하게 잘라 과체결 보고가 다른 주문의 미체결을 가리지 않게 한다.
+    """
     required = 0
     filled = 0
 
+    for row in (*primary, *retry):
+        if row.get("status_error"):
+            return False  # 최종 상태 불확실
+        if int(row.get("remaining_qty", 0) or 0) > 0:
+            return False  # 살아 있는 잔량
+
     for row in primary:
-        required += int(row.get("requested_qty", row.get("qty", 0)))
-        filled += int(row.get("filled_qty", 0))
+        req = int(row.get("requested_qty", row.get("qty", 0)))
+        required += req
+        filled += min(int(row.get("filled_qty", 0)), req) if req > 0 else 0
 
     for row in retry:
         filled += int(row.get("filled_qty", 0))

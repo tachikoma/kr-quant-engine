@@ -343,6 +343,44 @@ class LiveOrderSafetyTests(unittest.TestCase):
             self.assertIn("inconsistent quantities", row.get("status_error", ""), (filled, remaining))
             self.assertEqual(ns["_build_retry_orders"]([row]), [], (filled, remaining))
 
+    def _side_ns(self):
+        return isolated_functions("_is_side_fully_filled")
+
+    def test_side_not_filled_when_remaining_or_error_even_if_filled_sum_matches(self):
+        """매도 10주 / 체결 10주 / 잔량 1주 (is_filled=False) 와 상태 조회 오류는 '완료'가 아니다."""
+        f = self._side_ns()["_is_side_fully_filled"]
+        base = {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
+                "filled_qty": 10, "remaining_qty": 0, "is_filled": True}
+        self.assertTrue(f([dict(base)], []))
+        self.assertFalse(f([dict(base, remaining_qty=1, is_filled=False)], []))
+        self.assertFalse(f([dict(base, status_error="refresh failed: x")], []))
+        self.assertFalse(f([dict(base)], [dict(base, order_id="2", remaining_qty=3)]))   # 재주문 쪽 잔량
+        self.assertFalse(f([dict(base)], [dict(base, order_id="2", status_error="e")]))  # 재주문 쪽 오류
+
+    def test_side_partial_fill_cancel_retry_still_counts_as_filled(self):
+        f = self._side_ns()["_is_side_fully_filled"]
+        primary = {"ticker": "a", "submitted": True, "order_id": "1", "requested_qty": 10,
+                   "filled_qty": 4, "remaining_qty": 0, "cancel_confirmed": True}
+        retry = {"ticker": "a", "submitted": True, "order_id": "2", "requested_qty": 6,
+                 "filled_qty": 6, "remaining_qty": 0, "retry_from_order_id": "1"}
+        self.assertTrue(f([primary], [retry]))
+        self.assertFalse(f([primary], [dict(retry, filled_qty=5)]))
+        self.assertFalse(f([primary], []))
+
+    def test_side_overfill_report_does_not_mask_other_unfilled_order(self):
+        f = self._side_ns()["_is_side_fully_filled"]
+        a = {"ticker": "a", "order_id": "1", "requested_qty": 10, "filled_qty": 15, "remaining_qty": 0}
+        b = {"ticker": "b", "order_id": "2", "requested_qty": 10, "filled_qty": 5, "remaining_qty": 0}  # 합 20 = 요청 합 20
+        self.assertFalse(f([a, b], []))
+
+    def test_buy_gate_uses_side_check_on_sell_results(self):
+        """구조(AST): _run_daily_locked 의 can_buy 는 dry_run 이 아니면 _is_side_fully_filled(sell...) 결과만 따른다."""
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_daily_locked"][0]
+        gates = [ast.unparse(n.value) for n in ast.walk(fn)
+                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "can_buy" for t in n.targets)]
+        self.assertIn("dry_run or _is_side_fully_filled(sell_results, sell_retry_results)", gates)
+
     def test_refresh_failure_blocks_retry(self):
         ns = self._refresh_ns()
         for exc_or_status in (TimeoutError("x"), {"is_found": False, "remaining_qty": 0}):
