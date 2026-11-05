@@ -150,6 +150,7 @@ GitHub 워크플로(`daily_runner*.yml`)가 이 값을 전역 `LIVE_ORDER_ENABLE
   계좌번호·토큰·키는 가린다.
 
 ### 결과 기록 템플릿
+전체 양식(표 형식, 브로커 1개당 1부)은 `docs/mock_trading_result_template.md`. 아래는 요약본이다.
 ```
 브로커/모드/커밋:
 일시(KST):
