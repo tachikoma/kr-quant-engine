@@ -71,7 +71,10 @@ class OrderStatusTests(unittest.TestCase):
     def test_row_without_order_number_never_matches(self):
         row = _row()
         del row["itg_orr_no"]
-        self.assertFalse(_Stub(_resp(row)).get_order_status("0").get("is_found"))
+        stub = _Stub(_resp(row))  # 3014 는 등록돼 있으므로 행 검사까지 실제로 도달한다
+        st = stub.get_order_status("3014")
+        self.assertEqual(len(stub.calls), 1)
+        self.assertFalse(st["is_found"])
 
     def test_open_order(self):
         st = _Stub(_resp(_row(orr_qty=2, tot_cns_qty=0, ny_cns_qty=2))).get_order_status("3014")
@@ -168,6 +171,67 @@ class IdentityTests(unittest.TestCase):
         )
 
 
+class RegistryCollisionTests(unittest.TestCase):
+    """번호가 겹치면 먼저 낸 주문의 신원을 덮어쓰지 않는다 (Codex P1)."""
+
+    def _place(self, stub, resp, ticker="069500", side="SELL"):
+        stub._response = resp
+        os.environ["LIVE_ORDER_ENABLED"] = "1"
+        try:
+            return stub.place_order(side, ticker, 1, None, "MARKET")
+        finally:
+            os.environ.pop("LIVE_ORDER_ENABLED", None)
+
+    def test_normalised_duplicate_order_numbers_make_both_unresolved(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"ord_no": "7", "mkt_orr_no": "101", "itg_orr_no": "201"}})
+        self._place(stub, {"Output_0": {"ord_no": "007", "mkt_orr_no": "102", "itg_orr_no": "202"}},
+                    ticker="229200")
+        # A 는 미체결, B 는 체결 — 어느 쪽 조회도 B 의 체결로 확정되면 안 된다.
+        stub._response = _resp(
+            _row(itg_orr_no=201, iem_cd="069500", sby_dit_cd_nm="현금매도", orr_qty=1,
+                 tot_cns_qty=0, ny_cns_qty=1),
+            _row(itg_orr_no=202, iem_cd="229200", sby_dit_cd_nm="현금매도"),
+        )
+        for oid in ("7", "007"):
+            st = stub.get_order_status(oid)
+            self.assertFalse(st["is_found"], oid)
+            self.assertFalse(st["is_filled"], oid)
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order(oid, "069500")
+
+    def test_exact_reused_order_number_is_a_conflict(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        r = {"Output_0": {"mkt_orr_no": "55", "itg_orr_no": "66"}}
+        self._place(stub, r)
+        self._place(stub, r)
+        self.assertFalse(stub.get_order_status("55")["is_found"])
+
+    def test_two_orders_sharing_one_inquiry_number_are_both_unresolved(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"mkt_orr_no": "10", "itg_orr_no": "99"}})
+        self._place(stub, {"Output_0": {"mkt_orr_no": "11", "itg_orr_no": "099"}})
+        stub._response = _resp(_row(itg_orr_no=99, sby_dit_cd_nm="현금매도"))
+        for oid in ("10", "11"):
+            self.assertFalse(stub.get_order_status(oid)["is_found"], oid)
+
+    def test_distinct_orders_stay_independent(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"mkt_orr_no": "10", "itg_orr_no": "98"}})
+        self._place(stub, {"Output_0": {"mkt_orr_no": "11", "itg_orr_no": "99"}}, ticker="229200")
+        stub._response = _resp(
+            _row(itg_orr_no=98, sby_dit_cd_nm="현금매도"),
+            _row(itg_orr_no=99, iem_cd="229200", sby_dit_cd_nm="현금매도", tot_cns_qty=0,
+                 ny_cns_qty=1),
+        )
+        self.assertTrue(stub.get_order_status("10")["is_filled"])
+        self.assertFalse(stub.get_order_status("11")["is_filled"])
+
+
 class CancelEvidenceTests(unittest.TestCase):
     """거부/알 수 없는 행은 취소 확정이 될 수 없다 (Codex P1-2)."""
 
@@ -183,12 +247,32 @@ class CancelEvidenceTests(unittest.TestCase):
         st = self._st(tot_cns_qty=0, ny_cns_qty=0, can_qty=0)
         self.assertGreater(st["remaining_qty"], 0)
 
-    def test_missing_or_garbage_open_quantity_is_not_zero(self):
-        for bad in (None, "", "abc", -1):
-            row = _row(tot_cns_qty=0, can_qty=0)
-            row["ny_cns_qty"] = bad
-            st = _Stub(_resp(row)).get_order_status("3014")
-            self.assertGreater(st["remaining_qty"], 0, bad)
+    def test_absent_open_quantity_is_derived_not_zero(self):
+        row = _row(tot_cns_qty=0, can_qty=0)
+        del row["ny_cns_qty"]
+        st = _Stub(_resp(row)).get_order_status("3014")
+        self.assertGreater(st["remaining_qty"], 0)
+
+    def test_present_but_invalid_quantities_are_unresolved_even_with_cancel_evidence(self):
+        # 값이 있는데 잘못된 필드는 취소/체결 확정에 쓰이지 않는다 (Codex P2).
+        bad_values = (None, "", "abc", -1, "-1", 0.9, -0.9, "0.9", True, [], {})
+        for field in ("ny_cns_qty", "can_qty", "tot_cns_qty", "orr_qty"):
+            for bad in bad_values:
+                row = _row(orr_qty=1, tot_cns_qty=0, ny_cns_qty=0, can_qty=1)
+                row[field] = bad
+                st = _Stub(_resp(row)).get_order_status("3014")
+                self.assertFalse(st["is_found"], (field, bad))
+                self.assertFalse(st["is_filled"], (field, bad))
+
+    def test_fractional_quantities_never_become_a_confirmed_fill(self):
+        st = _Stub(_resp(_row(orr_qty="1.9", tot_cns_qty="1.1"))).get_order_status("3014")
+        self.assertFalse(st["is_found"])
+        st = _Stub(_resp(_row(can_qty=0.9))).get_order_status("3014")
+        self.assertFalse(st["is_filled"])
+
+    def test_integer_like_inputs_are_accepted(self):
+        st = _Stub(_resp(_row(orr_qty="1", tot_cns_qty="1", ny_cns_qty="0", can_qty=0.0))).get_order_status("3014")
+        self.assertTrue(st["is_filled"])
 
     def test_unknown_order_or_fill_quantity_is_unresolved(self):
         for k in ("orr_qty", "tot_cns_qty"):
@@ -243,10 +327,20 @@ class CancelRequestTests(unittest.TestCase):
         with self.assertRaises(nh_adapter.NhApiError):
             stub.cancel_order("3014", "069500")
 
-    def test_non_numeric_order_id_is_rejected_before_sending(self):
+    def test_non_numeric_market_number_is_rejected_before_sending(self):
         stub = _Stub({"rsp_cd": "00000"})
+        stub.register("abc", itg="1", mkt="abc")
         with self.assertRaises(ValueError):
             stub.cancel_order("abc", "069500")
+        self.assertEqual(stub.calls, [])
+
+    def test_cancel_refused_without_confirmed_market_number(self):
+        # 미등록(재시작/다른 프로세스), 응답에 mkt_orr_no 없음 -> 취소를 보내지 않는다 (Codex P2).
+        stub = _Stub({"rsp_cd": "00000"})
+        stub.register("7", itg="201", mkt="")
+        for oid in ("7", "9999"):
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order(oid, "069500")
         self.assertEqual(stub.calls, [])
 
 
