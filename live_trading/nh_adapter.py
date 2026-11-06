@@ -78,7 +78,8 @@ def _canon_no(v: Any) -> str:
     if isinstance(v, bool) or v is None:
         return ""
     if isinstance(v, int):
-        return str(v) if v >= 0 else ""
+        t = str(v) if v >= 0 else ""
+        return t if t and len(t) <= 18 else ""
     if not isinstance(v, str):
         return ""
     t = v.strip()
@@ -806,11 +807,23 @@ class NhAdapter:
         reg = self._order_registry()
         burned = self._burned_numbers()
         key = _canon_no(order_id)
-        if not key:
-            # 주문번호를 정식 표기로 쓸 수 없으면 이 주문은 등록하지 않는다(상태 조회 미확정, 취소 거부).
-            logger.warning("[NH] 주문번호 %r 를 신원으로 쓸 수 없어 등록하지 않습니다", order_id)
-            return
         mine = self._numbers_of(key, rec)
+        if not key:
+            # 주문번호를 정식 표기로 쓸 수 없으면 이 주문은 저장하지 않는다(상태 조회 미확정, 취소 거부).
+            # 그래도 이 주문이 가진 유효한 itg/mkt 번호는 다른 주문과 겹치는지 검사하고 항상 burn 한다.
+            logger.warning("[NH] 주문번호 %r 를 신원으로 쓸 수 없어 등록하지 않습니다", order_id)
+            mine.pop("key")
+            for ns, val in mine.items():
+                if not val:
+                    continue
+                for k, v in reg.items():
+                    if self._numbers_of(k, v)[ns] == val:
+                        v["conflict"] = "1"
+                        for ns2, val2 in self._numbers_of(k, v).items():
+                            if val2:
+                                burned[ns2].add(val2)
+                burned[ns].add(val)
+            return
         clashed: list[str] = []
         hit = False
         for ns, val in mine.items():

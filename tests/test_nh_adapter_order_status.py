@@ -292,8 +292,38 @@ class CanonicalNumberTests(unittest.TestCase):
         for good, want in (("7", "7"), (" 007 ", "7"), (7, "7"), ("0", "0"), ("000", "0"), (0, "0")):
             self.assertEqual(c(good), want, good)
         for bad in ("+7", "-7", "７", "٧", "0_7", "7.0", "1e2", "", " ", "  ", None, True, 7.0,
-                    -1, "1" * 19, "abc", [], {}):
+                    -1, "1" * 19, "abc", [], {}, 10**18, "1" * 19):
             self.assertEqual(c(bad), "", bad)
+        self.assertEqual(c(10**17), str(10**17))
+        self.assertEqual(c("1" * 18), "1" * 18)
+        self.assertEqual(c(int("1" * 18)), "1" * 18)
+
+    def test_invalid_key_still_burns_and_conflicts_secondary_numbers(self):
+        first_ids = (("1", "+2"), ("+2", "1"))
+        for a_id, b_id in first_ids:
+            stub = _Stub({})
+            stub._order_registry().clear()
+            self._place(stub, {"ord_no": a_id, "mkt_orr_no": "7", "itg_orr_no": "21"})
+            self._place(stub, {"ord_no": b_id, "mkt_orr_no": "7", "itg_orr_no": "21"})
+            reg = stub._order_registry()
+            for rec in reg.values():
+                self.assertEqual(rec.get("conflict"), "1", (a_id, b_id))
+            self.assertIn("21", stub._burned_numbers()["itg"])
+            self.assertIn("7", stub._burned_numbers()["mkt"])
+            n = len(stub.calls)
+            for oid in ("1", "+2"):
+                with self.assertRaises(RuntimeError):
+                    stub.cancel_order(oid, "069500")
+                self.assertFalse(stub.get_order_status(oid)["is_found"])
+
+    def test_oversized_int_numbers_not_registered(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"ord_no": "1", "mkt_orr_no": 10**18, "itg_orr_no": 10**18})
+        self.assertEqual(stub._order_registry()["1"]["mkt"], "")
+        self.assertEqual(stub._order_registry()["1"]["itg"], "")
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("1", "069500")
 
     def _place(self, stub, out0, ticker="069500", side="SELL"):
         stub._response = {"Output_0": out0, "rsp_cd": "00000"}
