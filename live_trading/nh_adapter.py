@@ -753,9 +753,10 @@ class NhAdapter:
             out0.get("mkt_orr_no") if isinstance(out0, dict) else None,
             out0.get("itg_orr_no") if isinstance(out0, dict) else None,
         )
-        if order_id:
-            # 취소는 mkt_orr_no, 상태 조회는 itg_orr_no. 두 번호 체계가 같다고 가정하지 않고 주문별로 기억한다.
-            is_d = isinstance(out0, dict)
+        # 취소는 mkt_orr_no, 상태 조회는 itg_orr_no. 두 번호 체계가 같다고 가정하지 않고 주문별로 기억한다.
+        # order_id 가 비어 있어도 응답의 itg/mkt 번호는 충돌 검사와 burn 에 반영한다(저장은 하지 않음).
+        is_d = isinstance(out0, dict)
+        if order_id or (is_d and (out0.get("itg_orr_no") is not None or out0.get("mkt_orr_no") is not None)):
             self._register_order(
                 order_id,
                 {
@@ -898,12 +899,11 @@ class NhAdapter:
                 rows.extend([r for r in v if isinstance(r, dict)])
 
         want = rec["itg"]
-        target: dict[str, Any] = {}
-        for r in rows:
-            got = _canon_no(r.get("itg_orr_no"))
-            if got and got == want:
-                target = r
-                break
+        matches = [r for r in rows if _canon_no(r.get("itg_orr_no")) == want]
+        # 같은 번호의 행이 둘 이상이면 내용이 모두 같을 때만 쓴다. 서로 다르면 어느 쪽이 맞는지 알 수 없다.
+        if len(matches) > 1 and any(m != matches[0] for m in matches[1:]):
+            return self._unresolved(order_id, data)
+        target: dict[str, Any] = matches[0] if matches else {}
         # 주문번호가 일치하지 않는 행은 절대 대체 사용하지 않는다 (타 주문의 잔량을 오인 → 중복 주문).
         if not target:
             return self._unresolved(order_id, data)

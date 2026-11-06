@@ -316,6 +316,20 @@ class CanonicalNumberTests(unittest.TestCase):
                     stub.cancel_order(oid, "069500")
                 self.assertFalse(stub.get_order_status(oid)["is_found"])
 
+    def test_empty_primary_id_still_burns_secondary_numbers(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"ord_no": "1", "mkt_orr_no": "7", "itg_orr_no": "21"})
+        self._place(stub, {"ord_no": " ", "itg_orr_no": "21"})
+        self.assertEqual(stub._order_registry()["1"].get("conflict"), "1")
+        self.assertIn("21", stub._burned_numbers()["itg"])
+        stub._response = _resp(_row(itg_orr_no=21, iem_cd="069500", sby_dit_cd_nm="현금매도"))
+        self.assertFalse(stub.get_order_status("1")["is_found"])
+        n = len(stub.calls)
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("1", "069500")
+        self.assertEqual(len(stub.calls), n)
+
     def test_oversized_int_numbers_not_registered(self):
         stub = _Stub({})
         stub._order_registry().clear()
@@ -388,6 +402,24 @@ class CanonicalNumberTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             stub.cancel_order("3", "069500")
         self.assertEqual(len(stub.calls), n)
+
+
+class DuplicateRowTests(unittest.TestCase):
+    def _status(self, rows):
+        stub = _Stub(_resp(*rows))
+        return stub.get_order_status("3014", today="20261106")
+
+    def test_contradicting_rows_are_unresolved_in_both_orders(self):
+        cancelled = _row(orr_qty=1, tot_cns_qty=0, ny_cns_qty=0, can_qty=1)
+        open_ = _row(orr_qty=1, tot_cns_qty=0, ny_cns_qty=1, can_qty=0)
+        for rows in ((cancelled, open_), (open_, cancelled)):
+            st = self._status(list(rows))
+            self.assertFalse(st["is_found"])
+
+    def test_identical_duplicate_rows_are_accepted(self):
+        st = self._status([_row(), _row()])
+        self.assertTrue(st["is_found"])
+        self.assertTrue(st["is_filled"])
 
 
 class CancelEvidenceTests(unittest.TestCase):
