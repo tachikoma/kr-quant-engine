@@ -799,6 +799,9 @@ class AdapterRowMatchTests(unittest.TestCase):
 
     ROW_OTHER = {"ord_no": "999", "ord_qty": "10", "ccld_qty": "4", "rmn_qty": "0"}
     ROW_SELF = {"ord_no": "123", "ord_qty": "10", "ccld_qty": "10", "rmn_qty": "0"}
+    # NH 모의서버 실응답 필드 (itg_orr_no/orr_qty/tot_cns_qty/ny_cns_qty)
+    NH_OTHER = {"itg_orr_no": 999, "orr_qty": 10, "tot_cns_qty": 4, "ny_cns_qty": 0}
+    NH_SELF = {"itg_orr_no": 123, "orr_qty": 10, "tot_cns_qty": 10, "ny_cns_qty": 0}
 
     def _kb(self, rows):
         from live_trading.kb_adapter import KbAdapter
@@ -814,14 +817,15 @@ class AdapterRowMatchTests(unittest.TestCase):
         return a
 
     def test_single_foreign_row_is_not_found(self):
-        for make in (self._kb, self._nh):
-            st = make([self.ROW_OTHER]).get_order_status("123")
+        for make, other in ((self._kb, self.ROW_OTHER), (self._nh, self.NH_OTHER)):
+            st = make([other]).get_order_status("123")
             self.assertFalse(st["is_found"], make.__name__)
             self.assertFalse(st["is_filled"])
 
     def test_matching_row_is_used(self):
-        for make in (self._kb, self._nh):
-            st = make([self.ROW_OTHER, self.ROW_SELF]).get_order_status("123")
+        for make, other, own in ((self._kb, self.ROW_OTHER, self.ROW_SELF),
+                                 (self._nh, self.NH_OTHER, self.NH_SELF)):
+            st = make([other, own]).get_order_status("123")
             self.assertTrue(st["is_found"], make.__name__)
             self.assertEqual(st["filled_qty"], 10)
 
@@ -829,9 +833,9 @@ class AdapterRowMatchTests(unittest.TestCase):
         ns = isolated_functions("_wait_for_cancellations")
         ns["time"] = SimpleNamespace(sleep=lambda x: None)
         ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
-        for make in (self._kb, self._nh):
+        for make, other in ((self._kb, self.ROW_OTHER), (self._nh, self.NH_OTHER)):
             row = {"ticker": "a", "order_id": "123", "cancel_submitted": True}
-            ns["_wait_for_cancellations"](make([self.ROW_OTHER]), [row], timeout_sec=0)
+            ns["_wait_for_cancellations"](make([other]), [row], timeout_sec=0)
             self.assertNotIn("cancel_confirmed", row, make.__name__)
 
 if __name__ == "__main__":

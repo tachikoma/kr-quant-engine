@@ -163,6 +163,13 @@ GitHub 워크플로(`daily_runner*.yml`)가 이 값을 전역 `LIVE_ORDER_ENABLE
 ```
 
 ## 알려진 한계
+- **NH 주문 상태 조회/취소 (2026-11-06 모의 실측 후 수정):** 첫 `--with-order`에서 시장가 매수는 체결됐으나 어댑터가
+  없는 필드(`ord_no`/`ord_qty`/`ccld_qty`)를 찾아 `is_found=False`로 답했다(1주 잔존). 실응답 기준
+  `itg_orr_no/orr_qty/tot_cns_qty/ny_cns_qty/can_qty`로 고쳤고, 취소 요청도 `org_mkt_orr_no/all_pat_dit_cd/cor_qty`로
+  바꾸고 실패 응답(`rsp_cd`)을 "요청됨"으로 보지 않게 했다. **미검증:** 주문 응답의 `mkt_orr_no`(취소 키)와 조회 행의
+  `itg_orr_no`가 같은 번호인지, 취소된 주문 행이 `can_qty`/`ny_cns_qty`를 어떻게 보고하는지. 재검증 때 로그의
+  `[NH] 주문응답 번호 mkt_orr_no=… itg_orr_no=…`를 확인하고, 두 번호가 다르면 즉시 중단·보고한다
+  (다르면 상태 조회가 주문을 못 찾아 매수가 막히는 쪽으로 실패한다).
 - 프리플라이트 Stage 2와 위 시나리오는 실제 증권사 모의 서버로 실행해 본 적이 없다(작성 시점 기준 mock 검증만 완료).
 - KB는 모의투자가 없고 주문 필드 매핑이 미확정이라 이 게이트로 주문 동작을 검증할 수 없다. 아래 KB 절차의 선행 조건을 충족하기 전에는 KB를 운영에 쓰지 않는다.
 - DEBUG 로그에는 키움·KB·NH 토큰 응답이 남을 수 있다. 검증·운영 모두 `LOG_LEVEL=INFO`.
