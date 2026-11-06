@@ -69,12 +69,22 @@ class NhApiError(Exception):
         super().__init__(f"[{msg_cd}] {msg}")
 
 
-def _norm_order_no(v: Any) -> str:
-    """숫자 주문번호의 앞자리 0/공백/정수-문자열 차이만 흡수한다. 숫자가 아니면 그대로 비교."""
-    t = str(v if v is not None else "").strip()
-    if t.isdigit():
-        return t.lstrip("0") or "0"
-    return t
+def _canon_no(v: Any) -> str:
+    """주문 관련 번호의 유일한 정식 표기. ASCII 숫자만 인정하고 앞자리 0을 제거한다.
+
+    충돌 검사, 조회 비교, 취소 요청이 모두 이 값을 쓴다. 인정하지 않는 표기(부호, 전각/비ASCII 숫자,
+    밑줄, 공백뿐, 너무 긴 값, 숫자가 아닌 값)는 "" (유효하지 않음)이며 신원 증거로 쓰지 않는다.
+    """
+    if isinstance(v, bool) or v is None:
+        return ""
+    if isinstance(v, int):
+        return str(v) if v >= 0 else ""
+    if not isinstance(v, str):
+        return ""
+    t = v.strip()
+    if not t or len(t) > 18 or not (t.isascii() and t.isdigit()):
+        return ""
+    return t.lstrip("0") or "0"
 
 
 _MISSING = object()
@@ -722,15 +732,19 @@ class NhAdapter:
         out0 = data.get("Output_0", {})
         if isinstance(out0, list):
             out0 = out0[0] if out0 else {}
-        order_id = (
-            out0.get("ord_no")
-            or out0.get("order_no")
-            or out0.get("odno")
-            or out0.get("mkt_orr_no")
-            or out0.get("anw_cld_mkt_orr_no1")
-            or data.get("ord_no")
-            or ""
-        )
+        order_id = ""
+        for cand in (
+            out0.get("ord_no"),
+            out0.get("order_no"),
+            out0.get("odno"),
+            out0.get("mkt_orr_no"),
+            out0.get("anw_cld_mkt_orr_no1"),
+            data.get("ord_no"),
+        ):
+            # 공백뿐인 후보가 유효한 다음 후보(예: mkt_orr_no)를 가리지 않게 한다.
+            if cand is not None and not isinstance(cand, bool) and str(cand).strip():
+                order_id = str(cand).strip()
+                break
         # 상태 조회는 itg_orr_no, 취소는 mkt_orr_no를 쓴다. 두 번호가 같은지는 모의서버로 확인 중이므로
         # (주문번호는 비밀이 아님) 응답에 있는 번호를 로그로 남긴다.
         logger.info(
@@ -740,11 +754,12 @@ class NhAdapter:
         )
         if order_id:
             # 취소는 mkt_orr_no, 상태 조회는 itg_orr_no. 두 번호 체계가 같다고 가정하지 않고 주문별로 기억한다.
+            is_d = isinstance(out0, dict)
             self._register_order(
-                str(order_id),
+                order_id,
                 {
-                    "mkt": str(out0.get("mkt_orr_no") or "").strip() if isinstance(out0, dict) else "",
-                    "itg": str(out0.get("itg_orr_no") or "").strip() if isinstance(out0, dict) else "",
+                    "mkt": _canon_no(out0.get("mkt_orr_no")) if is_d else "",
+                    "itg": _canon_no(out0.get("itg_orr_no")) if is_d else "",
                     "ticker": str(ticker),
                     "side": side_u,
                 },
@@ -776,8 +791,8 @@ class NhAdapter:
     def _numbers_of(key: str, rec: dict[str, str]) -> dict[str, str]:
         return {
             "key": key,
-            "itg": _norm_order_no(rec["itg"]) if rec.get("itg") else "",
-            "mkt": _norm_order_no(rec["mkt"]) if rec.get("mkt") else "",
+            "itg": rec.get("itg", ""),
+            "mkt": rec.get("mkt", ""),
         }
 
     def _register_order(self, order_id: str, rec: dict[str, str]) -> None:
@@ -790,7 +805,11 @@ class NhAdapter:
         """
         reg = self._order_registry()
         burned = self._burned_numbers()
-        key = _norm_order_no(order_id)
+        key = _canon_no(order_id)
+        if not key:
+            # 주문번호를 정식 표기로 쓸 수 없으면 이 주문은 등록하지 않는다(상태 조회 미확정, 취소 거부).
+            logger.warning("[NH] 주문번호 %r 를 신원으로 쓸 수 없어 등록하지 않습니다", order_id)
+            return
         mine = self._numbers_of(key, rec)
         clashed: list[str] = []
         hit = False
@@ -843,7 +862,7 @@ class NhAdapter:
         # 주문 응답의 번호(mkt_orr_no 등)와 조회 행의 itg_orr_no가 같은 번호 체계인지는 검증되지 않았다.
         # 그래서 이 어댑터가 낸 주문만, 주문 응답이 itg_orr_no를 준 경우에만, 종목·매매구분까지 맞을 때만
         # 확인한다. 그 외에는 "찾지 못함"(미확정)으로 답한다.
-        rec = self._order_registry().get(_norm_order_no(order_id))
+        rec = self._order_registry().get(_canon_no(order_id))
         if not rec or rec.get("conflict") or not rec.get("itg"):
             return self._unresolved(
                 order_id, {"error": "itg_orr_no unknown for this order — identity unresolved"}
@@ -865,10 +884,10 @@ class NhAdapter:
             elif isinstance(v, list):
                 rows.extend([r for r in v if isinstance(r, dict)])
 
-        want = _norm_order_no(rec["itg"])
+        want = rec["itg"]
         target: dict[str, Any] = {}
         for r in rows:
-            got = _norm_order_no(r.get("itg_orr_no"))
+            got = _canon_no(r.get("itg_orr_no"))
             if got and got == want:
                 target = r
                 break
@@ -936,7 +955,7 @@ class NhAdapter:
             raise ValueError("ticker is required")
         # 취소 키는 원시장주문번호 org_mkt_orr_no(숫자). 전량=all_pat_dit_cd "1", 일부="2" + cor_qty.
         # (이전의 orgn_ord_no/cncl_qty는 NH 명세에 없는 이름이었다.)
-        rec = self._order_registry().get(_norm_order_no(order_id))
+        rec = self._order_registry().get(_canon_no(order_id))
         if not rec or rec.get("conflict") or not rec.get("mkt"):
             # 시장주문번호(mkt_orr_no)를 이 어댑터가 확인한 주문만 취소한다. 다른 번호 체계의 값을
             # org_mkt_orr_no 로 보내면 같은 종목의 다른 주문을 취소할 수 있다.
@@ -945,7 +964,7 @@ class NhAdapter:
                 "(미등록/번호 충돌/응답에 없음) — 증권사 내역으로 수동 확인하세요"
             )
         try:
-            org_no: int | str = int(str(rec["mkt"]).strip())
+            org_no: int | str = int(rec["mkt"])
         except ValueError as e:
             raise ValueError(f"NH 취소는 숫자 주문번호가 필요합니다: {order_id!r}") from e
         part = qty is not None and int(qty) > 0

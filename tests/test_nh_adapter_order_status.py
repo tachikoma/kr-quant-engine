@@ -284,6 +284,82 @@ class RegistryCollisionTests(unittest.TestCase):
         self.assertFalse(stub.get_order_status("11")["is_filled"])
 
 
+class CanonicalNumberTests(unittest.TestCase):
+    """충돌 검사와 취소/조회가 같은 정식 표기를 쓴다 (Codex P1/P2)."""
+
+    def test_canon(self):
+        c = nh_adapter._canon_no
+        for good, want in (("7", "7"), (" 007 ", "7"), (7, "7"), ("0", "0"), ("000", "0"), (0, "0")):
+            self.assertEqual(c(good), want, good)
+        for bad in ("+7", "-7", "７", "٧", "0_7", "7.0", "1e2", "", " ", "  ", None, True, 7.0,
+                    -1, "1" * 19, "abc", [], {}):
+            self.assertEqual(c(bad), "", bad)
+
+    def _place(self, stub, out0, ticker="069500", side="SELL"):
+        stub._response = {"Output_0": out0, "rsp_cd": "00000"}
+        os.environ["LIVE_ORDER_ENABLED"] = "1"
+        try:
+            return stub.place_order(side, ticker, 1, None, "MARKET")
+        finally:
+            os.environ.pop("LIVE_ORDER_ENABLED", None)
+
+    def test_non_canonical_market_numbers_are_never_used_to_cancel(self):
+        for bad in ("+7", "７", "٧", "0_7", "7.0"):
+            stub = _Stub({})
+            stub._order_registry().clear()
+            self._place(stub, {"ord_no": "1", "mkt_orr_no": bad, "itg_orr_no": "21"})
+            n = len(stub.calls)
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order("1", "069500")
+            self.assertEqual(len(stub.calls), n, bad)
+
+    def test_equivalent_spellings_of_one_market_number_collide(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"ord_no": "1", "mkt_orr_no": "7", "itg_orr_no": "21"})
+        self._place(stub, {"ord_no": "2", "mkt_orr_no": " 007 ", "itg_orr_no": "22"})
+        n = len(stub.calls)
+        for oid in ("1", "2"):
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order(oid, "069500")
+        self.assertEqual(len(stub.calls), n)
+
+    def test_whitespace_candidates_do_not_mask_the_market_number(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        a = self._place(stub, {"ord_no": " ", "mkt_orr_no": "10", "itg_orr_no": "21"})
+        b = self._place(stub, {"ord_no": "  ", "mkt_orr_no": "11", "itg_orr_no": "22"},
+                        ticker="229200")
+        self.assertEqual((a["order_id"], b["order_id"]), ("10", "11"))
+        stub._response = {"Output_0": {}, "rsp_cd": "00000"}
+        stub.cancel_order("10", "069500")
+        self.assertEqual(stub.calls[-1][1]["org_mkt_orr_no"], 10)
+        stub.cancel_order("11", "229200")
+        self.assertEqual(stub.calls[-1][1]["org_mkt_orr_no"], 11)
+
+    def test_unusable_order_key_is_not_registered(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"ord_no": "+7", "mkt_orr_no": "", "itg_orr_no": "21"})
+        self.assertEqual(stub._order_registry(), {})
+        stub._response = _resp(_row(itg_orr_no=21, sby_dit_cd_nm="현금매도"))
+        self.assertFalse(stub.get_order_status("+7")["is_found"])
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("+7", "069500")
+
+    def test_unstored_reused_order_still_burns_its_market_number(self):
+        # A(key=1,mkt=7) / B(key=1,mkt=8: 저장되지 않음) / C(key=3,mkt=8) — C 를 막는 것은 burn 기억뿐이다.
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"ord_no": "1", "mkt_orr_no": "7", "itg_orr_no": "21"})
+        self._place(stub, {"ord_no": "1", "mkt_orr_no": "8", "itg_orr_no": "22"})
+        self._place(stub, {"ord_no": "3", "mkt_orr_no": "8", "itg_orr_no": "23"})
+        n = len(stub.calls)
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("3", "069500")
+        self.assertEqual(len(stub.calls), n)
+
+
 class CancelEvidenceTests(unittest.TestCase):
     """거부/알 수 없는 행은 취소 확정이 될 수 없다 (Codex P1-2)."""
 
@@ -385,10 +461,9 @@ class CancelRequestTests(unittest.TestCase):
         with self.assertRaises(nh_adapter.NhApiError):
             stub.cancel_order("3014", "069500")
 
-    def test_non_numeric_market_number_is_rejected_before_sending(self):
+    def test_unregistered_non_numeric_order_id_is_refused_before_sending(self):
         stub = _Stub({"rsp_cd": "00000"})
-        stub.register("abc", itg="1", mkt="abc")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(RuntimeError):
             stub.cancel_order("abc", "069500")
         self.assertEqual(stub.calls, [])
 
