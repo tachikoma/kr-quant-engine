@@ -69,6 +69,25 @@ class NhApiError(Exception):
         super().__init__(f"[{msg_cd}] {msg}")
 
 
+def _norm_order_no(v: Any) -> str:
+    """숫자 주문번호의 앞자리 0/공백/정수-문자열 차이만 흡수한다. 숫자가 아니면 그대로 비교."""
+    t = str(v if v is not None else "").strip()
+    if t.isdigit():
+        return t.lstrip("0") or "0"
+    return t
+
+
+def _strict_qty(v: Any) -> int | None:
+    """수량 파싱. 없거나 숫자가 아니거나 음수면 None(알 수 없음) — 0으로 바꾸지 않는다."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        n = int(float(str(v).replace(",", "").strip()))
+    except (ValueError, OverflowError):
+        return None
+    return n if n >= 0 else None
+
+
 class NhAdapter:
     """NH PLUG 어댑터. BrokerProtocol을 duck-typing으로 만족."""
 
@@ -701,6 +720,14 @@ class NhAdapter:
             out0.get("mkt_orr_no") if isinstance(out0, dict) else None,
             out0.get("itg_orr_no") if isinstance(out0, dict) else None,
         )
+        if order_id:
+            # 취소는 mkt_orr_no, 상태 조회는 itg_orr_no. 두 번호 체계가 같다고 가정하지 않고 주문별로 기억한다.
+            self._order_registry()[_norm_order_no(order_id)] = {
+                "mkt": str(out0.get("mkt_orr_no") or "").strip() if isinstance(out0, dict) else "",
+                "itg": str(out0.get("itg_orr_no") or "").strip() if isinstance(out0, dict) else "",
+                "ticker": str(ticker),
+                "side": side_u,
+            }
         # 실패 응답(예: rsp_cd=14250 잔고부족, Output_0 없음)을 성공으로 오판하지 않도록
         # order_id가 없고 rsp_cd가 실패 코드면 예외를 던져 runner가 submitted=False 처리
         if not order_id:
@@ -710,28 +737,46 @@ class NhAdapter:
                 raise NhApiError(rsp_cd, rsp_msg)
         return {"order_id": str(order_id), "response": data}
 
+    def _order_registry(self) -> dict[str, dict[str, str]]:
+        reg = self.__dict__.get("_order_ids")
+        if reg is None:
+            reg = {}
+            self.__dict__["_order_ids"] = reg
+        return reg
+
+    @staticmethod
+    def _unresolved(order_id: str, data: Any) -> dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "filled_qty": 0,
+            "order_qty": 0,
+            "remaining_qty": 0,
+            "is_filled": False,
+            "is_found": False,
+            "response": data,
+        }
+
     def get_order_status(self, order_id: str, today: str | None = None) -> dict[str, Any]:
         if not order_id:
             raise ValueError("order_id is required")
         # 모의서버 실응답(2026-11-06 캡처) 기준 필드:
-        #   itg_orr_no(주문번호, 숫자) / orr_qty(주문수량) / tot_cns_qty(총체결수량)
-        #   ny_cns_qty(미체결수량) / can_qty(취소수량) / orr_rjt_rsn_cd_nm(거부사유)
-        # 요청은 act_no만으로 당일 전체(체결 포함)를 돌려준다. today(YYYYMMDD)가 있으면 orr_dt로 전달.
+        #   itg_orr_no(조회용 주문번호) / orr_qty / tot_cns_qty / ny_cns_qty(미체결) / can_qty(취소)
+        #   orr_rjt_rsn_cd_nm(거부사유) / iem_cd / sby_dit_cd_nm("현금매수"/"현금매도")
+        # 주문 응답의 번호(mkt_orr_no 등)와 조회 행의 itg_orr_no가 같은 번호 체계인지는 검증되지 않았다.
+        # 그래서 이 어댑터가 낸 주문만, 주문 응답이 itg_orr_no를 준 경우에만, 종목·매매구분까지 맞을 때만
+        # 확인한다. 그 외에는 "찾지 못함"(미확정)으로 답한다.
+        rec = self._order_registry().get(_norm_order_no(order_id))
+        if not rec or not rec.get("itg"):
+            return self._unresolved(
+                order_id, {"error": "itg_orr_no unknown for this order — identity unresolved"}
+            )
         payload: dict[str, Any] = {"act_no": self.acct_no}
         if today:
             payload["orr_dt"] = today
         try:
             data = self._call("/krstock/inquiry/v1/dailyOrderExecution", payload)
         except Exception as e:  # noqa: BLE001
-            return {
-                "order_id": order_id,
-                "filled_qty": 0,
-                "order_qty": 0,
-                "remaining_qty": 0,
-                "is_filled": False,
-                "is_found": False,
-                "response": {"error": str(e)},
-            }
+            return self._unresolved(order_id, {"error": str(e)})
 
         # Output_0 또는 Output_1에서 주문 행 탐색 (실응답은 Output_0 배열)
         rows: list[dict[str, Any]] = []
@@ -742,48 +787,51 @@ class NhAdapter:
             elif isinstance(v, list):
                 rows.extend([r for r in v if isinstance(r, dict)])
 
-        def _norm_no(v: Any) -> str:
-            # 숫자 주문번호의 앞자리 0/공백/정수-문자열 차이만 흡수한다. 숫자가 아니면 그대로 비교.
-            t = str(v if v is not None else "").strip()
-            if t.isdigit():
-                return t.lstrip("0") or "0"
-            return t
-
-        want = _norm_no(order_id)
+        want = _norm_order_no(rec["itg"])
         target: dict[str, Any] = {}
         for r in rows:
-            got = _norm_no(r.get("itg_orr_no"))
+            got = _norm_order_no(r.get("itg_orr_no"))
             if got and got == want:
                 target = r
                 break
         # 주문번호가 일치하지 않는 행은 절대 대체 사용하지 않는다 (타 주문의 잔량을 오인 → 중복 주문).
-
         if not target:
-            return {
-                "order_id": order_id,
-                "filled_qty": 0,
-                "order_qty": 0,
-                "remaining_qty": 0,
-                "is_filled": False,
-                "is_found": False,
-                "response": data,
-            }
+            return self._unresolved(order_id, data)
 
-        def _int(v: Any) -> int:
-            try:
-                return int(float(str(v).replace(",", "").strip() or 0))
-            except ValueError:
-                return 0
+        # 번호가 같아도 종목/매매구분이 다르면 다른 주문이다 (번호 체계 충돌 방어).
+        side_nm = str(target.get("sby_dit_cd_nm", "") or "")
+        side_ok = ("매수" in side_nm) if rec.get("side") == "BUY" else ("매도" in side_nm)
+        if str(target.get("iem_cd", "") or "").strip() != rec.get("ticker") or not side_ok:
+            return self._unresolved(order_id, data)
 
-        order_qty = _int(target.get("orr_qty", 0))
-        filled_qty = _int(target.get("tot_cns_qty", 0))
-        cancelled_qty = _int(target.get("can_qty", 0))
-        if "ny_cns_qty" in target:
-            remaining_qty = _int(target.get("ny_cns_qty"))
+        order_qty = _strict_qty(target.get("orr_qty"))
+        filled_qty = _strict_qty(target.get("tot_cns_qty"))
+        if order_qty is None or order_qty <= 0 or filled_qty is None:
+            return self._unresolved(order_id, data)  # 수량을 알 수 없으면 확정하지 않는다
+        can_raw = target.get("can_qty")
+        cancelled_qty = _strict_qty(can_raw) if can_raw not in (None, "") else 0
+        ny_qty = _strict_qty(target.get("ny_cns_qty"))
+        reject_reason = str(target.get("orr_rjt_rsn_cd_nm", "") or "").strip()
+        if cancelled_qty is None:
+            return self._unresolved(order_id, data)
+
+        # 수량 회계: 체결 + 취소 + 미체결 == 주문 이어야 "확정"으로 본다.
+        # 설명되지 않는 수량(거부/누락/알 수 없음)은 아직 열려 있는 것으로 취급해 취소 확정과 재주문을 막는다.
+        known_open = ny_qty if ny_qty is not None else 0
+        accounted = filled_qty + cancelled_qty + known_open
+        if accounted > order_qty:
+            remaining_qty = max(known_open, 1)  # 모순: 완료/취소 확정 불가
+        elif accounted < order_qty:
+            remaining_qty = known_open + (order_qty - accounted)
         else:
-            # 미체결수량 필드가 없으면 주문-체결-취소로 유도한다.
-            remaining_qty = max(order_qty - filled_qty - cancelled_qty, 0)
-        is_filled = order_qty > 0 and remaining_qty == 0 and filled_qty >= order_qty
+            remaining_qty = known_open
+        if reject_reason and filled_qty < order_qty:
+            remaining_qty = max(remaining_qty, order_qty - filled_qty)  # 거부는 취소 확정이 아니다
+        if filled_qty < order_qty and cancelled_qty == 0 and remaining_qty == 0:
+            remaining_qty = order_qty - filled_qty  # 취소 증거(can_qty) 없이 0이 될 수 없다
+        is_filled = (
+            filled_qty >= order_qty and remaining_qty == 0 and cancelled_qty == 0
+        )
 
         return {
             "order_id": order_id,
@@ -791,7 +839,7 @@ class NhAdapter:
             "order_qty": order_qty,
             "remaining_qty": remaining_qty,
             "cancelled_qty": cancelled_qty,
-            "reject_reason": str(target.get("orr_rjt_rsn_cd_nm", "") or "").strip(),
+            "reject_reason": reject_reason,
             "is_filled": is_filled,
             "is_found": True,
             "response": data,
@@ -805,8 +853,10 @@ class NhAdapter:
             raise ValueError("ticker is required")
         # 취소 키는 원시장주문번호 org_mkt_orr_no(숫자). 전량=all_pat_dit_cd "1", 일부="2" + cor_qty.
         # (이전의 orgn_ord_no/cncl_qty는 NH 명세에 없는 이름이었다.)
+        rec = self._order_registry().get(_norm_order_no(order_id))
+        cancel_key = (rec or {}).get("mkt") or str(order_id)
         try:
-            org_no: int | str = int(str(order_id).strip())
+            org_no: int | str = int(str(cancel_key).strip())
         except ValueError as e:
             raise ValueError(f"NH 취소는 숫자 주문번호가 필요합니다: {order_id!r}") from e
         part = qty is not None and int(qty) > 0

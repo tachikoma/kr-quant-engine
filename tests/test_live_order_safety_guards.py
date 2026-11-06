@@ -800,8 +800,9 @@ class AdapterRowMatchTests(unittest.TestCase):
     ROW_OTHER = {"ord_no": "999", "ord_qty": "10", "ccld_qty": "4", "rmn_qty": "0"}
     ROW_SELF = {"ord_no": "123", "ord_qty": "10", "ccld_qty": "10", "rmn_qty": "0"}
     # NH 모의서버 실응답 필드 (itg_orr_no/orr_qty/tot_cns_qty/ny_cns_qty)
-    NH_OTHER = {"itg_orr_no": 999, "orr_qty": 10, "tot_cns_qty": 4, "ny_cns_qty": 0}
-    NH_SELF = {"itg_orr_no": 123, "orr_qty": 10, "tot_cns_qty": 10, "ny_cns_qty": 0}
+    _NH_BASE = {"iem_cd": "069500", "sby_dit_cd_nm": "현금매수", "can_qty": 0}
+    NH_OTHER = {**_NH_BASE, "itg_orr_no": 999, "orr_qty": 10, "tot_cns_qty": 4, "ny_cns_qty": 0}
+    NH_SELF = {**_NH_BASE, "itg_orr_no": 123, "orr_qty": 10, "tot_cns_qty": 10, "ny_cns_qty": 0}
 
     def _kb(self, rows):
         from live_trading.kb_adapter import KbAdapter
@@ -813,6 +814,7 @@ class AdapterRowMatchTests(unittest.TestCase):
         from live_trading.nh_adapter import NhAdapter
         a = object.__new__(NhAdapter)
         a.acct_no = "x"
+        a._order_registry()["123"] = {"mkt": "123", "itg": "123", "ticker": "069500", "side": "BUY"}
         a._call = lambda path, payload, **kw: {"Output_0": rows}
         return a
 
@@ -837,6 +839,35 @@ class AdapterRowMatchTests(unittest.TestCase):
             row = {"ticker": "a", "order_id": "123", "cancel_submitted": True}
             ns["_wait_for_cancellations"](make([other]), [row], timeout_sec=0)
             self.assertNotIn("cancel_confirmed", row, make.__name__)
+
+    def _wait(self, nh_row):
+        ns = isolated_functions("_wait_for_cancellations")
+        ns["time"] = SimpleNamespace(sleep=lambda x: None)
+        ns["_now_kst"] = lambda: dt.datetime(2026, 11, 4, 9, 0, tzinfo=dt.timezone.utc)
+        row = {"ticker": "069500", "order_id": "123", "qty": 1, "order_qty": 1,
+               "cancel_submitted": True}
+        ns["_wait_for_cancellations"](self._nh([nh_row]), [row], timeout_sec=0)
+        return row
+
+    def test_nh_rejected_or_unknown_row_never_confirms_cancel_through_runner(self):
+        base = {**self._NH_BASE, "itg_orr_no": 123, "orr_qty": 1, "tot_cns_qty": 0}
+        for extra in (
+            {"ny_cns_qty": 0, "orr_rjt_rsn_cd_nm": "잔고부족"},   # 거부
+            {"ny_cns_qty": 0},                                      # 취소 증거 없음
+            {"ny_cns_qty": None},                                   # 미체결수량 알 수 없음
+        ):
+            row = self._wait({**base, **extra})
+            self.assertIsNot(row.get("cancel_confirmed"), True, extra)
+
+    def test_nh_real_cancel_row_confirms_through_runner(self):
+        row = self._wait({**self._NH_BASE, "itg_orr_no": 123, "orr_qty": 1, "tot_cns_qty": 0,
+                          "ny_cns_qty": 0, "can_qty": 1})
+        self.assertIs(row.get("cancel_confirmed"), True)
+
+    def test_nh_colliding_number_of_other_ticker_never_confirms(self):
+        row = self._wait({**self._NH_BASE, "iem_cd": "229200", "itg_orr_no": 123, "orr_qty": 1,
+                          "tot_cns_qty": 0, "ny_cns_qty": 0, "can_qty": 1})
+        self.assertIsNot(row.get("cancel_confirmed"), True)
 
 if __name__ == "__main__":
     unittest.main()
