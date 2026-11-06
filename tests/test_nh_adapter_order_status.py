@@ -206,8 +206,60 @@ class RegistryCollisionTests(unittest.TestCase):
         stub._order_registry().clear()
         r = {"Output_0": {"mkt_orr_no": "55", "itg_orr_no": "66"}}
         self._place(stub, r)
+        # 첫 주문의 체결 행이 실제로 있는 상태에서 같은 번호가 다시 나온다.
+        stub._response = _resp(_row(itg_orr_no=66, sby_dit_cd_nm="현금매도"))
         self._place(stub, r)
+        stub._response = _resp(_row(itg_orr_no=66, sby_dit_cd_nm="현금매도"))
+        n = len(stub.calls)
         self.assertFalse(stub.get_order_status("55")["is_found"])
+        self.assertEqual(len(stub.calls), n)  # 충돌 주문은 조회 요청도 보내지 않는다
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("55", "069500")
+        self.assertEqual(len(stub.calls), n)
+
+    def test_numbers_of_an_unstored_reused_order_are_still_poisoned(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"mkt_orr_no": "55", "itg_orr_no": "66"}})
+        # 같은 주문번호 재사용: 두 번째 주문은 저장되지 않지만 그 번호(67)는 쓸 수 없어야 한다.
+        self._place(stub, {"Output_0": {"mkt_orr_no": "55", "itg_orr_no": "67"}})
+        self._place(stub, {"Output_0": {"mkt_orr_no": "56", "itg_orr_no": "67"}})
+        stub._response = _resp(_row(itg_orr_no=67, sby_dit_cd_nm="현금매도"))
+        self.assertFalse(stub.get_order_status("56")["is_found"])
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("56", "069500")
+
+    def test_poisoned_inquiry_number_cannot_be_reused_by_a_later_order(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"mkt_orr_no": "10", "itg_orr_no": "99"}})
+        self._place(stub, {"Output_0": {"mkt_orr_no": "11", "itg_orr_no": "099"}})
+        self._place(stub, {"Output_0": {"mkt_orr_no": "12", "itg_orr_no": "99"}})
+        stub._response = _resp(_row(itg_orr_no=99, sby_dit_cd_nm="현금매도"))
+        for oid in ("10", "11", "12"):
+            self.assertFalse(stub.get_order_status(oid)["is_found"], oid)
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order(oid, "069500")
+
+    def test_market_number_collision_blocks_cancel_of_both(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"ord_no": "1", "mkt_orr_no": "007", "itg_orr_no": "21"}})
+        self._place(stub, {"Output_0": {"ord_no": "2", "mkt_orr_no": "7", "itg_orr_no": "22"}})
+        n = len(stub.calls)
+        for oid in ("1", "2"):
+            with self.assertRaises(RuntimeError):
+                stub.cancel_order(oid, "069500")
+        self.assertEqual(len(stub.calls), n)  # org_mkt_orr_no=7 이 한 번도 나가지 않는다
+
+    def test_poisoned_market_number_cannot_be_reused_either(self):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        self._place(stub, {"Output_0": {"ord_no": "1", "mkt_orr_no": "7", "itg_orr_no": "21"}})
+        self._place(stub, {"Output_0": {"ord_no": "2", "mkt_orr_no": "07", "itg_orr_no": "22"}})
+        self._place(stub, {"Output_0": {"ord_no": "3", "mkt_orr_no": "7", "itg_orr_no": "23"}})
+        with self.assertRaises(RuntimeError):
+            stub.cancel_order("3", "069500")
 
     def test_two_orders_sharing_one_inquiry_number_are_both_unresolved(self):
         stub = _Stub({})
@@ -269,6 +321,12 @@ class CancelEvidenceTests(unittest.TestCase):
         self.assertFalse(st["is_found"])
         st = _Stub(_resp(_row(can_qty=0.9))).get_order_status("3014")
         self.assertFalse(st["is_filled"])
+
+    def test_absurdly_long_digit_string_is_unknown_not_an_exception(self):
+        self.assertIsNone(nh_adapter._strict_qty("1" * 5000))
+        self.assertEqual(nh_adapter._strict_qty(" 12 "), 12)
+        for bad in ("１", "1_0", "1e2", float("nan"), float("inf")):
+            self.assertIsNone(nh_adapter._strict_qty(bad), bad)
 
     def test_integer_like_inputs_are_accepted(self):
         st = _Stub(_resp(_row(orr_qty="1", tot_cns_qty="1", ny_cns_qty="0", can_qty=0.0))).get_order_status("3014")

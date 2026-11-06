@@ -93,6 +93,8 @@ def _strict_qty(v: Any) -> int | None:
         return int(v) if v == v and v not in (float("inf"), float("-inf")) and v.is_integer() and v >= 0 else None
     if isinstance(v, str):
         t = v.replace(",", "").strip()
+        if len(t) > 18:  # 수량으로 말이 안 되는 길이(파이썬 정수 변환 한도 보호)
+            return None
         return int(t) if t.isascii() and t.isdigit() else None
     return None
 
@@ -763,25 +765,60 @@ class NhAdapter:
             self.__dict__["_order_ids"] = reg
         return reg
 
-    def _register_order(self, order_id: str, rec: dict[str, str]) -> None:
-        """주문 신원 등록. 번호가 겹치면 덮어쓰지 않고 관련 주문 모두 '충돌'로 표시한다.
+    def _burned_numbers(self) -> dict[str, set[str]]:
+        b = self.__dict__.get("_burned")
+        if b is None:
+            b = {"key": set(), "itg": set(), "mkt": set()}
+            self.__dict__["_burned"] = b
+        return b
 
+    @staticmethod
+    def _numbers_of(key: str, rec: dict[str, str]) -> dict[str, str]:
+        return {
+            "key": key,
+            "itg": _norm_order_no(rec["itg"]) if rec.get("itg") else "",
+            "mkt": _norm_order_no(rec["mkt"]) if rec.get("mkt") else "",
+        }
+
+    def _register_order(self, order_id: str, rec: dict[str, str]) -> None:
+        """주문 신원 등록. 번호가 한 번이라도 겹치면 그 번호는 영구히 쓸 수 없게(burned) 한다.
+
+        주문번호(key)·조회번호(itg)·시장번호(mkt) 각각에서, 이미 등록된 주문이나 burned 번호와 같은(정규화 후)
+        번호가 나오면 관련된 모든 주문을 '충돌'로 표시하고 그 주문들의 모든 번호를 burned 로 만든다.
         충돌한 주문은 상태 조회가 항상 미확정이고 취소도 보내지 않는다(사람이 증권사 내역으로 대조).
+        충돌 표시는 신원 정보를 지우지 않으므로 이후 등록도 같은 번호면 걸린다.
         """
         reg = self._order_registry()
+        burned = self._burned_numbers()
         key = _norm_order_no(order_id)
-        itg = _norm_order_no(rec.get("itg")) if rec.get("itg") else ""
-        clash = [key] if key in reg else []
-        if itg:
-            clash += [
-                k for k, v in reg.items()
-                if k != key and v.get("itg") and _norm_order_no(v["itg"]) == itg
-            ]
-        if clash:
-            for k in clash:
-                reg[k] = {"conflict": "1"}
-            reg[key] = {"conflict": "1"}
-            logger.warning("[NH][주문번호 충돌] 신원을 확정할 수 없어 관련 주문의 확인/취소를 막습니다: %s", sorted(set(clash + [key])))
+        mine = self._numbers_of(key, rec)
+        clashed: list[str] = []
+        hit = False
+        for ns, val in mine.items():
+            if not val:
+                continue
+            if val in burned[ns]:
+                hit = True
+            for k, v in reg.items():
+                theirs = self._numbers_of(k, v)[ns]
+                if theirs and theirs == val:
+                    hit = True
+                    clashed.append(k)
+        if hit:
+            for k in set(clashed):
+                reg[k]["conflict"] = "1"
+                for ns2, val2 in self._numbers_of(k, reg[k]).items():
+                    if val2:
+                        burned[ns2].add(val2)
+            for ns, val in mine.items():
+                if val:
+                    burned[ns].add(val)
+            if key not in reg:
+                reg[key] = {**rec, "conflict": "1"}
+            logger.warning(
+                "[NH][주문번호 충돌] 신원을 확정할 수 없어 관련 주문의 확인/취소를 막습니다: %s",
+                sorted(set(clashed + [key])),
+            )
             return
         reg[key] = rec
 
