@@ -320,7 +320,10 @@ class KiwoomAdapter:
                     pass
         return max(0.0, self.http_retry_delay)
 
-    def _post(self, endpoint: str, payload: dict[str, Any], api_id: str | None = None) -> dict[str, Any]:
+    def _post(
+        self, endpoint: str, payload: dict[str, Any], api_id: str | None = None,
+        retry_network: bool = True,
+    ) -> dict[str, Any]:
         url = self._resolve_url(endpoint)
 
         response: requests.Response | None = None
@@ -330,7 +333,7 @@ class KiwoomAdapter:
             try:
                 response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self.http_max_retries:
+                if retry_network and attempt < self.http_max_retries:  # 주문 전송은 재전송 금지
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
                     logger.debug(
                         "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
@@ -787,7 +790,7 @@ class KiwoomAdapter:
         if price is not None:
             payload[price_key] = str(price)
 
-        data = self._post(endpoint, payload, api_id)
+        data = self._post(endpoint, payload, api_id, retry_network=False)
         self._raise_on_api_error(data, context=f"place_order:{side_upper}")
         order_id_path = "ord_no"
         order_id = self._get_by_path(data, order_id_path)
