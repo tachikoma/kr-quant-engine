@@ -901,7 +901,12 @@ class NhAdapter:
         want = rec["itg"]
         matches = [r for r in rows if _canon_no(r.get("itg_orr_no")) == want]
         # 같은 번호의 행이 둘 이상이면 내용이 모두 같을 때만 쓴다. 서로 다르면 어느 쪽이 맞는지 알 수 없다.
-        if len(matches) > 1 and any(m != matches[0] for m in matches[1:]):
+        # 비교는 타입까지 구분한다 (파이썬 동등 비교는 True == 1, 1 == 1.0 이라 잘못된 형식이 정상 행과 같아짐).
+        if len(matches) > 1 and any(
+            repr(sorted(m.items(), key=lambda kv: str(kv[0])))
+            != repr(sorted(matches[0].items(), key=lambda kv: str(kv[0])))
+            for m in matches[1:]
+        ):
             return self._unresolved(order_id, data)
         target: dict[str, Any] = matches[0] if matches else {}
         # 주문번호가 일치하지 않는 행은 절대 대체 사용하지 않는다 (타 주문의 잔량을 오인 → 중복 주문).

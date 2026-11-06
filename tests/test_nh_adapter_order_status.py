@@ -416,6 +416,13 @@ class DuplicateRowTests(unittest.TestCase):
             st = self._status(list(rows))
             self.assertFalse(st["is_found"])
 
+    def test_bool_or_float_quantity_duplicate_is_not_equal_to_int(self):
+        good = _row(orr_qty=1, tot_cns_qty=0, ny_cns_qty=0, can_qty=1)
+        for bad in (True, 1.0, "1"):
+            variant = _row(orr_qty=1, tot_cns_qty=0, ny_cns_qty=0, can_qty=bad)
+            for rows in ((good, variant), (variant, good)):
+                self.assertFalse(self._status(list(rows))["is_found"], (bad, rows[0] is good))
+
     def test_identical_duplicate_rows_are_accepted(self):
         st = self._status([_row(), _row()])
         self.assertTrue(st["is_found"])
