@@ -404,6 +404,60 @@ class CanonicalNumberTests(unittest.TestCase):
         self.assertEqual(len(stub.calls), n)
 
 
+class MeasuredResponseShapeTests(unittest.TestCase):
+    """모의서버 실측(2026-11-09): 주문 응답은 mkt_orr_no=624 만 오고 조회 행 itg_orr_no 는 624."""
+
+    def _placed(self, out0, ticker="069500", side="BUY"):
+        stub = _Stub({})
+        stub._order_registry().clear()
+        stub._response = {"Output_0": out0, "rsp_cd": "00000"}
+        os.environ["LIVE_ORDER_ENABLED"] = "1"
+        try:
+            stub.place_order(side, ticker, 1, None, "MARKET")
+        finally:
+            os.environ.pop("LIVE_ORDER_ENABLED", None)
+        return stub
+
+    def test_mkt_only_response_resolves_filled_order(self):
+        stub = self._placed({"mkt_orr_no": 624})
+        self.assertEqual(stub._order_registry()["624"]["itg"], "624")
+        stub._response = _resp(_row(itg_orr_no=624))
+        st = stub.get_order_status("624", today="20261109")
+        self.assertTrue(st["is_found"])
+        self.assertTrue(st["is_filled"])
+        self.assertEqual((st["order_qty"], st["filled_qty"], st["remaining_qty"]), (1, 1, 0))
+
+    def test_mkt_only_response_never_uses_other_numbers_ticker_or_side(self):
+        stub = self._placed({"mkt_orr_no": 624})
+        for row in (_row(itg_orr_no=601), _row(itg_orr_no=624, iem_cd="229200"),
+                    _row(itg_orr_no=624, sby_dit_cd_nm="현금매도")):
+            stub._response = _resp(row)
+            self.assertFalse(stub.get_order_status("624")["is_found"], row)
+
+    def test_invalid_itg_field_present_stays_unresolved(self):
+        for bad in ("+624", "", None, "abc"):
+            stub = self._placed({"mkt_orr_no": 624, "itg_orr_no": bad})
+            self.assertEqual(stub._order_registry()["624"]["itg"], "", bad)
+            stub._response = _resp(_row(itg_orr_no=624))
+            self.assertFalse(stub.get_order_status("624")["is_found"], bad)
+
+    def test_explicit_itg_is_preferred_over_mkt(self):
+        stub = self._placed({"mkt_orr_no": 624, "itg_orr_no": 700})
+        self.assertEqual(stub._order_registry()["624"]["itg"], "700")
+
+    def test_mkt_only_orders_with_same_number_conflict(self):
+        stub = self._placed({"mkt_orr_no": 624})
+        stub._response = {"Output_0": {"mkt_orr_no": 624}, "rsp_cd": "00000"}
+        os.environ["LIVE_ORDER_ENABLED"] = "1"
+        try:
+            stub.place_order("BUY", "069500", 1, None, "MARKET")
+        finally:
+            os.environ.pop("LIVE_ORDER_ENABLED", None)
+        self.assertEqual(stub._order_registry()["624"].get("conflict"), "1")
+        stub._response = _resp(_row(itg_orr_no=624))
+        self.assertFalse(stub.get_order_status("624")["is_found"])
+
+
 class DuplicateRowTests(unittest.TestCase):
     def _status(self, rows):
         stub = _Stub(_resp(*rows))

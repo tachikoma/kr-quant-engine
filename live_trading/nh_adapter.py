@@ -756,12 +756,20 @@ class NhAdapter:
         # 취소는 mkt_orr_no, 상태 조회는 itg_orr_no. 두 번호 체계가 같다고 가정하지 않고 주문별로 기억한다.
         # order_id 가 비어 있어도 응답의 itg/mkt 번호는 충돌 검사와 burn 에 반영한다(저장은 하지 않음).
         is_d = isinstance(out0, dict)
+        mkt_no = _canon_no(out0.get("mkt_orr_no")) if is_d else ""
+        itg_no = _canon_no(out0.get("itg_orr_no")) if is_d else ""
+        if is_d and "itg_orr_no" not in out0 and mkt_no:
+            # 모의서버 실측(2026-11-09): 주문 응답에는 mkt_orr_no 만 오고 조회 행의 itg_orr_no 는 같은 번호였다
+            # (mkt_orr_no=624 -> itg_orr_no=624). itg 필드가 응답에 아예 없을 때만 mkt 번호를 조회 번호로 쓴다.
+            # 필드가 있는데 잘못된 값이면 그대로 비워 미확정으로 둔다. 종목/매매구분/행 유일성 검증은 그대로 적용된다.
+            itg_no = mkt_no
+            logger.info("[NH] 주문응답에 itg_orr_no 없음 — mkt_orr_no 를 조회 번호로 사용")
         if order_id or (is_d and (out0.get("itg_orr_no") is not None or out0.get("mkt_orr_no") is not None)):
             self._register_order(
                 order_id,
                 {
-                    "mkt": _canon_no(out0.get("mkt_orr_no")) if is_d else "",
-                    "itg": _canon_no(out0.get("itg_orr_no")) if is_d else "",
+                    "mkt": mkt_no,
+                    "itg": itg_no,
                     "ticker": str(ticker),
                     "side": side_u,
                 },
