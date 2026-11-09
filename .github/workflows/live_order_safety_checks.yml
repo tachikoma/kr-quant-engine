@@ -36,9 +36,11 @@ jobs:
           tests/test_live_order_safety_guards.py
           tests/test_broker_preflight.py
           tests/test_nh_adapter_order_status.py
+          tests/test_kiwoom_adapter_token.py
       - name: Offline safety tests (no broker credentials, no network)
         run: >
           python -m unittest -v
           tests.test_live_order_safety_guards
           tests.test_broker_preflight
           tests.test_nh_adapter_order_status
+          tests.test_kiwoom_adapter_token

@@ -378,6 +378,15 @@ class KiwoomAdapter:
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"Invalid JSON response from {url}: {response.text[:500]}") from exc
 
+            # 키움은 만료/잘못된 토큰도 HTTP 401이 아니라 HTTP 200 + return_code=3 [8005] 로 내려준다
+            # (모의서버 실측 2026-11-09). 인증 단계에서 거부된 요청은 접수되지 않았으므로 토큰 재발급 후 1회만 재전송한다.
+            if self._is_token_invalid(data) and not auth_retried:
+                auth_retried = True
+                logger.warning("[HTTP][재시도] 토큰 무효(return_code=3, 8005) — 토큰 재발급 후 1회 재전송: %s", api_id or endpoint)
+                self.invalidate_token()
+                self._ensure_token_valid()
+                continue
+
             # 키움은 HTTP 200이어도 return_code로 API 제한(예: 5)을 내려줄 수 있다.
             if self._is_api_rate_limited(data) and attempt < self.http_max_retries:
                 wait_sec = max(0.0, self.http_retry_delay)
@@ -398,6 +407,15 @@ class KiwoomAdapter:
         if response is not None:
             response.raise_for_status()
         raise RuntimeError(f"HTTP request failed without response: {url}")
+
+    @staticmethod
+    def _is_token_invalid(data: Any) -> bool:
+        """본문 기준 '토큰이 유효하지 않음' 응답 여부. return_code=3 이면서 메시지에 8005 가 있을 때만 해당한다."""
+        if not isinstance(data, dict):
+            return False
+        code = str(data.get("return_code", "")).strip()
+        msg = str(data.get("return_msg", "")).strip()
+        return code == "3" and "8005" in msg
 
     def _is_api_rate_limited(self, data: dict[str, Any]) -> bool:
         """키움 API 본문 기준 요청 제한 응답 여부를 판별한다."""
