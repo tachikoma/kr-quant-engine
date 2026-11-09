@@ -584,6 +584,18 @@ class CancelRequestTests(unittest.TestCase):
         with self.assertRaises(nh_adapter.NhApiError):
             stub.cancel_order("3014", "069500")
 
+    def test_measured_cancel_completed_code_is_accepted_for_cancel_only(self):
+        stub = _Stub({"rsp_cd": "00192", "rsp_msg": "모의투자 취소주문이완료되었습니다"})
+        stub.cancel_order("3014", "069500")  # 예외 없음
+        # 같은 코드를 주문(place_order) 성공으로는 인정하지 않는다 (order_id 없음 + 비성공 코드 -> 예외)
+        stub2 = _Stub({"rsp_cd": "00192", "rsp_msg": "x"})
+        os.environ["LIVE_ORDER_ENABLED"] = "1"
+        try:
+            with self.assertRaises(nh_adapter.NhApiError):
+                stub2.place_order("BUY", "069500", 1, None, "MARKET")
+        finally:
+            os.environ.pop("LIVE_ORDER_ENABLED", None)
+
     def test_unregistered_non_numeric_order_id_is_refused_before_sending(self):
         stub = _Stub({"rsp_cd": "00000"})
         with self.assertRaises(RuntimeError):

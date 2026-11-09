@@ -58,6 +58,9 @@ _ORDER_TYPE_TO_NMN: dict[str, str] = {
 
 # 주문 성공 rsp_cd (복수 성공코드 — 00000 외 00048 등)
 _SUCCESS_RSP_CODES = {"00000", "00048"}
+# 취소 요청 전용: 모의서버 실측(2026-11-09) 취소 접수 응답이 rsp_cd=00192 "모의투자 취소주문이완료되었습니다".
+# 주문(place_order) 성공 판정에는 쓰지 않는다. 취소 확정은 어느 쪽이든 상태 재조회로만 한다.
+_CANCEL_OK_RSP_CODES = _SUCCESS_RSP_CODES | {"00192"}
 
 
 class NhApiError(Exception):
@@ -1005,7 +1008,7 @@ class NhAdapter:
         data = self._call("/krstock/order/v1/cancel", payload)
         # 실패 응답을 "요청됨"으로 오인하지 않는다 (취소 확정은 상태 재조회로만 한다).
         rsp_cd = str(data.get("rsp_cd", "") or "")
-        if rsp_cd and rsp_cd not in _SUCCESS_RSP_CODES:
+        if rsp_cd and rsp_cd not in _CANCEL_OK_RSP_CODES:
             raise NhApiError(rsp_cd, str(data.get("rsp_msg", "") or ""))
         out0 = data.get("Output_0", {})
         if isinstance(out0, list):
