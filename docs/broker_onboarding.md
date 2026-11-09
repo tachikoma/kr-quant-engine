@@ -21,9 +21,9 @@
 
 - [ ] `.env` / GitHub Environment Secrets 분리 확인 (실계좌 키와 모의 키 혼용 금지)
 - [ ] 샌드박스/모의투자 환경 우선 확인
-  - KIS: `https://openapi.koreainvestment.com:9443` (모의 전용 도메인/앱키)
+  - KIS: `https://openapivts.koreainvestment.com:29443` (모의 전용 도메인/앱키; 실전은 `openapi.koreainvestment.com:9443`)
   - NH PLUG: `MODE=demo` → `https://moapi.nhplug.com:8443` (자동), 토큰은 `api.nhplug.com` 발급
-  - Kiwoom/NH/KB 등 모의 미제공 시에만 실계좌 1주 테스트로 폴백 (사전 승인 필요)
+  - 모의 미제공 브로커(KB)만 실계좌 1주 테스트로 폴백 (사전 승인 필요). 단 **주문 필드 매핑이 확정·검증되기 전에는 불가** — 현재 KB 어댑터는 주문 전송을 거부하고 프리플라이트도 주문 검증을 거부한다(`docs/mock_trading_verification.md`의 KB 절차 참고). Kiwoom(`mockapi.kiwoom.com`)과 NH(`moapi.nhplug.com`)는 모의 제공
 - [ ] 장중(09:00~15:30 KST) + 거래일(`_is_trading_day()` 휴장일 참고) 확인 — 시간외/휴장일은 주문 테스트 스킵
 
 ## 4. 절차 (Stage 0~3, 수동)

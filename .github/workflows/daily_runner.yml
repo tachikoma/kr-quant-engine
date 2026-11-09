@@ -107,6 +107,9 @@ jobs:
            LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
 
       - name: Save runtime state
+        # 실패한 실행도 저장한다: 주문 전송 중 예외로 끝나도 주문 원장(live_order_intents.json)이
+        # 다음 실행에 전달되어야 실패-폐쇄가 유지된다. (docs/live_order_journal_runbook.md 7절)
+        if: ${{ always() && hashFiles('runtime_state/**') != '' }}
         uses: actions/cache/save@v4
         with:
           path: runtime_state/

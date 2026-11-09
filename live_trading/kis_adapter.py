@@ -31,7 +31,15 @@ class KisAdapter:
     def __init__(self) -> None:
         self._auth = KisAuthManager()
         self._auth.init()
-        env_mode = os.environ.get("ENV_MODE", "real").lower()
+        try:
+            from config_utils import get_mode
+
+            env_mode = "real" if get_mode(default="real") == "real" else "demo"
+        except Exception:
+            env_mode = (
+                os.environ.get("MODE") or os.environ.get("BROKER_MODE")
+                or os.environ.get("ENV_MODE") or "real"
+            ).lower()
         self._api = KisApiClient(self._auth, env_mode)
 
         self._cano: str = ""

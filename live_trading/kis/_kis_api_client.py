@@ -144,7 +144,7 @@ class KisApiClient:
                     continue
                 raise KisApiError("NETWORK_ERROR", str(e), http_status=0) from e
 
-    def _post(self, path: str, tr_id: str, payload: dict) -> dict:
+    def _post(self, path: str, tr_id: str, payload: dict, retry_network: bool = True) -> dict:
         """POST 요청 수행 (재시도 + 스로틀 포함). 응답 dict 반환."""
         url = f"{self._auth.base_url}{path}"
         auth_retried = False
@@ -182,7 +182,7 @@ class KisApiClient:
                     continue
                 raise
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self._max_retries:
+                if retry_network and attempt < self._max_retries:
                     _backoff = self._retry_delay * (2 ** attempt)
                     time.sleep(_backoff)
                     continue
@@ -392,7 +392,9 @@ class KisApiClient:
             "SLL_TYPE": sll_type,
             "CNDT_PRIC": cndt_pric,
         }
-        body = self._post("/uapi/domestic-stock/v1/trading/order-cash", tr_id, payload)
+        body = self._post(
+            "/uapi/domestic-stock/v1/trading/order-cash", tr_id, payload, retry_network=False
+        )
         return body.get("output") or {}
 
     def cancel_order(

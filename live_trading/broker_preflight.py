@@ -61,6 +61,33 @@ _load_dotenv()
 # pykrx 토큰 만료 이슈로 .env 로드 후 import 해야 하는 모듈이 있으면 여기서 지연 import
 # 본 파일은 pykrx를 직접 쓰지 않으므로 불필요.
 
+# 브로커별 인증 환경변수 (어댑터 소스 기준)
+#  - KIWOOM: appkey/secretkey (밑줄 없음). 계좌번호 불필요 (KIWOOM_ACCOUNT_NO 선택)
+#  - KIS   : KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT_NO (+ KIS_ACCOUNT_PROD_CD 기본 01)
+#  - NH    : NHPLUG_APP_KEY / NHPLUG_APP_SECRET / NHPLUG_ACCT_NO
+#  - KB    : KBSEC_APP_KEY / KBSEC_APP_SECRET (계좌 변수 없음)
+CRED_REQUIRED: dict[str, list[str]] = {
+    "KIS": ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"],
+    "KIWOOM": ["KIWOOM_APPKEY", "KIWOOM_SECRETKEY"],
+    "NH": ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"],
+    "KB": ["KBSEC_APP_KEY", "KBSEC_APP_SECRET"],
+}
+CRED_OPTIONAL: dict[str, list[str]] = {
+    "KIS": ["KIS_ACCOUNT_PROD_CD"],
+    "KIWOOM": ["KIWOOM_ACCOUNT_NO"],
+    "NH": [],
+    "KB": [],
+}
+# 어댑터의 주문 전송이 전역 LIVE_ORDER_ENABLED=1 을 요구하는 브로커
+LIVE_FLAG_REQUIRED = {"NH", "KB"}
+# 모의투자를 지원하지 않는 브로커 (주문 검증은 실계좌 1주 테스트뿐 — 사전 승인 필요)
+NO_MOCK_BROKERS = {"KB"}
+# 어댑터의 주문 필드 매핑(시장가/지정가 구분 등)이 증권사 API 문서로 확정되지 않은 브로커.
+# kb_adapter.place_order 에 "주문 구분/가격 필드명 확정" TODO 가 남아 있다. 확정·검증 후 이 집합에서 제거한다.
+ORDER_MAPPING_UNVERIFIED = {"KB"}
+# KRX ETF 호가가격단위(원). 지정가는 이 단위로 내림한다 (규정 확인 필요 — 틀리면 증권사가 주문을 거부한다).
+ETF_TICK_KRW = 5
+
 DEFAULT_TICKERS = ["069500", "229200"]  # KODEX 200, KODEX 200 TR 등 유동성 높은 ETF
 TEST_TICKER = "069500"
 
@@ -98,6 +125,182 @@ def _mask(s: str | None, keep: int = 4) -> str:
     return s[:2] + "***" + s[-keep:]
 
 
+def _credential_forms(raw: str) -> set[str]:
+    """한 자격증명 값의 기준 문자열들 (어댑터의 정규화 포함). 인코딩 변형은 _loose_pattern 이 처리한다."""
+    v = raw.strip()  # 어댑터(NH 등)는 .strip() 후 사용
+    if len(v) < 4:
+        return set()  # 너무 짧은 값(예: 상품코드 '01')은 비밀이 아니며 진단 메모를 망가뜨린다
+    forms = {raw, v, v.replace("-", "")}
+    # 하이픈 조각(계좌 CANO/상품코드 분리 등): 조각도 strip, 6자 이상만 (짧은 조각은 일반 텍스트와 충돌)
+    forms |= {p.strip() for p in v.split("-") if len(p.strip()) >= 6}
+    # 파생 형태에도 길이/내용 필터: 빈 문자열이나 '-'·공백뿐인 형태는 치환하지 않는다
+    return {f for f in forms if len(f) >= 4 and f.strip(" -")}
+
+
+_JSON_SHORT_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_hex(seg: str) -> bool:
+    return bool(seg) and all(ch in _HEX for ch in seg)
+
+
+def _is_pct(text: str, i: int) -> bool:
+    return text[i] == "%" and i + 2 < len(text) and _is_hex(text[i + 1:i + 3])
+
+
+def _decoded_units(text: str) -> tuple[list[str], list[int], list[int]]:
+    """본문을 '디코딩된 문자 단위' 열로 푼다: (문자 후보, 원문 시작, 원문 끝).
+
+    - 퍼센트 인코딩(%XX 연속은 UTF-8 로 디코딩, hex 대소문자 무관)
+    - JSON 이스케이프: \\uXXXX(서로게이트 쌍 결합), \\n \\r \\t \\b \\f \\/ \\" \\\\
+    - '+' 는 매칭 단계에서 공백과 같은 부류로 취급(폼 인코딩)
+    잘못된 UTF-8 바이트는 각각 자기 구간만 소유하는 대체문자 1개가 된다(좌표가 어긋나지 않는다).
+    """
+    chars: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "%" and _is_pct(text, i):
+            j = i
+            while j < n and _is_pct(text, j):
+                j += 3
+            raw = bytes(int(text[k + 1:k + 3], 16) for k in range(i, j, 3))
+            p = 0
+            while p < len(raw):
+                for ln in (1, 2, 3, 4):  # 엄격한 UTF-8: 유효한 최단 시퀀스, 아니면 이 1바이트만 대체문자
+                    try:
+                        ch = raw[p:p + ln].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    ch, ln = "\ufffd", 1
+                chars.append(ch); starts.append(i + 3 * p); ends.append(i + 3 * (p + ln))
+                p += ln
+            i = j
+        elif c == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "u" and _is_hex(text[i + 2:i + 6]) and len(text[i + 2:i + 6]) == 4:
+                cu, end = int(text[i + 2:i + 6], 16), i + 6
+                lo_seg = text[i + 8:i + 12]
+                if (0xD800 <= cu <= 0xDBFF and text[i + 6:i + 8] == "\\u" and len(lo_seg) == 4
+                        and _is_hex(lo_seg) and 0xDC00 <= int(lo_seg, 16) <= 0xDFFF):
+                    ch = chr(0x10000 + ((cu - 0xD800) << 10) + (int(lo_seg, 16) - 0xDC00))
+                    end = i + 12
+                else:
+                    ch = chr(cu)  # 단독 서로게이트도 그대로 (인코딩하지 않으므로 예외 없음)
+                chars.append(ch); starts.append(i); ends.append(end)
+                i = end
+            elif nxt in _JSON_SHORT_ESCAPES:
+                chars.append(_JSON_SHORT_ESCAPES[nxt]); starts.append(i); ends.append(i + 2)
+                i += 2
+            else:
+                chars.append(c); starts.append(i); ends.append(i + 1)
+                i += 1
+        elif c == "+":
+            chars.append("+"); starts.append(i); ends.append(i + 1)
+            i += 1
+        else:
+            chars.append(c); starts.append(i); ends.append(i + 1)
+            i += 1
+    return chars, starts, ends
+
+
+_PLUS_CLASS = "\x00"  # '+' 와 ' ' 를 같은 부류로 보는 정규화 기호 (폼 인코딩; 과대 마스킹만 가능, 누락 없음)
+
+
+def _norm_unit(ch: str) -> str:
+    return _PLUS_CLASS if ch in ("+", " ") else ch
+
+
+def _build_automaton(forms) -> tuple[list[dict], list[int], list[list[int]], list[int]]:
+    """Aho-Corasick: 전이표, 실패 링크, 상태별 패턴 길이(자기 것만), 출력 링크(다음 출력 상태).
+
+    출력을 자손에게 복사하지 않고 출력 링크로 따라가므로 저장량이 패턴 총 길이에 비례한다.
+    """
+    goto: list[dict] = [{}]
+    own: list[list[int]] = [[]]
+    for f in forms:
+        st = 0
+        for ch in map(_norm_unit, f):
+            nxt = goto[st].get(ch)
+            if nxt is None:
+                goto.append({}); own.append([])
+                nxt = goto[st][ch] = len(goto) - 1
+            st = nxt
+        own[st].append(len(f))
+    fail = [0] * len(goto)
+    dict_link = [0] * len(goto)  # 실패 사슬에서 처음 만나는 '출력이 있는' 상태 (없으면 0=루트)
+    queue = list(goto[0].values())
+    for head in queue:  # BFS (queue 는 순회 중 확장)
+        for ch, nxt in goto[head].items():
+            f = fail[head]
+            while f and ch not in goto[f]:
+                f = fail[f]
+            fail[nxt] = goto[f].get(ch, 0)
+            dict_link[nxt] = fail[nxt] if own[fail[nxt]] else dict_link[fail[nxt]]
+            queue.append(nxt)
+    return goto, fail, own, dict_link
+
+
+def _match_spans(chars: list[str], starts: list[int], ends: list[int], automaton) -> list[tuple[int, int]]:
+    """chars 열에서 forms 가 나타나는 모든 위치(겹침 포함)의 원문 구간. 일치마다 O(1) 추가."""
+    goto, fail, own, dict_link = automaton
+    spans: list[tuple[int, int]] = []
+    st = 0
+    for k, ch in enumerate(map(_norm_unit, chars)):
+        while st and ch not in goto[st]:
+            st = fail[st]
+        st = goto[st].get(ch, 0)
+        o = st if own[st] else dict_link[st]
+        while o:
+            for m in own[o]:
+                spans.append((starts[k - m + 1], ends[k]))
+            o = dict_link[o]
+    return spans
+
+
+def _scrub(text: str) -> str:
+    """출력/리포트에 환경변수 자격증명 값(키·시크릿·계좌)이 섞이지 않도록 마스킹.
+
+    본문을 (a) 원문 문자 열과 (b) 디코딩된 문자 열(퍼센트/JSON 이스케이프/'+') 두 가지로 보고,
+    모든 자격증명의 기준 문자열이 나타나는 모든 구간(서로 겹쳐도)의 **합집합**을 `***`로 바꾼다.
+    인코딩이 섞인 경우, 겹치는 자격증명, 줄바꿈 등 짧은 이스케이프도 처리한다.
+    4자 미만 값과 퇴화 형태는 치환하지 않는다. 정규식 없이 Aho-Corasick 으로 매칭한다.
+    """
+    text = str(text)
+    forms: set[str] = set()
+    for names in (*CRED_REQUIRED.values(), *CRED_OPTIONAL.values()):
+        for n in names:
+            forms |= _credential_forms(os.environ.get(n, ""))
+    if not forms or not text:
+        return text
+    automaton = _build_automaton(forms)
+    spans = _match_spans(list(text), list(range(len(text))), list(range(1, len(text) + 1)), automaton)
+    spans += _match_spans(*_decoded_units(text), automaton)
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[list[int]] = [list(spans[0])]
+    for st, en in spans[1:]:
+        if st <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], en)
+        else:
+            merged.append([st, en])
+    out: list[str] = []
+    pos = 0
+    for st, en in merged:
+        out.append(text[pos:st])
+        out.append("***")
+        pos = en
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _try_call(label: str, fn, *args, **kwargs) -> tuple[str, Any, str]:
     try:
         out = fn(*args, **kwargs)
@@ -109,7 +312,7 @@ def _try_call(label: str, fn, *args, **kwargs) -> tuple[str, Any, str]:
             note = "empty result (parsing OK, no data)"
         return "PASS", out, note
     except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
+        msg = _scrub(f"{type(e).__name__}: {e}")
         # 인증/권한/미구현은 FAIL이지만 스킵으로 오해하지 않도록 FAIL 유지
         return "FAIL", None, msg
 
@@ -118,8 +321,10 @@ def _build_adapter(broker: str, mode: str):
     broker = broker.upper()
     mode = mode.lower()
     # BROKER_TYPE/MODE env를 어댑터가 읽을 수 있도록 임시 설정 (기존 env 우선)
-    os.environ.setdefault("BROKER_TYPE", broker)
-    os.environ.setdefault("MODE", mode)
+    # .env 의 MODE 가 --mode 와 달라도 실계좌로 붙지 않도록 프로세스 내에서 강제 덮어쓴다.
+    os.environ["BROKER_TYPE"] = broker
+    for _k in ("MODE", "BROKER_MODE", "ENV_MODE"):
+        os.environ[_k] = mode
     if broker == "KIS":
         from live_trading.kis_adapter import KisAdapter
 
@@ -139,16 +344,256 @@ def _build_adapter(broker: str, mode: str):
     raise ValueError(f"unknown broker: {broker} (KIS|KIWOOM|NH|KB)")
 
 
+# 모의(demo) 엔드포인트 표식. None = 코드상 모의 구분 불가(명시 승인 필요).
+DEMO_ENDPOINT_HOST: dict[str, str | None] = {
+    "KIWOOM": "mockapi.kiwoom.com",
+    "KIS": "openapivts.koreainvestment.com",
+    "NH": "moapi.nhplug.com",
+    "KB": None,
+}
+POLL_TRIES = 6
+
+
+def _endpoint_of(api: Any) -> str:
+    for getter in (lambda a: a.base_url, lambda a: a._auth.base_url):
+        try:
+            v = getter(api)
+            if isinstance(v, str) and v:
+                return v
+        except Exception:
+            continue
+    return ""
+
+
+def order_destination_ok(api: Any, broker: str, mode: str, allow_real: bool) -> tuple[bool, str]:
+    """--mode 값이 아니라 어댑터가 실제로 쓰는 주문 목적지를 검증한다.
+
+    URL 을 파싱해 호스트명을 정확히 비교한다 (부분 문자열 비교는
+    `https://moapi.nhplug.com@api.nhplug.com` 같은 userinfo 우회에 뚫린다).
+    """
+    from urllib.parse import urlsplit
+
+    url = _endpoint_of(api)
+    if broker.upper() in ORDER_MAPPING_UNVERIFIED:
+        return (False, f"{broker.upper()}: 어댑터 주문 필드 매핑(시장가/지정가 구분·가격 필드)이 증권사 API 문서로 "
+                       "확정되지 않음(kb_adapter.place_order TODO) — 주문 검증 거부 (mode/--allow-real 무관)")
+    if mode != "demo":
+        return (allow_real, f"mode={mode}: 실계좌 주문 — --allow-real 명시 필요 (endpoint host={_host_of(url)})")
+    expected = DEMO_ENDPOINT_HOST.get(broker.upper())
+    if expected is None:
+        # 모의투자를 지원하지 않는 브로커(KB): --mode demo 는 의미가 없고 주문은 항상 실계좌다.
+        return (False, f"{broker.upper()}: 모의투자 미지원 — --mode demo 로는 주문 검증을 할 수 없음 "
+                       f"(host={_host_of(url)}). 실계좌 1주 테스트는 사전 승인 후 --mode real --allow-real")
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        return (False, "endpoint URL 파싱 실패 — 주문 거부")
+    if parts.scheme != "https" or has_userinfo or host != expected:
+        return (False, f"effective endpoint host={host or '?'} (scheme={parts.scheme or '?'}"
+                       f"{', userinfo 포함' if has_userinfo else ''}) 는 모의({expected})가 아님 — 주문 거부")
+    return (True, f"endpoint host={host}")
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url).hostname or "?").lower()
+    except ValueError:
+        return "?"
+
+
+def _order_id(out: Any) -> str | None:
+    if isinstance(out, dict):
+        oid = out.get("order_id") or out.get("odno") or out.get("ord_no")
+        return str(oid) if oid else None
+    return str(out)[:32] if out else None
+
+
+def cancel_confirmed(st: dict[str, Any], prior_filled: int = 0) -> bool:
+    """러너(_wait_for_cancellations)와 동일: 발견됨 + 잔량 0 + (관측 최대 체결 < 주문수량).
+
+    prior_filled: 이전 폴링에서 관측한 최대 체결수량 (체결수량은 감소하지 않는다).
+    """
+    if not st.get("is_found", False) or st.get("remaining_qty") is None:
+        return False
+    order_qty = int(st.get("order_qty", 0))
+    filled = max(int(st.get("filled_qty", 0)), int(prior_filled))
+    return order_qty > 0 and int(st["remaining_qty"]) == 0 and filled < order_qty
+
+
+def fully_filled(st: dict[str, Any], prior_filled: int = 0) -> bool:
+    order_qty = int(st.get("order_qty", 0))
+    filled = max(int(st.get("filled_qty", 0)), int(prior_filled))
+    if st.get("remaining_qty") is None or int(st["remaining_qty"]) != 0:
+        return False  # 수량 불일치(체결=주문인데 잔량>0)는 미해결로 둔다
+    return bool(st.get("is_found", False)) and order_qty > 0 and filled >= order_qty
+
+
+def _fmt_status(st: Any) -> str:
+    if not isinstance(st, dict):
+        return str(st)[:80]
+    keys = ("is_found", "order_qty", "filled_qty", "remaining_qty", "is_filled")
+    return " ".join(f"{k}={st.get(k)}" for k in keys)
+
+
+def _stage2_orders(
+    api: Any, record, tickers_hint: str = TEST_TICKER, *, broker: str, mode: str, allow_real: bool = False
+) -> None:
+    """주문 왕복/취소 검증. 모든 주문은 최종 상태(체결 또는 취소 확정)까지 확인하고,
+    확정하지 못하면 FAIL 기록 후 이후 주문을 중단한다 (미해결 주문/포지션을 남기지 않기 위함).
+
+    broker/mode 는 필수 키워드 인자다: 이 함수를 직접 호출해도 run_preflight 와 동일한 승인 검사
+    (실전 모드 승인, 주문 목적지, 매핑 미확정 브로커 차단)를 스스로 수행한다.
+    """
+    if mode != "demo" and not allow_real:
+        record("2", "stage2-authorization", "FAIL", "mode=real 주문은 --allow-real 필요 — 주문 거부")
+        return
+    ok, detail = order_destination_ok(api, broker, mode, allow_real)
+    if not ok:
+        record("2", "stage2-authorization", "FAIL", detail)
+        return
+    ticker = tickers_hint
+    today_krx = _now_kst().strftime("%Y%m%d")
+    before = api.get_holdings() if hasattr(api, "get_holdings") else None
+    unresolved: list[str] = []
+
+    def abort(msg: str) -> None:
+        record("2", "stage2_unresolved", "FAIL", msg + " — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
+
+    def status_of(label: str, oid: str) -> dict[str, Any] | None:
+        st, out, note = _try_call(label, api.get_order_status, oid, today=today_krx)
+        record("2", label, st, note if note else _fmt_status(out))
+        return out if st == "PASS" and isinstance(out, dict) else None
+
+    def place(label: str, side: str, price: float | None, otype: str) -> str | None:
+        st, out, note = _try_call(label, api.place_order, side, ticker, 1, price, otype)
+        oid = _order_id(out) if st == "PASS" else None
+        if st != "PASS":
+            record("2", label, "FAIL", note)
+            return None
+        if not oid:
+            # 접수 여부 불명 — 추가 주문 금지 (러너의 OrderSubmissionUncertain 과 동일 원칙)
+            record("2", label, "FAIL", "order_id 없음 — 접수 여부 불명(uncertain), 이후 주문 중단")
+            unresolved.append("order_id missing")
+            return None
+        record("2", label, "PASS", f"order_id={_mask(oid)}")
+        return oid
+
+    def wait_fill(label: str, oid: str) -> tuple[bool, int]:
+        seen = 0
+        for _ in range(POLL_TRIES):
+            time.sleep(1.0)
+            r = status_of(label, oid)
+            if r:
+                seen = max(seen, int(r.get("filled_qty", 0)))
+                if fully_filled(r, seen):
+                    return True, seen
+        return False, seen
+
+    def cancel_and_resolve(label: str, oid: str, seen: int) -> str:
+        """취소 요청 후 최종 상태 확정. 반환: 'filled' | 'cancelled' | 'unresolved'."""
+        s3, o3, n3 = _try_call(label + "_cancel", api.cancel_order, oid, ticker, 1)
+        record("2", f"cancel_order({label})", s3, n3 if n3 else "requested")
+        # 취소 요청 실패여도 최종 상태를 확인한다 (이미 체결/취소되었을 수 있음)
+        for _ in range(POLL_TRIES):
+            time.sleep(1.0)
+            r = status_of(f"get_order_status({label} 취소 후)", oid)
+            if not r:
+                continue
+            seen = max(seen, int(r.get("filled_qty", 0)))
+            if fully_filled(r, seen):
+                return "filled"
+            if cancel_confirmed(r, seen):
+                return "cancelled"
+        return "unresolved"
+
+    # (1) 시장가 1주 매수 → 체결 확인 → 매도
+    boid = place("place_order(BUY 1주 MARKET)", "BUY", None, "MARKET")
+    if boid is None:
+        abort("매수 주문 미확정")
+        return
+    filled, seen = wait_fill("get_order_status(BUY)", boid)
+    if not filled:
+        outcome = cancel_and_resolve("BUY", boid, seen)
+        if outcome == "unresolved":
+            abort("매수 주문의 최종 상태(체결/취소)를 확정하지 못함")
+            return
+        if outcome == "cancelled":
+            record("2", "roundtrip", "FAIL",
+                   "incomplete: 시장가 매수가 체결되지 않아(취소됨) 시장가 체결·매도 경로를 검증하지 못함 — 재시도 필요")
+            filled = False
+        else:
+            filled = True  # 취소와 체결이 경합해 체결됨 → 반드시 매도해 원복
+    if filled:
+        soid = place("place_order(SELL 1주 MARKET)", "SELL", None, "MARKET")
+        if soid is None:
+            abort("매도 주문 미확정 — 매수 1주가 보유 상태로 남아 있음")
+            return
+        sold, sseen = wait_fill("get_order_status(SELL)", soid)
+        if not sold:
+            outcome = cancel_and_resolve("SELL", soid, sseen)
+            if outcome != "filled":
+                abort("매도 미체결 — 매수 1주가 보유 상태로 남아 있음 (매도 " +
+                      ("취소됨" if outcome == "cancelled" else "상태 불명") + ")")
+                return
+        record("2", "roundtrip", "PASS", "buy→sell 체결")
+
+    # (2) 미체결 지정가 → 취소 → 취소 의미 검증
+    cur = None
+    try:
+        px = api.get_prices([ticker]).get(ticker)
+        cur = float(px) if px else None
+    except Exception:
+        cur = None
+    if not cur or cur <= 0:
+        # 임의 가격으로 지정가를 내지 않는다 (가격제한/호가단위 위반 또는 의도치 않은 체결 위험)
+        record("2", "limit_price", "FAIL", "현재가를 얻지 못해 지정가 취소 테스트를 수행하지 않음")
+        abort("지정가 단계 생략 — 현재가 조회 실패")
+        return
+    # -25% 후 호가단위(ETF 5원)로 내림. 현재가가 호가단위 미만이면 주문하지 않는다.
+    limit_price = int(cur * 0.75) // ETF_TICK_KRW * ETF_TICK_KRW
+    if limit_price < ETF_TICK_KRW:
+        record("2", "limit_price", "FAIL", f"계산된 지정가({limit_price})가 호가단위 미만 — 주문하지 않음")
+        abort("지정가 단계 생략 — 가격 계산 불가")
+        return
+    loid = place("place_order(BUY 1주 LIMIT -25%)", "BUY", limit_price, "LIMIT")
+    if loid is None:
+        abort("지정가 주문 미확정")
+        return
+    time.sleep(1.0)
+    first = status_of("get_order_status(LIMIT 미체결)", loid)
+    seen = int(first.get("filled_qty", 0)) if first else 0
+    outcome = cancel_and_resolve("LIMIT", loid, seen)
+    if outcome == "cancelled":
+        record("2", "cancel_semantics(found & remaining==0 & filled<order)", "PASS",
+               "러너의 취소 확정 조건과 일치")
+    elif outcome == "filled":
+        record("2", "cancel_semantics", "FAIL", "지정가(-25%)가 체결됨 — 1주 보유 상태, 수동 매도 필요")
+    else:
+        abort("지정가 주문의 취소를 확정하지 못함 (러너도 재주문을 확정하지 못함)")
+        return
+
+    after = api.get_holdings() if hasattr(api, "get_holdings") else None
+    flat = before == after
+    record("2", "verify_flat_position", "PASS" if flat else "FAIL",
+           "holdings unchanged" if flat else "before≠after — 수동 확인/정리 필요")
+
+
 def run_preflight(
     broker: str,
     mode: str,
     with_order: bool,
     tickers: list[str],
+    allow_real: bool = False,
 ) -> dict[str, Any]:
     now = _now_kst()
     results: list[dict[str, Any]] = []
 
     def record(stage: str, label: str, status: str, note: str = "") -> None:
+        note = _scrub(note)[:400]  # 마스킹 후에 자른다 (경계에 걸친 값 노출 방지)
         results.append({"stage": stage, "label": label, "status": status, "note": note})
         icon = {"PASS": "✓", "FAIL": "✗", "SKIP": "-"} .get(status, "?")
         suffix = f" — {note}" if note else ""
@@ -165,15 +610,16 @@ def run_preflight(
     record("0", "market_hours", "PASS" if _is_market_hours(now) else "SKIP",
            f"09:00~15:30 KST, now={now:%H:%M}")
     # credential presence (키 존재 여부만, 값은 마스킹)
-    cred_keys = {
-        "KIS": ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"],
-        "KIWOOM": ["KIWOOM_APP_KEY", "KIWOOM_SECRET_KEY", "KIWOOM_ACCOUNT_NO"],
-        "NH": ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"],
-        "KB": ["KB_APP_KEY", "KB_APP_SECRET", "KB_ACCOUNT_NO"],
-    }
-    for k in cred_keys.get(broker.upper(), []):
+    # 어댑터가 실제로 읽는 변수명 기준 (live_trading/*_adapter.py). 값은 마스킹.
+    if broker.upper() in NO_MOCK_BROKERS:
+        record("0", "mock_support", "SKIP",
+               f"{broker.upper()}는 모의투자 미지원 — 읽기 전용 호출도 실서버/실계좌에 대해 수행됨, 주문 검증은 --mode real --allow-real 만 가능")
+    for k in CRED_REQUIRED.get(broker.upper(), []):
         v = os.environ.get(k)
         record("0", f"env:{k}", "PASS" if v else "FAIL", _mask(v) if v else "missing")
+    for k in CRED_OPTIONAL.get(broker.upper(), []):
+        v = os.environ.get(k)
+        record("0", f"env:{k}", "SKIP", "optional — set" if v else "optional — not needed")
 
     # Adapter init (토큰/세션 검증이 여기서 일어남)
     print("\n[Stage 1] Read-only — strategy-used APIs")
@@ -181,7 +627,7 @@ def run_preflight(
         api = _build_adapter(broker, mode)
         record("1", "adapter_init", "PASS", type(api).__name__)
     except Exception as e:
-        record("1", "adapter_init", "FAIL", f"{type(e).__name__}: {e}"[:400])
+        record("1", "adapter_init", "FAIL", f"{type(e).__name__}: {e}")
         total = len(results)
         passes = sum(1 for r in results if r["status"] == "PASS")
         fails = sum(1 for r in results if r["status"] == "FAIL")
@@ -214,7 +660,7 @@ def run_preflight(
             return None
         fn = getattr(api, method)
         status, out, note = _try_call(label, fn, *a, **kw)
-        record("1", label, status, note[:200] if note else "")
+        record("1", label, status, note if note else "")
         return out
 
     # 1.1 cash
@@ -225,17 +671,17 @@ def run_preflight(
             # 가격 0이면 buyable 계산이 무의미하므로 더미 가격 50000
             out = api.get_available_cash(TEST_TICKER, 50000) if "ticker" in api.get_available_cash.__code__.co_varnames else api.get_available_cash()  # type: ignore[attr-defined]
             # 위 분기가 부정확할 수 있어 fallback
-            record("1", "get_available_cash", "PASS", str(out)[:120] if out is not None else "")
+            record("1", "get_available_cash", "PASS", str(out) if out is not None else "")
         except TypeError:
             status, out, note = _try_call("get_available_cash", getattr(api, "get_available_cash"))
-            record("1", "get_available_cash", status, note[:200] if note else "")
+            record("1", "get_available_cash", status, note if note else "")
         except Exception as e:
-            record("1", "get_available_cash", "FAIL", f"{type(e).__name__}: {e}"[:200])
+            record("1", "get_available_cash", "FAIL", f"{type(e).__name__}: {e}")
     else:
         record("1", "get_available_cash", "SKIP", "not implemented")
 
     # 1.2 holdings
-    holdings = check("get_holdings", "get_holdings")
+    check("get_holdings", "get_holdings")
 
     # 1.3 prices
     check("get_prices", "get_prices", tickers)
@@ -250,130 +696,33 @@ def run_preflight(
     check("get_ticker_name", "get_ticker_name", TEST_TICKER)
 
     # Stage 2: write 가역 — --with-order 시만
-    print("\n[Stage 2] Write 가역 (1주 IOC, 원복 보장)")
+    print("\n[Stage 2] Write 가역 (1주 주문→취소/원복)")
     if not with_order:
         record("2", "place_order/get_order_status/cancel_order", "SKIP",
                "read-only run — add --with-order to test write path (장중만)")
-    elif not _is_market_hours(now):
-        record("2", "place_order", "SKIP", "market closed — write test requires 09:00~15:30 KST")
+    elif mode != "demo" and not allow_real:
+        record("2", "real-mode guard", "FAIL",
+               "mode=real 에서 실계좌 주문이 발생합니다. 의도했다면 --allow-real 을 명시하세요")
     else:
-        if mode != "demo":
-            print("  ! mode != demo 에서 실계좌 1주 주문이 발생합니다. 계속하려면 3초 대기...")
-            time.sleep(3)
-        # 전 스냅샷
-        snap_before = None
-        try:
-            snap_before = api.get_holdings() if hasattr(api, "get_holdings") else None
-        except Exception:
-            snap_before = None
-
-        # Buy→Sell 라운드트립: 매수/매도 모두 필수 검증, net 0 평탄화
-        def _place_and_status(side: str) -> tuple[str | None, str]:
-            try:
-                status, out, note = _try_call(
-                    f"place_order({side})", api.place_order, side, TEST_TICKER, 1, 0, "market"
-                )
-                record("2", f"place_order({side} 1주 market)", status,
-                       note[:200] if note else str(out)[:120])
-                oid = None
-                if status == "PASS" and isinstance(out, dict):
-                    oid = out.get("order_id") or out.get("odno") or out.get("ord_no")
-                elif status == "PASS":
-                    oid = str(out)[:32] if out else None
-                else:
-                    return None, status
-                if oid and hasattr(api, "get_order_status"):
-                    time.sleep(0.8)
-                    s2, o2, n2 = _try_call(f"get_order_status({side})",
-                                           api.get_order_status, oid, True)
-                    if s2 == "FAIL" and "today" in n2:
-                        s2, o2, n2 = _try_call(f"get_order_status({side})",
-                                               api.get_order_status, oid)
-                    record("2", f"get_order_status({side})", s2,
-                           n2[:200] if n2 else str(o2)[:120])
-                    # cancel은 라운드트립에서는 불필요 — 체결 후 반대매매로 평탄화하므로 SKIP
-                    if hasattr(api, "cancel_order"):
-                        record("2", f"cancel_order({side})", "SKIP",
-                               "round-trip mode: cancel not needed (opposite order reverts)")
-                return oid, status
-            except Exception as e:
-                record("2", f"place_order({side})", "FAIL", f"{type(e).__name__}: {e}"[:200])
-                return None, "FAIL"
-
-        buy_oid, buy_status = _place_and_status("buy")
-        # buy가 체결되어야 sell 보유가 생김 — buy 실패 시 sell도 실패하지만 양쪽 API 도달은 기록됨
-        if buy_status != "PASS":
-            record("2", "place_order(sell 1주 market)", "SKIP",
-                   "buy failed — sell skipped to avoid naked short (buy must pass first)")
-            record("2", "get_order_status(sell)", "SKIP", "buy failed")
+        # 거부 사유(잘못된 목적지, 매핑 미확정, 모의 미지원 등)는 장중/라이브 플래그 SKIP 보다 먼저 판정해
+        # 장외 시간에 실행해도 FAIL(종료 코드 1)로 보고되도록 한다.
+        ok, detail = order_destination_ok(api, broker, mode, allow_real)
+        if not ok:
+            record("2", "order-destination guard", "FAIL", detail)
         else:
-            time.sleep(0.5)
-            _place_and_status("sell")
-
-        # cancel 경로: 미체결 지정가 1주 → 취소 (보유 영향 없이 cancel 확정 테스트)
-        if hasattr(api, "place_order") and hasattr(api, "cancel_order") and hasattr(api, "get_order_status"):
-            try:
-                cur_price = None
-                if hasattr(api, "get_prices"):
-                    try:
-                        p_out = api.get_prices([TEST_TICKER])
-                        if isinstance(p_out, dict):
-                            # 어댑터별 반환 형태 대응: {ticker: price} or {ticker: {price: ...}}
-                            raw = p_out.get(TEST_TICKER) or p_out.get(TEST_TICKER.lstrip("A")) or next(iter(p_out.values()), None)
-                            if isinstance(raw, dict):
-                                for k in ("price", "prpr", "stck_prpr", "cur_prc", "now_prc"):
-                                    if k in raw:
-                                        cur_price = raw[k]
-                                        break
-                            elif isinstance(raw, (int, float)):
-                                cur_price = raw
-                    except Exception:
-                        cur_price = None
-                if not cur_price or not isinstance(cur_price, (int, float)) or cur_price <= 0:
-                    cur_price = 30000  # fallback — KRX 가격제한 내 미체결 유도용 더미
-                limit_price = max(1, int(cur_price * 0.75))  # -25% 지정가: 가격제한(±30%) 내, 체결 안 됨
-                status, out, note = _try_call(
-                    "place_order(cancel-test limit)", api.place_order, "buy", TEST_TICKER, 1, limit_price, "limit"
-                )
-                record("2", "place_order(cancel-test 지정가 1주)", status,
-                       note[:200] if note else str(out)[:120])
-                oid = None
-                if status == "PASS" and isinstance(out, dict):
-                    oid = out.get("order_id") or out.get("odno") or out.get("ord_no")
-                elif status == "PASS":
-                    oid = str(out)[:32] if out else None
-                if oid:
-                    time.sleep(0.6)
-                    s2, o2, n2 = _try_call("get_order_status(cancel-test 미체결)",
-                                           api.get_order_status, oid, True)
-                    if s2 == "FAIL" and "today" in n2:
-                        s2, o2, n2 = _try_call("get_order_status(cancel-test 미체결)",
-                                               api.get_order_status, oid)
-                    record("2", "get_order_status(cancel-test)", s2, n2[:200] if n2 else str(o2)[:120])
-                    s3, o3, n3 = _try_call("cancel_order(cancel-test)", api.cancel_order, oid, TEST_TICKER, 1)
-                    record("2", "cancel_order(cancel-test)", s3, n3[:200] if n3 else str(o3)[:120])
-                    time.sleep(0.4)
-                    s4, o4, n4 = _try_call("get_order_status(cancel-test 취소확인)",
-                                           api.get_order_status, oid, True)
-                    if s4 == "FAIL" and "today" in n4:
-                        s4, o4, n4 = _try_call("get_order_status(cancel-test 취소확인)",
-                                               api.get_order_status, oid)
-                    record("2", "get_order_status(cancel-test 취소후)", s4, n4[:200] if n4 else str(o4)[:120])
-                else:
-                    record("2", "get_order_status(cancel-test)", "SKIP", "no order_id")
-                    record("2", "cancel_order(cancel-test)", "SKIP", "no order_id")
-            except Exception as e:
-                record("2", "cancel-test", "FAIL", f"{type(e).__name__}: {e}"[:200])
-        else:
-            record("2", "cancel-test", "SKIP", "place_order/cancel_order/get_order_status 미구현")
-
-        try:
-            snap_after = api.get_holdings() if hasattr(api, "get_holdings") else None
-            flat = snap_before == snap_after
-            record("2", "verify_flat_position", "PASS" if flat else "FAIL",
-                   "holdings net 0 (buy→sell + cancel-test 모두 원복)" if flat else "before≠after — round-trip/cancel not flat, manual check needed")
-        except Exception as e:
-            record("2", "verify_flat_position", "FAIL", f"{type(e).__name__}: {e}"[:200])
+            record("2", "order-destination guard", "PASS", detail)
+            if not _is_market_hours(now):
+                record("2", "place_order", "SKIP", "market closed — write test requires 09:00~15:30 KST")
+            elif broker.upper() in LIVE_FLAG_REQUIRED and os.environ.get("LIVE_ORDER_ENABLED", "0").strip() != "1":
+                record("2", "place_order", "SKIP",
+                       f"{broker.upper()} 어댑터는 LIVE_ORDER_ENABLED=1 일 때만 주문 전송 — 모의 검증 시 설정 필요")
+            else:
+                try:
+                    _stage2_orders(api, record, tickers_hint=TEST_TICKER,
+                                   broker=broker, mode=mode, allow_real=allow_real)
+                except Exception as e:  # noqa: BLE001
+                    record("2", "stage2_unresolved", "FAIL",
+                           f"unexpected {type(e).__name__}: {e} — 증권사 앱에서 미체결/보유를 수동 확인·정리하세요")
 
     # Stage 3: smoke는 문서상 선택 — 여기서는 runner --help 수준만 힌트
     print("\n[Stage 3] Smoke (선택)")
@@ -426,11 +775,14 @@ def main() -> None:
     p.add_argument("--broker", required=True, help="KIS|KIWOOM|NH|KB")
     p.add_argument("--mode", default="demo", help="demo|real (default: demo)")
     p.add_argument("--with-order", action="store_true",
-                   help="장중 1주 IOC 주문→취소/원복까지 테스트 (기본은 read-only)")
+                   help="장중 1주 주문→취소/원복까지 테스트 (기본은 read-only)")
     p.add_argument("--tickers", nargs="*", default=DEFAULT_TICKERS,
                    help=f"price 조회 티커 목록 (default: {' '.join(DEFAULT_TICKERS)})")
+    p.add_argument("--allow-real", action="store_true",
+                   help="mode=real 에서 --with-order 실주문 허용 (기본 거부)")
     args = p.parse_args()
-    report = run_preflight(args.broker, args.mode, bool(args.with_order), list(args.tickers))
+    report = run_preflight(args.broker, args.mode, bool(args.with_order), list(args.tickers),
+                           allow_real=bool(args.allow_real))
     # FAIL 있으면 exit 1 (CI에서 쓰더라도 문서 게이트가 우선이므로 호출자가 판단)
     fails = report["summary"]["fail"]
     raise SystemExit(1 if fails else 0)

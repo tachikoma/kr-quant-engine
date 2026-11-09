@@ -320,7 +320,10 @@ class KiwoomAdapter:
                     pass
         return max(0.0, self.http_retry_delay)
 
-    def _post(self, endpoint: str, payload: dict[str, Any], api_id: str | None = None) -> dict[str, Any]:
+    def _post(
+        self, endpoint: str, payload: dict[str, Any], api_id: str | None = None,
+        retry_network: bool = True,
+    ) -> dict[str, Any]:
         url = self._resolve_url(endpoint)
 
         response: requests.Response | None = None
@@ -330,7 +333,7 @@ class KiwoomAdapter:
             try:
                 response = self._session.post(url, headers=self._headers(api_id), json=payload, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self.http_max_retries:
+                if retry_network and attempt < self.http_max_retries:  # 주문 전송은 재전송 금지
                     delay = min(self.http_retry_delay * (2 ** attempt), 10.0)
                     logger.debug(
                         "[HTTP][재시도] 네트워크 오류 (%s) -> %.1f초 대기 후 재시도 (attempt %s/%s)",
@@ -375,6 +378,15 @@ class KiwoomAdapter:
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"Invalid JSON response from {url}: {response.text[:500]}") from exc
 
+            # 키움은 만료/잘못된 토큰도 HTTP 401이 아니라 HTTP 200 + return_code=3 [8005] 로 내려준다
+            # (모의서버 실측 2026-11-09). 인증 단계에서 거부된 요청은 접수되지 않았으므로 토큰 재발급 후 1회만 재전송한다.
+            if self._is_token_invalid(data) and not auth_retried:
+                auth_retried = True
+                logger.warning("[HTTP][재시도] 토큰 무효(return_code=3, 8005) — 토큰 재발급 후 1회 재전송: %s", api_id or endpoint)
+                self.invalidate_token()
+                self._ensure_token_valid()
+                continue
+
             # 키움은 HTTP 200이어도 return_code로 API 제한(예: 5)을 내려줄 수 있다.
             if self._is_api_rate_limited(data) and attempt < self.http_max_retries:
                 wait_sec = max(0.0, self.http_retry_delay)
@@ -395,6 +407,15 @@ class KiwoomAdapter:
         if response is not None:
             response.raise_for_status()
         raise RuntimeError(f"HTTP request failed without response: {url}")
+
+    @staticmethod
+    def _is_token_invalid(data: Any) -> bool:
+        """본문 기준 '토큰이 유효하지 않음' 응답 여부. return_code=3 이면서 메시지에 8005 가 있을 때만 해당한다."""
+        if not isinstance(data, dict):
+            return False
+        code = str(data.get("return_code", "")).strip()
+        msg = str(data.get("return_msg", "")).strip()
+        return code == "3" and "8005" in msg
 
     def _is_api_rate_limited(self, data: dict[str, Any]) -> bool:
         """키움 API 본문 기준 요청 제한 응답 여부를 판별한다."""
@@ -787,7 +808,7 @@ class KiwoomAdapter:
         if price is not None:
             payload[price_key] = str(price)
 
-        data = self._post(endpoint, payload, api_id)
+        data = self._post(endpoint, payload, api_id, retry_network=False)
         self._raise_on_api_error(data, context=f"place_order:{side_upper}")
         order_id_path = "ord_no"
         order_id = self._get_by_path(data, order_id_path)

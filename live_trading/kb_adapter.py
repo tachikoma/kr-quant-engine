@@ -45,7 +45,23 @@ from requests.adapters import HTTPAdapter
 logger = logging.getLogger(__name__)
 
 
+# 주문 필드 매핑(주문 구분 시장가/지정가, 가격 필드명)이 증권사 API 문서로 확정·검증되었는지.
+# 확정 전에는 place_order 가 주문을 전송하지 않는다. 확정 후 이 값을 True 로 바꾸고,
+# broker_preflight.ORDER_MAPPING_UNVERIFIED 에서 KB 를 제거한다 (tests 가 두 값의 일치를 검사).
+ORDER_MAPPING_VERIFIED = False
+
+
+class KbOrderMappingUnverified(RuntimeError):
+    """주문 필드 매핑 미확정으로 주문을 전송하지 않았다 (브로커로 아무것도 나가지 않음 = 명확한 거절)."""
+
+    msg_cd = "ORDER_MAPPING_UNVERIFIED"
+    http_status = 400
+
+
 class KbAdapter:
+    # 러너가 주문 전에 확인하는 플래그 (etf_daily_runner._assert_order_mapping_verified)
+    ORDER_MAPPING_VERIFIED = ORDER_MAPPING_VERIFIED
+
     """KB REST OPEN API 어댑터. BrokerProtocol duck-typing 준수."""
 
     def __init__(self) -> None:
@@ -211,7 +227,9 @@ class KbAdapter:
             "Authorization": f"Bearer {self.access_token}",
         }
 
-    def _call(self, api_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _call(
+        self, api_id: str, body: dict[str, Any], retry_network: bool = True
+    ) -> dict[str, Any]:
         """POST /api/v1/{apiId} with dataHeader/dataBody envelope."""
         url = f"{self.base_url}/api/v1/{api_id.lower()}"
         envelope = {
@@ -224,7 +242,7 @@ class KbAdapter:
             try:
                 resp = self._session.post(url, headers=self._headers(), json=envelope, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
-                if attempt < self.http_max_retries:
+                if retry_network and attempt < self.http_max_retries:
                     delay = min(self.http_retry_delay * (2**attempt), 10.0)
                     logger.debug("[KB][재시도] 네트워크 %s -> %.1fs", type(e).__name__, delay)
                     time.sleep(delay)
@@ -245,7 +263,7 @@ class KbAdapter:
                 self.invalidate_token()
                 self._ensure_token_valid()
                 continue
-            if resp.status_code in (500, 502, 503) and attempt < self.http_max_retries:
+            if resp.status_code in (500, 502, 503) and retry_network and attempt < self.http_max_retries:
                 time.sleep(min(self.http_retry_delay * (2**attempt), 10.0))
                 continue
 
@@ -360,6 +378,11 @@ class KbAdapter:
         order_type: str = "LIMIT",
     ) -> dict[str, Any]:
         self._check_live_enabled()
+        if not ORDER_MAPPING_VERIFIED:
+            raise KbOrderMappingUnverified(
+                "KB 주문 필드 매핑(주문 구분/가격 필드)이 확정되지 않아 주문을 전송하지 않습니다 "
+                "(kb_adapter.ORDER_MAPPING_VERIFIED=False)"
+            )
         side_u = side.upper()
         if side_u not in {"BUY", "SELL"}:
             raise ValueError(f"Invalid side: {side}")
@@ -378,7 +401,7 @@ class KbAdapter:
             body["ord_prc"] = str(int(price))
         # 시장가면 가격 미전송
 
-        data = self._call(api_id, body)
+        data = self._call(api_id, body, retry_network=False)
         # order_id 추출 후보
         body_resp = data.get("dataBody", data) if isinstance(data.get("dataBody"), dict) else data
         order_id = ""
@@ -422,8 +445,7 @@ class KbAdapter:
             if str(r.get("ord_no", "")).strip() == str(order_id).strip():
                 target = r
                 break
-        if not target and len(rows) == 1:
-            target = rows[0]
+        # 주문번호가 일치하지 않는 행은 절대 대체 사용하지 않는다 (타 주문의 잔량을 오인 → 중복 주문).
         if not target:
             return {
                 "order_id": order_id,
