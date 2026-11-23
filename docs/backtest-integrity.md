@@ -11,6 +11,7 @@
 | 단계 | 보호장치 | 해석 경계 |
 |---|---|---|
 | Phase 0 | 합성 fixture의 t+1 체결, 현금·수량·수수료·세금 검산, 분배금 귀속 순서, 입력·설정 provenance hash | 연구 경로 회귀 검증이며 역사 원천의 정확성 증명은 아님 |
+| Phase 0-A | 신호·결정 prefix invariance, as-of 신호 재계산, t+1 시가 체결 검증 + 누수 3종 주입 탐지(`scripts/test_lookahead_bias.py`) | 합성 fixture MVP. 실데이터·NAV/total-return·기업행위·PIT 경로는 미포함 |
 | Phase 1 | 최신 snapshot-as-of PIT membership, 미래 snapshot 차단, 거래일 기반 coverage preflight | static 경로와 분리; historical source 미검증 시 승인 차단 |
 | Phase 2 | manifest-bound 기업행위 ledger, payment-date receivable, split/reverse split, suspension/delisting/settlement lifecycle, strict 출력 격리 | strict 모드에서 blocker가 있으면 성과 산출 안 함 |
 | Phase 3 | OHLCV 참여율, partial/one-day carry, zero-volume·missing-open·suspension·possible-lock 진단, AUM 시나리오, reconciliation, 원자적 출력 교체 | **OHLCV capacity scenario**이며 실제 역사적 체결이 아님 |
@@ -95,6 +96,7 @@ uv run python run_etf_backtest.py --approval-strict --mode single \
 
 # 핵심 회귀 fixture
 uv run python scripts/test_backtest_integrity.py
+uv run python scripts/test_lookahead_bias.py
 uv run python scripts/test_pit_universe.py
 uv run python scripts/test_corporate_actions.py
 uv run python scripts/test_execution_realism.py
@@ -106,6 +108,30 @@ uv run python scripts/test_walk_forward_validation.py
 결과 경로는 legacy `outputs_etf_only/`, strict `outputs_approval/`, capacity
 `outputs_execution/`이다. `uv run ruff check .`는 기존 Ruff debt 때문에 전체 green
 증거가 아니며, 변경 범위의 scoped Ruff와 fixture 결과를 별도로 보존한다.
+
+## 미래정보 누수 검증 (P0-A)
+
+`scripts/test_lookahead_bias.py`는 운영 신호 경로(`load_etf_price` →
+`rank_etfs` → `run_etf_strategy`)를 합성 fixture로 그대로 실행하고, 결정 시점과
+체결 시점을 분리해 다음을 검사한다.
+
+| 검사 | 보장 |
+|---|---|
+| signal prefix invariance | 기준 시점 T까지의 OHLCV 신호가 T 이후 데이터 추가·변경에 불변 |
+| decision prefix invariance | T까지의 리밸런싱 결정(순위/목표/게이트)과 실행일이 불변, 실행일 > 결정일 |
+| as-of signal recompute | 시점 t의 종가·`ret_60`·`ret_120`·`ma20`·`ma60`·`trend_ok`가 t까지의 종가로 재현 가능 |
+| execution next open | 체결일이 결정일 다음 거래일이고 체결가가 실행일 시가(스프레드 반영) 기준 |
+
+누수 주입 시 실제 경로에서 실패하는지도 확인한다(주입 미적용 시 전 항목 PASS).
+
+- shift(-1) 오프바이원 정렬(전일 행에 당일 값) → `asof_signal_recompute` 검출
+- 전 구간 평균 유동성 정규화(미래 통계 참조) → `signal_prefix_invariance` + `decision_prefix_invariance` 검출
+- 당일 종가 체결(실행일 시가 자리에 결정일 종가) → `execution_next_open` 검출
+
+검증되지 않는 영역: NAV/total-return 기준, 분배금·기업행위, PIT 유니버스,
+trailing/portfolio stop 오버레이(`exit_check_days=0`으로 비활성), 실데이터의
+거래정지·결측가·호가·부분체결. 주문 수량 산정은 실행일 시가를 사용하는 기존
+가정을 그대로 두며, 본 검증은 "선택 신호"의 인과성만 확인한다.
 
 ## 남은 blocker와 승인 전 evidence
 
