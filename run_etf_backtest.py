@@ -487,7 +487,15 @@ def get_price(
 
             # 완전 커버되면 서브셋 반환
             if cached_min <= start_req and cached_max >= end_req:
-                subset = df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)].copy()
+                # 캐시 파일이 역순/중복으로 오염되어 있어도 호출자에게는 정렬·중복제거된
+                # 시계열만 반환한다. (중복 날짜가 그대로 나가면 pct_change/rolling 계산이
+                # 왜곡되므로 병합 경로와 동일한 정규화를 적용한다.)
+                subset = (
+                    df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)]
+                    .drop_duplicates(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
                 print(f"[캐시] {ticker} 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
                 return subset
 
@@ -508,7 +516,11 @@ def get_price(
                             fetch_etf_ohlcv_with_nav, fetch_start, fetch_end, ticker
                         )
                     except Exception as e:
-                        print(f"[캐시] {ticker} left 호출 실패: {e}")
+                        # 부분 캐시를 완전한 결과처럼 반환하면 신호가 조용히 잘린다.
+                        # 전체 재조회로 대체한다.
+                        raise _RefreshPriceCacheRequired(
+                            f"{ticker} left 증분 조회 실패: {e}"
+                        ) from e
                     else:
                         try:
                             df_left = raw_left.copy() if isinstance(raw_left, pd.DataFrame) else pd.DataFrame()
@@ -519,7 +531,9 @@ def get_price(
                             else:
                                 print(f"[캐시] {ticker} left 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
-                            print(f"[캐시] {ticker} left 증분 처리 실패: {e}")
+                            raise _RefreshPriceCacheRequired(
+                                f"{ticker} left 증분 처리 실패: {e}"
+                            ) from e
 
             # 오른쪽(최신) 구간이 필요하면 조회
             if end_req > cached_max:
@@ -535,7 +549,9 @@ def get_price(
                             fetch_etf_ohlcv_with_nav, fetch_start, fetch_end, ticker
                         )
                     except Exception as e:
-                        print(f"[캐시] {ticker} right 호출 실패: {e}")
+                        raise _RefreshPriceCacheRequired(
+                            f"{ticker} right 증분 조회 실패: {e}"
+                        ) from e
                     else:
                         try:
                             df_right = raw_right.copy() if isinstance(raw_right, pd.DataFrame) else pd.DataFrame()
@@ -546,7 +562,9 @@ def get_price(
                             else:
                                 print(f"[캐시] {ticker} right 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
-                            print(f"[캐시] {ticker} right 증분 처리 실패: {e}")
+                            raise _RefreshPriceCacheRequired(
+                                f"{ticker} right 증분 처리 실패: {e}"
+                            ) from e
 
             if fetched:
                 parts = [p for p in to_concat if isinstance(p, pd.DataFrame) and not p.empty]
@@ -573,7 +591,12 @@ def get_price(
                 return subset
             else:
                 # 일부만 캐시되어 있고 증분 불가한 경우 가능하면 서브셋 반환
-                subset = df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)].copy()
+                subset = (
+                    df_cached[(df_cached["date"] >= start_req) & (df_cached["date"] <= end_req)]
+                    .drop_duplicates(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
                 if not subset.empty:
                     print(f"[캐시] {ticker} 부분 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
                     return subset
