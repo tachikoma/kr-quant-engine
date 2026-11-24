@@ -668,6 +668,7 @@ def get_index_data() -> pd.DataFrame:
 
             to_concat = [idx_cached]
             fetched = False
+            incremental_failed = False
 
             if start_req < cached_min:
                 fetch_start = start_req.strftime("%Y%m%d")
@@ -681,6 +682,7 @@ def get_index_data() -> pd.DataFrame:
                         raw_left = _call_capture_stderr(get_stock().get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
                     except Exception as e:
                         print(f"[캐시] KOSPI left 호출 실패: {e}")
+                        incremental_failed = True
                     else:
                         try:
                             if hasattr(raw_left, "columns"):
@@ -698,6 +700,7 @@ def get_index_data() -> pd.DataFrame:
                                 print(f"[캐시] KOSPI left 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
                             print(f"[캐시] KOSPI left 정규화 실패: {e}; 원본 컬럼={list(raw_left.columns) if hasattr(raw_left, 'columns') else None}")
+                            incremental_failed = True
 
             if end_req > cached_max:
                 fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
@@ -711,6 +714,7 @@ def get_index_data() -> pd.DataFrame:
                         raw_right = _call_capture_stderr(get_stock().get_index_ohlcv_by_date, fetch_start, fetch_end, KOSPI_INDEX_CODE)
                     except Exception as e:
                         print(f"[캐시] KOSPI right 호출 실패: {e}")
+                        incremental_failed = True
                     else:
                         try:
                             if hasattr(raw_right, "columns"):
@@ -728,6 +732,12 @@ def get_index_data() -> pd.DataFrame:
                                 print(f"[캐시] KOSPI right 증분 비어있음: {fetch_start}~{fetch_end}")
                         except Exception as e:
                             print(f"[캐시] KOSPI right 정규화 실패: {e}; 원본 컬럼={list(raw_right.columns) if hasattr(raw_right, 'columns') else None}")
+                            incremental_failed = True
+
+            if incremental_failed:
+                # 한쪽 구간만 병합한 결과를 반환하면 요청 기간의 반대편이 조용히 빠진다.
+                # 기존 전체 재조회 경로로 복구한다(그마저 실패하면 예외가 전파된다).
+                raise _RefreshPriceCacheRequired("KOSPI 증분 조회 실패 — 전체 재조회")
 
             if fetched:
                 # 빈 프레임을 제외하여 concat 관련 FutureWarning 제거
@@ -761,6 +771,8 @@ def get_index_data() -> pd.DataFrame:
                     print(f"[캐시] KOSPI 캐시 저장 실패: {e}")
                 df = idx_new[(idx_new["date"] >= start_req) & (idx_new["date"] <= end_req)]
                 return df[["date", "close", "market_ma", "market_ma_slope", "risk_on"]]
+        except _RefreshPriceCacheRequired as e:
+            print(f"[캐시] {e}")
         except Exception as e:
             print(f"[캐시] KOSPI 캐시 읽기 실패: {e}; 재조회")
 

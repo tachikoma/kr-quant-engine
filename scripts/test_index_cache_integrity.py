@@ -111,11 +111,11 @@ def us_expected() -> pd.DataFrame:
     )
 
 
-def kospi_expected_window() -> pd.DataFrame:
+def kospi_expected_window(start: str = START, end: str = END) -> pd.DataFrame:
     """요청 구간만 내려받았을 때(전체 재조회 경로)의 지표 기대값."""
     source = kospi_expected()
     window = source[
-        (source["date"] >= pd.to_datetime(START)) & (source["date"] <= pd.to_datetime(END))
+        (source["date"] >= pd.to_datetime(start)) & (source["date"] <= pd.to_datetime(end))
     ]
     return independent_indicators(window, "market_ma", "market_ma_slope", "risk_on")
 
@@ -444,6 +444,110 @@ def check_kospi_incremental_left() -> None:
             atol=1e-9,
         ):
             raise AssertionError("과거 구간 병합 결과의 close가 원천과 다릅니다")
+
+
+def _cache_bytes() -> bytes:
+    return (Path("data_cache") / "index.parquet").read_bytes()
+
+
+def check_kospi_partial_side_failure_left() -> None:
+    """left 조회 실패 + right 성공이면 부분 병합을 반환하지 않고 전체 재조회로 복구한다."""
+    expected = kospi_expected()
+    cached = expected[
+        (expected["date"] >= pd.Timestamp("2023-12-01"))
+        & (expected["date"] <= pd.Timestamp("2024-02-29"))
+    ]
+    stock = FakeKrxStock(expected)
+    stock.fail_predicate = lambda _start, end: pd.to_datetime(end) < pd.Timestamp("2023-12-01")
+    with temp_cwd():
+        write_index_cache(cached)
+        with patched(stock=stock, start="20230901"):
+            frame = backtest.get_index_data()
+        if not any(call[0] == "20230901" and call[1] == END for call in stock.calls):
+            raise AssertionError(f"전체 재조회로 복구되지 않았습니다: {stock.calls}")
+        assert_sorted_unique(frame, "check_kospi_partial_side_failure_left", INDEX_COLUMNS)
+        # 전체 재조회 경로는 요청 구간만 내려받아 지표를 계산한다(기존 동작).
+        assert_indicator_match(
+            frame,
+            kospi_expected_window(start="20230901"),
+            "check_kospi_partial_side_failure_left",
+            ("market_ma", "market_ma_slope"),
+            start="20230901",
+        )
+
+
+def check_kospi_partial_side_failure_right() -> None:
+    """left 성공 + right 조회 실패여도 부분 병합을 반환하지 않는다."""
+    expected = kospi_expected()
+    cached = expected[
+        (expected["date"] >= pd.Timestamp("2023-12-01"))
+        & (expected["date"] <= pd.Timestamp("2024-02-29"))
+    ]
+    stock = FakeKrxStock(expected)
+    stock.fail_predicate = lambda start, _end: pd.to_datetime(start) > pd.Timestamp("2024-02-29")
+    with temp_cwd():
+        write_index_cache(cached)
+        with patched(stock=stock, start="20230901"):
+            frame = backtest.get_index_data()
+        if not any(call[0] == "20230901" and call[1] == END for call in stock.calls):
+            raise AssertionError(f"전체 재조회로 복구되지 않았습니다: {stock.calls}")
+        assert_sorted_unique(frame, "check_kospi_partial_side_failure_right", INDEX_COLUMNS)
+        assert_indicator_match(
+            frame,
+            kospi_expected_window(start="20230901"),
+            "check_kospi_partial_side_failure_right",
+            ("market_ma", "market_ma_slope"),
+            start="20230901",
+        )
+
+
+def check_kospi_all_sides_failure_raises() -> None:
+    """양쪽 증분과 전체 재조회가 모두 실패하면 예외로 전파하고 캐시를 보존한다."""
+    expected = kospi_expected()
+    cached = expected[
+        (expected["date"] >= pd.Timestamp("2023-12-01"))
+        & (expected["date"] <= pd.Timestamp("2024-02-29"))
+    ]
+    stock = FakeKrxStock(expected)
+    stock.fail_predicate = lambda *_args: True
+    with temp_cwd():
+        write_index_cache(cached)
+        before = _cache_bytes()
+        with patched(stock=stock, start="20230901"):
+            try:
+                backtest.get_index_data()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("전체 재조회 실패가 예외로 전파되지 않았습니다")
+        if _cache_bytes() != before:
+            raise AssertionError("실패 후 기존 캐시가 덮어써졌습니다")
+
+
+def check_kospi_partial_failure_does_not_overwrite() -> None:
+    """한쪽 조회 실패 후 전체 재조회까지 실패하면 부분 결과를 반환/저장하지 않는다."""
+    expected = kospi_expected()
+    cached = expected[
+        (expected["date"] >= pd.Timestamp("2023-12-01"))
+        & (expected["date"] <= pd.Timestamp("2024-02-29"))
+    ]
+    stock = FakeKrxStock(expected)
+    stock.fail_predicate = lambda start, end: (
+        pd.to_datetime(end) < pd.Timestamp("2023-12-01")
+        or (start == "20230901" and end == END)
+    )
+    with temp_cwd():
+        write_index_cache(cached)
+        before = _cache_bytes()
+        with patched(stock=stock, start="20230901"):
+            try:
+                backtest.get_index_data()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("부분 결과가 정상 반환되었습니다")
+        if _cache_bytes() != before:
+            raise AssertionError("부분 병합 결과로 기존 캐시가 덮어써졌습니다")
 
 
 def check_kospi_incremental_failure() -> None:
@@ -866,6 +970,10 @@ def main() -> int:
         ("2a. KOSPI 최신 구간 증분 병합", check_kospi_incremental_right),
         ("2b. KOSPI 과거 구간 증분 병합", check_kospi_incremental_left),
         ("3. KOSPI 증분 실패 fallback", check_kospi_incremental_failure),
+        ("3b. KOSPI left 실패 + right 성공", check_kospi_partial_side_failure_left),
+        ("3c. KOSPI left 성공 + right 실패", check_kospi_partial_side_failure_right),
+        ("3d. KOSPI 양쪽+전체 실패 예외", check_kospi_all_sides_failure_raises),
+        ("3e. KOSPI 부분 실패 캐시 보존", check_kospi_partial_failure_does_not_overwrite),
         ("4. 미국 부분 캐시 coverage", check_us_partial_cache_not_complete),
         ("1b. 미국 전체 캐시 정렬/중복", check_us_full_cache_sorted),
         ("4b. 미국 주말 종료일 캐시 재사용", check_us_weekend_end_reuses_cache),
