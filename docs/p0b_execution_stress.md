@@ -19,6 +19,11 @@
 | `slippage` | 0.0005 | 0.0005 | 일치(비용 축에서만 변동) |
 | 유니버스·그룹·과세티커·편차 임계·유동성/상장 필터 | — | — | 전부 일치(`config_diffs=[]`) |
 
+`parameters` 외에 freeze **최상위 필드**(`universe_mode`, `universe`, `taxable_tickers`,
+`ticker_groups`, `group_risk_override`)도 함께 대조한다. 유니버스/과세/그룹은 import 시
+env override로 바뀔 수 있으므로 제자리 갱신으로 동결값을 복원하고, 데이터 로딩·유니버스
+초기화 이후 `verify_applied_settings()`로 다시 검증해 불일치 시 중단한다.
+
 동결값은 **환경변수·모듈 속성에 강제 적용**한다(`exit_check_days=0`, trailing/portfolio 0,
 target-weight off, band 0.05, trim off, liquidate on, multi-index off, gating split, US proxy QQQ,
 MA/slope 120/20, distribution tax 0). 따라서 주변 셸 환경(`ETF_EXIT_CHECK_DAYS=1` 등)이 결과를

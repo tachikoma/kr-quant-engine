@@ -329,6 +329,56 @@ def data_cache_digest() -> str:
 
 
 APPLIED: dict[str, Any] = {}
+_FROZEN_EXPECTED: dict[str, Any] = {}
+
+
+def _normalized(value: Any) -> Any:
+    if isinstance(value, set):
+        return sorted(str(item) for item in value)
+    if isinstance(value, dict):
+        return {str(key): _normalized(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_normalized(item) for item in value]
+    return value
+
+
+def _diff_against_freeze(
+    applied: dict[str, Any], expected_payload: dict[str, Any], *, skip: set[str]
+) -> list[str]:
+    diffs: list[str] = []
+    for key, actual in applied.items():
+        if key in skip or key not in expected_payload:
+            continue
+        expected = expected_payload[key]
+        if isinstance(actual, float) and isinstance(expected, (int, float)):
+            same = abs(actual - float(expected)) < 1e-12
+        else:
+            same = _normalized(actual) == _normalized(expected)
+        if not same:
+            diffs.append(f"{key}: runtime={actual!r} freeze={expected!r}")
+    return diffs
+
+
+def verify_applied_settings() -> None:
+    """데이터 로딩·유니버스 초기화 이후 실제 적용값을 freeze와 다시 대조한다."""
+    applied: dict[str, Any] = {
+        "universe_mode": str(etf_shared.UNIVERSE_MODE),
+        "universe": [str(t) for t in etf_shared.ETF_LIST],
+        "taxable_tickers": sorted(str(t) for t in etf_shared.TAXABLE_ETF_TICKERS),
+        "ticker_groups": dict(etf_shared.ETF_TICKER_GROUPS),
+        "group_risk_override": sorted(str(g) for g in etf_shared.GROUP_RISK_OVERRIDE),
+        "max_positions": int(rtb.ETF_MAX_POSITIONS),
+        "rebalance_step_days": int(rtb.REBALANCE_STEP_DAYS),
+        "sell_rank_buffer": int(rtb.ETF_SELL_RANK_BUFFER),
+        "slippage": float(rtb.BASE_SLIPPAGE),
+        "spread_pct": float(rtb.SPREAD_PCT),
+        "max_asset_pct": float(APPLIED["max_asset_pct"]),
+    }
+    diffs = _diff_against_freeze(applied, _FROZEN_EXPECTED, skip={"max_asset_pct"})
+    if diffs:
+        raise SystemExit(
+            "[p0b] 로딩 후 적용 설정이 동결값과 다릅니다: " + "; ".join(diffs)
+        )
 
 
 def configure_frozen_settings(cap: float | None) -> dict[str, Any]:
@@ -365,6 +415,23 @@ def configure_frozen_settings(cap: float | None) -> dict[str, Any]:
         }
     )
     # import 시점에 상수로 고정되는 값은 모듈 속성도 함께 맞춘다.
+    # 유니버스·과세·그룹은 import 시 env override로 바뀔 수 있으므로 동결값으로 되돌린다.
+    # (list/set/dict는 제자리에서 갱신해 rtb가 들고 있는 참조도 함께 맞춘다.)
+    etf_shared.ETF_LIST[:] = [str(t) for t in frozen["universe"]]
+    etf_shared.TAXABLE_ETF_TICKERS.clear()
+    etf_shared.TAXABLE_ETF_TICKERS.update(str(t) for t in frozen["taxable_tickers"])
+    rtb.TAXABLE_ETF_TICKERS = etf_shared.TAXABLE_ETF_TICKERS
+    etf_shared.ETF_TICKER_GROUPS.clear()
+    etf_shared.ETF_TICKER_GROUPS.update(dict(frozen["ticker_groups"]))
+    etf_shared.GROUP_RISK_OVERRIDE.clear()
+    etf_shared.GROUP_RISK_OVERRIDE.update(str(g) for g in frozen["group_risk_override"])
+    etf_shared.UNIVERSE_MODE = str(frozen["universe_mode"])
+    etf_shared._auto_universe_requested = etf_shared.UNIVERSE_MODE == "auto"
+    etf_shared._universe_overridden = True
+    # 동결 유니버스/과세 집합을 그대로 쓰기 위해 초기화 상태로 표시한다.
+    # (ensure_universe_initialized가 KRX 분류로 다시 덮어쓰지 않도록)
+    etf_shared._universe_initialized = True
+
     etf_shared.MIN_LISTING_DAYS = int(params["min_listing_days"])
     etf_shared.MIN_AVG_TRADING_VALUE = int(params["min_avg_trading_value"])
     etf_shared.MAX_PREMIUM_DISCOUNT = float(params["max_premium_discount"])
@@ -417,29 +484,28 @@ def configure_frozen_settings(cap: float | None) -> dict[str, Any]:
         "max_positions": int(rtb.ETF_MAX_POSITIONS),
         "sell_rank_buffer": int(rtb.ETF_SELL_RANK_BUFFER),
         "use_market_filter": True,
+        "universe_mode": str(etf_shared.UNIVERSE_MODE),
         "universe": [str(t) for t in etf_shared.ETF_LIST],
         "taxable_tickers": sorted(str(t) for t in etf_shared.TAXABLE_ETF_TICKERS),
         "ticker_groups": dict(etf_shared.ETF_TICKER_GROUPS),
+        "group_risk_override": sorted(str(g) for g in etf_shared.GROUP_RISK_OVERRIDE),
     }
-    diffs: list[str] = []
-    for key, actual in applied.items():
-        if key not in params:
-            continue
-        if key == "max_asset_pct":
-            # 실험 변수로 의도한 차이는 intentional_deviations에 기록한다.
-            continue
-        expected = params[key]
-        if isinstance(actual, float) and isinstance(expected, (int, float)):
-            same = abs(actual - float(expected)) < 1e-12
-        else:
-            same = actual == expected
-        if not same:
-            diffs.append(f"{key}: runtime={actual!r} freeze={expected!r}")
+    expected_payload: dict[str, Any] = {
+        **params,
+        "universe_mode": frozen["universe_mode"],
+        "universe": [str(t) for t in frozen["universe"]],
+        "taxable_tickers": sorted(str(t) for t in frozen["taxable_tickers"]),
+        "ticker_groups": dict(frozen["ticker_groups"]),
+        "group_risk_override": sorted(str(g) for g in frozen["group_risk_override"]),
+    }
+    diffs = _diff_against_freeze(applied, expected_payload, skip={"max_asset_pct"})
     if diffs:
         raise SystemExit("[p0b] 동결 설정과 불일치합니다: " + "; ".join(diffs))
 
     APPLIED.clear()
     APPLIED.update(applied)
+    _FROZEN_EXPECTED.clear()
+    _FROZEN_EXPECTED.update(expected_payload)
 
     intentional: list[str] = []
     if applied_cap != float(params["max_asset_pct"]):
@@ -907,6 +973,9 @@ def main() -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     price, index_df, dates = load_inputs()
+    with network_blocked():
+        etf_shared.ensure_universe_initialized()
+    verify_applied_settings()
     loaded = set(price["ticker"].astype(str).unique())
     missing = sorted({str(t) for t in etf_shared.ETF_LIST} - loaded)
     if missing:
