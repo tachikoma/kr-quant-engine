@@ -655,8 +655,15 @@ def get_index_data() -> pd.DataFrame:
 
             if cached_min <= start_req and cached_max >= end_req:
                 print(f"[캐시] KOSPI 인덱스 재사용: {cache_parquet} ({cached_min.date()}~{cached_max.date()})")
-                df = idx_cached.copy()
-                df = df[(df["date"] >= start_req) & (df["date"] <= end_req)]
+                # 캐시가 역순/중복으로 오염되어 있어도 호출자에게는 정렬·중복제거된
+                # 시계열만 반환한다. is_risk_on은 date 필터 후 iloc[-1]을 쓰므로
+                # 정렬되지 않은 캐시는 위험 신호를 조용히 왜곡한다.
+                df = (
+                    idx_cached[(idx_cached["date"] >= start_req) & (idx_cached["date"] <= end_req)]
+                    .drop_duplicates(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
                 return df[["date", "close", "market_ma", "market_ma_slope", "risk_on"]]
 
             to_concat = [idx_cached]
@@ -817,6 +824,33 @@ def is_risk_on(index_df: pd.DataFrame, date: pd.Timestamp) -> bool:
     return bool(last["risk_on"])
 
 
+def _cache_window_covered(
+    dates: pd.Series, start_req: pd.Timestamp, end_req: pd.Timestamp
+) -> bool:
+    """캐시 **행**이 요청 구간 ``[start_req, end_req]``을 커버하는지 판정한다.
+
+    실제 거래일이 없는 구간(주말)만 비어 있으면 커버로 본다. 휴장일은 평일이므로
+    미커버로 판정되어 재조회될 수 있으나, 재조회는 기존 이력을 병합하므로 신호는
+    유지된다(달력 추정으로 실제 결손을 놓치는 것보다 안전하다).
+    """
+    values = pd.to_datetime(pd.Series(dates)).dropna()
+    if values.empty:
+        return False
+    cached_min = values.min()
+    cached_max = values.max()
+    if cached_min > start_req and _range_has_weekday(
+        start_req.strftime("%Y%m%d"), (cached_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    ):
+        return False
+    return not (
+        cached_max < end_req
+        and _range_has_weekday(
+            (cached_max + pd.Timedelta(days=1)).strftime("%Y%m%d"),
+            end_req.strftime("%Y%m%d"),
+        )
+    )
+
+
 def get_us_index_data() -> pd.DataFrame:
     """미국 지수(ETF proxy) 데이터를 조회해 risk_on 시그널을 계산한다."""
     if yf is None:
@@ -828,24 +862,62 @@ def get_us_index_data() -> pd.DataFrame:
     cache_file = cache_dir / f"us_index_{US_RISK_PROXY}.parquet"
     use_cache = os.environ.get("ETF_USE_CACHE", "1") != "0"
     force_refresh = os.environ.get("ETF_REFRESH_CACHE", "0") == "1"
+    cached_frame: pd.DataFrame | None = None
 
     if use_cache and cache_file.exists() and not force_refresh:
         try:
             cached = pd.read_parquet(cache_file)
+            cached_frame = cached
             cached["date"] = pd.to_datetime(cached["date"])
             req_start = pd.to_datetime(START)
             req_end = pd.to_datetime(END)
-            out = cached[(cached["date"] >= req_start) & (cached["date"] <= req_end)].copy()
-            if not out.empty:
-                return out[["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"]]
+            # 캐시 행이 요청 구간을 덮는지로만 판정한다(휴장 여부는 추정하지 않음).
+            # 휴장일 종료 구간은 한 번 재조회되지만, 재조회 시 기존 이력을 병합해
+            # 지표를 재계산하므로 신호는 유지된다.
+            if _cache_window_covered(cached["date"], req_start, req_end):
+                out = (
+                    cached[(cached["date"] >= req_start) & (cached["date"] <= req_end)]
+                    .drop_duplicates(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
+                if not out.empty:
+                    return out[["date", "close", "us_market_ma", "us_market_ma_slope", "us_risk_on"]]
+            else:
+                print(
+                    f"[캐시] {US_RISK_PROXY} 부분 캐시"
+                    f"({cached['date'].min().date()}~{cached['date'].max().date()}) — 전체 재조회"
+                )
         except Exception:
             pass
 
+    if use_cache and cached_frame is None and cache_file.exists():
+        # 강제 갱신/캐시 블록 미실행 시에도 병합·구간 확장을 위해 한 번만 읽는다.
+        try:
+            cached_frame = pd.read_parquet(cache_file)
+            cached_frame["date"] = pd.to_datetime(cached_frame["date"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"[캐시] {US_RISK_PROXY} 캐시 읽기 실패: {exc} — 신규 조회로 대체")
+            cached_frame = None
+
+    # 기존 캐시와 요청 구간 사이에 미조회 구간이 생기지 않도록, 두 구간의 **합집합**을
+    # 조회한다. 시작일만 확장하면 캐시보다 이른 구간을 요청할 때 역방향 결손이 남는다.
+    download_start = pd.to_datetime(START)
+    download_end = pd.to_datetime(END)
+    if cached_frame is not None and not cached_frame.empty:
+        cached_dates = pd.to_datetime(cached_frame["date"])
+        cached_min_value = cached_dates.min()
+        cached_max_value = cached_dates.max()
+        if pd.notna(cached_min_value) and cached_min_value < download_start:
+            download_start = cached_min_value
+        if pd.notna(cached_max_value) and cached_max_value > download_end:
+            download_end = cached_max_value
+
     try:
-        end_dt = pd.to_datetime(END) + pd.Timedelta(days=1)
+        end_dt = pd.to_datetime(download_end) + pd.Timedelta(days=1)
         raw = yf.download(
             US_RISK_PROXY,
-            start=pd.to_datetime(START),
+            start=download_start,
             end=end_dt,
             progress=False,
             auto_adjust=False,
@@ -902,11 +974,40 @@ def get_us_index_data() -> pd.DataFrame:
         }
     )
     us = us.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+
+    # 재조회 구간이 짧으면 캐시가 갖고 있던 긴 이력(워밍업)을 잃고 지표가 NaN이 되어
+    # risk 신호가 fallback(True)으로 무너진다. 기존 이력을 합쳐 지표를 재계산한다.
+    merge_failed = False
+    if use_cache and cache_file.exists():
+        try:
+            if cached_frame is None:
+                # 캐시를 읽지 못한 상태에서 짧은 결과로 교체하면 이력이 소실된다.
+                raise ValueError("기존 캐시를 읽지 못했습니다")
+            previous = pd.DataFrame(
+                {
+                    "date": pd.to_datetime(cached_frame["date"]),
+                    "close": pd.to_numeric(cached_frame["close"], errors="coerce"),
+                }
+            ).dropna(subset=["close"])
+            merged = pd.concat([previous, us], ignore_index=True)
+            # 같은 날짜는 새로 받은 값을 우선한다.
+            us = (
+                merged.drop_duplicates(subset=["date"], keep="last")
+                .sort_values("date")
+                .reset_index(drop=True)
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # 병합에 실패했는데 짧은 결과로 캐시를 교체하면 워밍업 이력이 영구 소실된다.
+            merge_failed = True
+            print(f"[캐시] {US_RISK_PROXY} 기존 캐시 병합 실패({exc}) — 캐시 교체 생략")
+
     us["us_market_ma"] = us["close"].rolling(US_MARKET_MA_DAYS).mean()
     us["us_market_ma_slope"] = us["us_market_ma"] - us["us_market_ma"].shift(US_MARKET_SLOPE_DAYS)
     us["us_risk_on"] = (us["close"] >= us["us_market_ma"]) & (us["us_market_ma_slope"] >= 0)
 
-    if use_cache:
+    # 병합 실패 시 캐시 교체를 막아 워밍업 이력 소실을 방지한다. 단 강제 갱신은
+    # 손상된 캐시를 복구하는 경로이므로 교체를 허용한다.
+    if use_cache and not (merge_failed and not force_refresh):
         try:
             tmp = cache_file.with_suffix(".parquet.tmp")
             us.to_parquet(tmp)
