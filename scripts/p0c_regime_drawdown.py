@@ -243,6 +243,7 @@ def episode_detail(
     contrib: pd.DataFrame,
     price: pd.DataFrame,
     index_df: pd.DataFrame,
+    labels: pd.DataFrame,
 ) -> dict[str, Any]:
     peak = pd.Timestamp(episode["peak_date"])
     trough = pd.Timestamp(episode["trough_date"])
@@ -301,6 +302,15 @@ def episode_detail(
         .sum()
         .sort_values("contribution")
     )
+    window_risk = labels.loc[
+        (labels.index > peak) & (labels.index <= trough), "risk"
+    ]
+    risk_off_days = int((window_risk == "risk_off").sum())
+    risk_off_first = (
+        window_risk[window_risk == "risk_off"].index.min()
+        if risk_off_days
+        else pd.NaT
+    )
     window_trades = trades[
         (pd.to_datetime(trades["date"]) > peak) & (pd.to_datetime(trades["date"]) <= trough)
     ]
@@ -344,6 +354,12 @@ def episode_detail(
         "fee_cost": costs["fee_cost"],
         "tax_cost": costs["tax_cost"],
         "slippage_cost": costs["slippage_cost"],
+        "risk_off_days": risk_off_days,
+        "first_risk_off_date": (
+            pd.Timestamp(risk_off_first).strftime("%Y-%m-%d")
+            if pd.notna(risk_off_first)
+            else None
+        ),
         "trades": len(window_trades),
         "holdings": ",".join(sorted(by_ticker["ticker"].tolist())),
         "group_contribution": json.dumps(
@@ -486,6 +502,60 @@ def regime_stats(
     return pd.DataFrame(rows), pd.DataFrame(asset_rows)
 
 
+def episode_timeline(
+    rank: int,
+    episode: pd.Series,
+    curve: pd.DataFrame,
+    trades: pd.DataFrame,
+    labels: pd.DataFrame,
+    dates: list[pd.Timestamp],
+) -> pd.DataFrame:
+    """낙폭 구간의 신호·리밸런싱 결정·실행·주문을 일자별로 남긴다(재현용)."""
+    peak = pd.Timestamp(episode["peak_date"])
+    trough = pd.Timestamp(episode["trough_date"])
+    calendar = [pd.Timestamp(d) for d in dates if peak <= pd.Timestamp(d) <= trough]
+    curve_idx = curve.set_index("date")
+    decision_dates = set(
+        pd.to_datetime(curve_idx.index[curve_idx["rebalance_decision"].astype(bool)])
+    )
+    trades_by_date = {
+        pd.Timestamp(d): grp for d, grp in trades.groupby("date")
+    }
+    rows: list[dict[str, Any]] = []
+    for position, date in enumerate(calendar):
+        previous = calendar[position - 1] if position else None
+        orders = ""
+        group = trades_by_date.get(date)
+        if group is not None:
+            orders = "; ".join(
+                f"{str(row.side).upper()} {row.ticker} x{int(row.qty)}"
+                for row in group.itertuples()
+            )
+        in_curve = date in curve_idx.index
+        row = {
+            "rank": rank,
+            "date": date.strftime("%Y-%m-%d"),
+            "risk": labels.at[date, "risk"] if date in labels.index else None,
+            "trend": labels.at[date, "trend"] if date in labels.index else None,
+            "vol": labels.at[date, "vol"] if date in labels.index else None,
+            "equity": float(curve_idx.at[date, "equity"]) if in_curve else None,
+            "cash": float(curve_idx.at[date, "cash"]) if in_curve else None,
+            "rebalance_decision": bool(
+                curve_idx.at[date, "rebalance_decision"]
+            )
+            if in_curve
+            else False,
+            "rebalance_order_count": int(curve_idx.at[date, "rebalance_order_count"])
+            if in_curve
+            else 0,
+            "is_execution_day": previous in decision_dates if previous else False,
+            "orders_on_date": orders,
+            "holdings": str(curve_idx.at[date, "holdings"]) if in_curve else "",
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # --------------------------------------------------------------------------- #
 # C/D. 필터 실효성·집중도
 # --------------------------------------------------------------------------- #
@@ -567,11 +637,12 @@ def worst_episode_summary(
     price: pd.DataFrame,
     index_df: pd.DataFrame,
     dates: list[pd.Timestamp],
+    labels: pd.DataFrame,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     equity = equity_with_initial(curve, dates)
     episodes = drawdown_episodes(equity)
     worst = episodes.iloc[0]
-    detail = episode_detail(worst, curve, trades, contrib, price, index_df)
+    detail = episode_detail(worst, curve, trades, contrib, price, index_df, labels)
     contributions = contrib[
         (pd.to_datetime(contrib["date"]) > pd.Timestamp(worst["peak_date"]))
         & (pd.to_datetime(contrib["date"]) <= pd.Timestamp(worst["trough_date"]))
@@ -590,6 +661,7 @@ def worst_episode_summary(
 def main() -> int:
     frozen = p0b.configure_frozen_settings(CAP_FROZEN)
     p0b.rtb.START, p0b.rtb.END = p0b.DEFAULT_START, p0b.DEFAULT_END
+    preflight = p0b.preflight_cache(p0b.DEFAULT_START, p0b.DEFAULT_END)
     digest_before = p0b.data_cache_digest()
     price, index_df, dates = p0b.load_inputs()
     p0b.verify_applied_settings()
@@ -618,10 +690,12 @@ def main() -> int:
     contrib = contributions(curve, trades, closes)
     equity = equity_with_initial(curve, dates)
     episodes = drawdown_episodes(equity)
+    labels = regime_labels(index_df, dates)
 
     top = episodes.head(TOP_DRAWDOWNS).copy()
     detail_rows = [
-        episode_detail(row, curve, trades, contrib, price, index_df) for _, row in top.iterrows()
+        episode_detail(row, curve, trades, contrib, price, index_df, labels)
+        for _, row in top.iterrows()
     ]
     drawdowns = pd.DataFrame(detail_rows)
     drawdowns.insert(0, "rank", range(1, len(drawdowns) + 1))
@@ -650,8 +724,14 @@ def main() -> int:
         OUTPUT_DIR / "drawdown_contributions.csv", index=False, encoding="utf-8-sig"
     )
 
+    timelines = []
+    for rank, (_, row) in enumerate(top.iterrows(), start=1):
+        timelines.append(episode_timeline(rank, row, curve, trades, labels, dates))
+    pd.concat(timelines, ignore_index=True).to_csv(
+        OUTPUT_DIR / "drawdown_timeline.csv", index=False, encoding="utf-8-sig"
+    )
+
     # B. Regime ---------------------------------------------------------------
-    labels = regime_labels(index_df, dates)
     regime_df, regime_asset = regime_stats(equity, curve, trades, contrib, labels)
     regime_df.to_csv(OUTPUT_DIR / "regime_performance.csv", index=False, encoding="utf-8-sig")
     regime_asset.to_csv(
@@ -701,10 +781,10 @@ def main() -> int:
     )
     cap50_contrib = contributions(cap50_curve, cap50_trades, closes)
     worst85, worst85_ticker = worst_episode_summary(
-        curve, trades, contrib, price, index_df, dates
+        curve, trades, contrib, price, index_df, dates, labels
     )
     worst50, worst50_ticker = worst_episode_summary(
-        cap50_curve, cap50_trades, cap50_contrib, price, index_df, dates
+        cap50_curve, cap50_trades, cap50_contrib, price, index_df, dates, labels
     )
     concentration_rows = []
     for cap, detail, ticker_df, curve_cap, trades_cap in (
@@ -753,6 +833,7 @@ def main() -> int:
         "oos_start_date": frozen["oos_start_date"],
         "git_commit": p0b.git_commit(),
         "data_cache_digest": digest_before,
+        "preflight": preflight,
         "data_cache_unchanged": True,
         "baseline": baseline,
         "baseline_matches_p0b": True,
