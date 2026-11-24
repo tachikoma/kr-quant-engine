@@ -879,8 +879,10 @@ def get_us_index_data() -> pd.DataFrame:
     if use_cache and cache_file.exists() and not force_refresh:
         try:
             cached = pd.read_parquet(cache_file)
-            cached_frame = cached
+            # 날짜 변환까지 성공한 프레임만 캐시로 인정한다. 변환 실패 프레임을
+            # 남겨두면 이후 구간 계산에서 KeyError/DateParseError가 밖으로 샌다.
             cached["date"] = pd.to_datetime(cached["date"])
+            cached_frame = cached
             req_start = pd.to_datetime(START)
             req_end = pd.to_datetime(END)
             # 캐시 행이 요청 구간을 덮는지로만 판정한다(휴장 여부는 추정하지 않음).
@@ -906,8 +908,9 @@ def get_us_index_data() -> pd.DataFrame:
     if use_cache and cached_frame is None and cache_file.exists():
         # 강제 갱신/캐시 블록 미실행 시에도 병합·구간 확장을 위해 한 번만 읽는다.
         try:
-            cached_frame = pd.read_parquet(cache_file)
-            cached_frame["date"] = pd.to_datetime(cached_frame["date"])
+            cached = pd.read_parquet(cache_file)
+            cached["date"] = pd.to_datetime(cached["date"])
+            cached_frame = cached
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"[캐시] {US_RISK_PROXY} 캐시 읽기 실패: {exc} — 신규 조회로 대체")
             cached_frame = None

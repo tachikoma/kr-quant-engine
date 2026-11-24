@@ -872,6 +872,53 @@ def check_us_backward_request_fills_gap() -> None:
         )
 
 
+def check_us_corrupt_cache_missing_date() -> None:
+    """date 컬럼이 없는 캐시는 예외 없이 신규 조회로 대체되고 덮어쓰지 않는다."""
+    expected = us_expected()
+    broken = expected[["close", "us_market_ma", "us_market_ma_slope"]].copy()
+    path = Path("data_cache") / f"us_index_{US_PROXY}.parquet"
+    yfinance = FakeYFinance(expected)
+    with temp_cwd():
+        path.parent.mkdir(exist_ok=True)
+        broken.to_parquet(path, index=False)
+        before = path.read_bytes()
+        with patched(yfinance=yfinance):
+            frame = backtest.get_us_index_data()
+        if not yfinance.calls:
+            raise AssertionError("손상 캐시인데 신규 조회가 없습니다")
+        assert_sorted_unique(frame, "check_us_corrupt_cache_missing_date", US_COLUMNS)
+        if pd.to_datetime(frame["date"]).max() < pd.Timestamp(END):
+            raise AssertionError("신규 조회 결과가 요청 종료일까지 차지 않습니다")
+        if path.read_bytes() != before:
+            raise AssertionError("손상 캐시가 덮어써졌습니다")
+
+
+def check_us_corrupt_cache_invalid_dates() -> None:
+    """날짜 값이 깨진 캐시도 예외 없이 신규 조회로 대체된다."""
+    expected = us_expected()
+    broken = expected[["date", "close"]].head(30).copy()
+    broken["date"] = ["not-a-date"] * len(broken)
+    path = Path("data_cache") / f"us_index_{US_PROXY}.parquet"
+    yfinance = FakeYFinance(expected)
+    with temp_cwd():
+        path.parent.mkdir(exist_ok=True)
+        broken.to_parquet(path, index=False)
+        before = path.read_bytes()
+        with patched(yfinance=yfinance):
+            frame = backtest.get_us_index_data()
+        if not yfinance.calls:
+            raise AssertionError("손상 캐시인데 신규 조회가 없습니다")
+        if path.read_bytes() != before:
+            raise AssertionError("손상 캐시가 덮어써졌습니다")
+        assert_sorted_unique(frame, "check_us_corrupt_cache_invalid_dates", US_COLUMNS)
+        assert_indicator_match(
+            frame,
+            us_expected_window(),
+            "check_us_corrupt_cache_invalid_dates",
+            ("us_market_ma", "us_market_ma_slope"),
+        )
+
+
 def check_us_weekend_end_reuses_cache() -> None:
     """주말 종료일은 거래일 갭이 아니므로 재조회 없이 캐시를 재사용한다(과잉 재조회 방지)."""
     expected = us_expected()
@@ -978,6 +1025,8 @@ def main() -> int:
         ("1b. 미국 전체 캐시 정렬/중복", check_us_full_cache_sorted),
         ("4b. 미국 주말 종료일 캐시 재사용", check_us_weekend_end_reuses_cache),
         ("4c. 미국 휴장 경계 캐시 재사용", check_us_holiday_edges_reuse_cache),
+        ("4c-1. 미국 캐시 date 컬럼 누락", check_us_corrupt_cache_missing_date),
+        ("4c-2. 미국 캐시 날짜값 손상", check_us_corrupt_cache_invalid_dates),
         ("4d. 미국 재조회 시 이력 보존", check_us_refetch_preserves_history),
         ("4e. 미국 최근 거래일 누락 재조회", check_us_recent_gap_refetches),
         ("4f. 미국 병합 실패 시 캐시 보존", check_us_merge_failure_keeps_cache),
