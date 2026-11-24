@@ -43,6 +43,7 @@ os.environ.setdefault("ETF_REFRESH_CACHE", "0")
 import parameter_stability as stability
 
 import etf_shared
+import pykrx_utils
 import run_etf_backtest as rtb
 
 OUTPUT_DIR = ROOT / "outputs_p0b"
@@ -219,15 +220,14 @@ def preflight_cache(start: str, end: str) -> dict[str, Any]:
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
     problems: list[str] = []
-    digests: dict[str, str] = {}
-    listing_dates = rtb.get_listing_dates(ticker_subset=set(etf_shared.ETF_LIST))
+    with network_blocked():
+        listing_dates = rtb.get_listing_dates(ticker_subset=set(etf_shared.ETF_LIST))
     for ticker in etf_shared.ETF_LIST:
         path = ROOT / "data_cache" / f"{ticker}.parquet"
         if not path.exists():
             problems.append(f"{ticker}: 캐시 없음")
             continue
         dates = pd.to_datetime(pd.read_parquet(path, columns=["date"])["date"])
-        digests[str(ticker)] = hashlib.sha256(path.read_bytes()).hexdigest()
         if dates.max() < end_ts:
             problems.append(f"{ticker}: 캐시 종료 {dates.max().date()} < {end_ts.date()}")
             continue
@@ -248,7 +248,6 @@ def preflight_cache(start: str, end: str) -> dict[str, Any]:
         problems.append("index.parquet 없음")
     else:
         index_dates = pd.to_datetime(pd.read_parquet(index_path, columns=["date"])["date"])
-        digests["__index__"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
         if index_dates.min() > start_ts:
             problems.append(
                 f"index: 캐시 시작 {index_dates.min().date()} > {start_ts.date()} (좌측 조회 필요)"
@@ -260,11 +259,10 @@ def preflight_cache(start: str, end: str) -> dict[str, Any]:
             "[p0b] 캐시가 요청 구간을 덮지 않습니다(네트워크/쓰기 방지). --start/--end를 조정하세요:\n  "
             + "\n  ".join(problems)
         )
-    payload = json.dumps(digests, sort_keys=True).encode("utf-8")
     return {
-        "data_cache_digest": hashlib.sha256(payload).hexdigest(),
+        "data_cache_digest": data_cache_digest(),
         "universe_size": len(etf_shared.ETF_LIST),
-        "cache_files": len(digests),
+        "cache_files": len(cache_file_digests()),
     }
 
 
@@ -283,6 +281,7 @@ def network_blocked() -> Iterator[None]:
     original_fetch = rtb.fetch_etf_ohlcv_with_nav
     original_stock = rtb.get_stock
     original_yf = rtb.yf
+    original_tax_fetch = pykrx_utils.fetch_and_cache_tax_classification
 
     def _blocked(*_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("P0-B: 네트워크 조회가 차단되었습니다(캐시 전용 실행)")
@@ -290,12 +289,178 @@ def network_blocked() -> Iterator[None]:
     rtb.fetch_etf_ohlcv_with_nav = _blocked
     rtb.get_stock = _blocked
     rtb.yf = None
+    pykrx_utils.fetch_and_cache_tax_classification = _blocked
     try:
         yield
     finally:
         rtb.fetch_etf_ohlcv_with_nav = original_fetch
         rtb.get_stock = original_stock
         rtb.yf = original_yf
+        pykrx_utils.fetch_and_cache_tax_classification = original_tax_fetch
+
+
+FREEZE_PATH = ROOT / "strategy_freeze.json"
+
+
+def cache_file_digests() -> dict[str, str]:
+    digests: dict[str, str] = {}
+    for ticker in etf_shared.ETF_LIST:
+        path = ROOT / "data_cache" / f"{ticker}.parquet"
+        if path.exists():
+            digests[str(ticker)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    index_path = ROOT / "data_cache" / "index.parquet"
+    if index_path.exists():
+        digests["__index__"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    classification = ROOT / "data_cache" / "etf_tax_classification.parquet"
+    if classification.exists():
+        digests["__tax_classification__"] = hashlib.sha256(
+            classification.read_bytes()
+        ).hexdigest()
+    distributions = ROOT / "data" / "etf_distributions.csv"
+    if distributions.exists():
+        digests["__distributions__"] = hashlib.sha256(distributions.read_bytes()).hexdigest()
+    return digests
+
+
+def data_cache_digest() -> str:
+    return hashlib.sha256(
+        json.dumps(cache_file_digests(), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+APPLIED: dict[str, Any] = {}
+
+
+def configure_frozen_settings(cap: float | None) -> dict[str, Any]:
+    """동결 설정을 환경/모듈에 강제 적용하고, 적용값이 freeze와 같은지 검증한다."""
+    from strategy_freeze import load_frozen_strategy
+
+    frozen = load_frozen_strategy(FREEZE_PATH)
+    params = frozen["parameters"]
+    applied_cap = float(params["max_asset_pct"]) if cap is None else float(cap)
+
+    os.environ.update(
+        {
+            "ETF_RETURN_BASIS": str(params["return_basis"]),
+            "ETF_DISTRIBUTION_TAX_PCT": str(float(params["distribution_tax_pct"])),
+            "MIN_LISTING_DAYS": str(int(params["min_listing_days"])),
+            "MIN_AVG_TRADING_VALUE": str(int(params["min_avg_trading_value"])),
+            "MAX_PREMIUM_DISCOUNT": str(float(params["max_premium_discount"])),
+            "MAX_ASSET_PCT": str(applied_cap),
+            "TARGET_WEIGHT_REBALANCE": "1" if params["target_weight_rebalance"] else "0",
+            "REBALANCE_BAND_PCT": str(float(params["rebalance_band_pct"])),
+            "TRIM_OVERWEIGHT_POSITIONS": "1" if params["trim_overweight_positions"] else "0",
+            "ETF_EXIT_CHECK_DAYS": str(int(params["exit_check_days"])),
+            "ETF_TRAILING_STOP_PCT": str(float(params["trailing_stop_pct"])),
+            "ETF_PORTFOLIO_TRAILING_STOP_PCT": str(
+                float(params["portfolio_trailing_stop_pct"])
+            ),
+            "LIQUIDATE_ON_RISK_OFF": "1" if params["liquidate_on_risk_off"] else "0",
+            "ENABLE_MULTI_INDEX_RISK": "1" if params["enable_multi_index_risk"] else "0",
+            "MULTI_INDEX_GATING_MODE": str(params["multi_index_gating_mode"]),
+            "US_RISK_PROXY": str(params["us_risk_proxy"]),
+            "US_MARKET_MA_DAYS": str(int(params["us_market_ma_days"])),
+            "US_MARKET_SLOPE_DAYS": str(int(params["us_market_slope_days"])),
+            "REBALANCE_STEP_DAYS": str(int(params["rebalance_step_days"])),
+        }
+    )
+    # import 시점에 상수로 고정되는 값은 모듈 속성도 함께 맞춘다.
+    etf_shared.MIN_LISTING_DAYS = int(params["min_listing_days"])
+    etf_shared.MIN_AVG_TRADING_VALUE = int(params["min_avg_trading_value"])
+    etf_shared.MAX_PREMIUM_DISCOUNT = float(params["max_premium_discount"])
+    etf_shared.ETF_DEVIATION_THRESHOLD_BY_GROUP = dict(params["deviation_threshold_by_group"])
+    etf_shared.ETF_DEVIATION_THRESHOLD_BY_TICKER = dict(params["deviation_threshold_by_ticker"])
+    etf_shared.ETF_SELL_RANK_BUFFER = int(params["sell_rank_buffer"])
+    etf_shared.REBALANCE_STEP_DAYS = int(params["rebalance_step_days"])
+    rtb.ETF_SELL_RANK_BUFFER = int(params["sell_rank_buffer"])
+    rtb.ETF_MAX_POSITIONS = int(params["max_positions"])
+    rtb.REBALANCE_STEP_DAYS = int(params["rebalance_step_days"])
+    rtb.MARKET_MA_DAYS = int(params["market_ma_days"])
+    rtb.MARKET_SLOPE_DAYS = int(params["market_slope_days"])
+    rtb.BASE_SLIPPAGE = float(params["slippage"])
+    rtb.SPREAD_PCT = float(params["spread_pct"])
+    rtb.ENABLE_MULTI_INDEX_RISK = bool(params["enable_multi_index_risk"])
+    rtb.MULTI_INDEX_GATING_MODE = str(params["multi_index_gating_mode"])
+    rtb.US_RISK_PROXY = str(params["us_risk_proxy"])
+    rtb.US_MARKET_MA_DAYS = int(params["us_market_ma_days"])
+    rtb.US_MARKET_SLOPE_DAYS = int(params["us_market_slope_days"])
+    # 엔진은 import 시점에 캡처한 모듈 전역 strategy_cfg를 참조하므로,
+    # 환경변수만 바꾸면 target_weight/trim/band/liquidate가 갱신되지 않는다.
+    rtb.strategy_cfg = rtb.get_strategy_config(initialize_universe=False)
+
+    applied: dict[str, Any] = {
+        "return_basis": os.environ["ETF_RETURN_BASIS"],
+        "distribution_tax_pct": float(os.environ["ETF_DISTRIBUTION_TAX_PCT"]),
+        "min_listing_days": int(etf_shared.MIN_LISTING_DAYS),
+        "max_premium_discount": float(etf_shared.MAX_PREMIUM_DISCOUNT),
+        "deviation_threshold_by_group": dict(etf_shared.ETF_DEVIATION_THRESHOLD_BY_GROUP),
+        "deviation_threshold_by_ticker": dict(etf_shared.ETF_DEVIATION_THRESHOLD_BY_TICKER),
+        "min_avg_trading_value": int(etf_shared.MIN_AVG_TRADING_VALUE),
+        "max_asset_pct": applied_cap,
+        "target_weight_rebalance": bool(rtb.strategy_cfg["target_weight_rebalance"]),
+        "rebalance_band_pct": float(rtb.strategy_cfg["rebalance_band_pct"]),
+        "trim_overweight_positions": bool(rtb.strategy_cfg["trim_overweight_positions"]),
+        "exit_check_days": int(os.environ["ETF_EXIT_CHECK_DAYS"]),
+        "trailing_stop_pct": float(os.environ["ETF_TRAILING_STOP_PCT"]),
+        "portfolio_trailing_stop_pct": float(os.environ["ETF_PORTFOLIO_TRAILING_STOP_PCT"]),
+        "liquidate_on_risk_off": bool(rtb.strategy_cfg["liquidate_on_risk_off"]),
+        "slippage": float(rtb.BASE_SLIPPAGE),
+        "spread_pct": float(rtb.SPREAD_PCT),
+        "rebalance_step_days": int(rtb.REBALANCE_STEP_DAYS),
+        "market_ma_days": int(rtb.MARKET_MA_DAYS),
+        "market_slope_days": int(rtb.MARKET_SLOPE_DAYS),
+        "enable_multi_index_risk": bool(rtb.ENABLE_MULTI_INDEX_RISK),
+        "multi_index_gating_mode": str(rtb.MULTI_INDEX_GATING_MODE),
+        "us_risk_proxy": str(rtb.US_RISK_PROXY),
+        "us_market_ma_days": int(rtb.US_MARKET_MA_DAYS),
+        "us_market_slope_days": int(rtb.US_MARKET_SLOPE_DAYS),
+        "max_positions": int(rtb.ETF_MAX_POSITIONS),
+        "sell_rank_buffer": int(rtb.ETF_SELL_RANK_BUFFER),
+        "use_market_filter": True,
+        "universe": [str(t) for t in etf_shared.ETF_LIST],
+        "taxable_tickers": sorted(str(t) for t in etf_shared.TAXABLE_ETF_TICKERS),
+        "ticker_groups": dict(etf_shared.ETF_TICKER_GROUPS),
+    }
+    diffs: list[str] = []
+    for key, actual in applied.items():
+        if key not in params:
+            continue
+        if key == "max_asset_pct":
+            # 실험 변수로 의도한 차이는 intentional_deviations에 기록한다.
+            continue
+        expected = params[key]
+        if isinstance(actual, float) and isinstance(expected, (int, float)):
+            same = abs(actual - float(expected)) < 1e-12
+        else:
+            same = actual == expected
+        if not same:
+            diffs.append(f"{key}: runtime={actual!r} freeze={expected!r}")
+    if diffs:
+        raise SystemExit("[p0b] 동결 설정과 불일치합니다: " + "; ".join(diffs))
+
+    APPLIED.clear()
+    APPLIED.update(applied)
+
+    intentional: list[str] = []
+    if applied_cap != float(params["max_asset_pct"]):
+        intentional.append(
+            f"max_asset_pct: freeze={params['max_asset_pct']} -> experiment={applied_cap}"
+        )
+    return {
+        "freeze_sha256": frozen["sha256"],
+        "freeze_date": frozen.get("freeze_date"),
+        "oos_start_date": frozen.get("oos_start_date"),
+        "applied_cap": applied_cap,
+        "frozen_cap": float(params["max_asset_pct"]),
+        "spread_pct": float(rtb.SPREAD_PCT),
+        "slippage": float(rtb.BASE_SLIPPAGE),
+        "applied_settings": applied,
+        "config_diffs": diffs,
+        "intentional_deviations": intentional,
+        "not_frozen_momentum_weight_60": float(
+            os.environ.get("ETF_MOMENTUM_WEIGHT_60", "0.55")
+        ),
+    }
 
 
 def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, list[pd.Timestamp]]:
@@ -313,8 +478,8 @@ def run_legacy(
     aum: float,
     slippage: float,
     fee_multiplier: float,
-    max_positions: int = 2,
-    max_asset_pct: float = 0.5,
+    max_asset_pct: float,
+    max_positions: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     with patched_costs(fee_multiplier):
         curve, trades = rtb.run_etf_strategy(
@@ -322,7 +487,9 @@ def run_legacy(
             dates,
             index_df,
             use_market_filter=True,
-            max_positions=max_positions,
+            max_positions=int(
+                max_positions if max_positions is not None else APPLIED["max_positions"]
+            ),
             slippage=slippage,
             risk_off_liquidate=True,
             price_data=price,
@@ -336,13 +503,19 @@ def run_legacy(
 # A. 비용/슬리피지 민감도
 # --------------------------------------------------------------------------- #
 def run_cost_phase(
-    price: pd.DataFrame, index_df: pd.DataFrame, dates: list[pd.Timestamp]
+    price: pd.DataFrame, index_df: pd.DataFrame, dates: list[pd.Timestamp], cap: float
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     aum = float(rtb.INITIAL_CASH)
     for label, slippage, multiplier in COST_SCENARIOS:
         curve, trades = run_legacy(
-            price, index_df, dates, aum=aum, slippage=slippage, fee_multiplier=multiplier
+            price,
+            index_df,
+            dates,
+            aum=aum,
+            slippage=slippage,
+            fee_multiplier=multiplier,
+            max_asset_pct=cap,
         )
         recon = assert_legacy_reconciled(curve, trades, aum, f"cost:{label}")
         row: dict[str, Any] = {
@@ -368,7 +541,7 @@ def run_cost_phase(
 # B. 유동성/운용규모 (OHLCV capacity)
 # --------------------------------------------------------------------------- #
 def run_capacity_phase(
-    price: pd.DataFrame, index_df: pd.DataFrame, dates: list[pd.Timestamp]
+    price: pd.DataFrame, index_df: pd.DataFrame, dates: list[pd.Timestamp], cap: float
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     summaries: list[dict[str, Any]] = []
     diagnostics_all: list[dict[str, Any]] = []
@@ -385,6 +558,7 @@ def run_capacity_phase(
             aum=float(aum),
             slippage=BASE_SLIPPAGE,
             fee_multiplier=1.0,
+            max_asset_pct=cap,
         )
         legacy_stats = performance(float(aum), dates, legacy_curve)
         print(
@@ -405,11 +579,11 @@ def run_capacity_phase(
                 dates,
                 index_df,
                 use_market_filter=True,
-                max_positions=2,
+                max_positions=int(APPLIED["max_positions"]),
                 slippage=BASE_SLIPPAGE,
                 risk_off_liquidate=True,
                 price_data=price,
-                max_asset_pct=0.5,
+                max_asset_pct=cap,
                 execution_mode="ohlcv_capacity",
                 participation_rate=rate,
                 return_final_state=True,
@@ -448,11 +622,28 @@ def run_capacity_phase(
                 if not diag_df.empty and partial_cancel_mask.any()
                 else 0.0
             )
+            original_requested = (
+                float(
+                    pd.to_numeric(
+                        diag_df.loc[
+                            pd.to_numeric(diag_df["carry_age"], errors="coerce").fillna(0) == 0,
+                            "requested_qty",
+                        ]
+                    ).sum()
+                )
+                if not diag_df.empty and "carry_age" in diag_df.columns
+                else requested
+            )
+            cap_stats = performance(float(aum), dates, curve)
             summary_row = {
                 "scenario": label,
                 **summary,
-                **performance(float(aum), dates, curve),
+                **cap_stats,
                 "fill_rate_qty": (filled / requested) if requested > 0 else None,
+                "original_requested_qty_total": original_requested,
+                "fill_rate_qty_original": (
+                    filled / original_requested if original_requested > 0 else None
+                ),
                 "full_order_count": int(decisions.get("FULL", 0)),
                 "partial_carry_count": int(decisions.get("PARTIAL_CARRY", 0)),
                 "partial_cancel_count": int(decisions.get("PARTIAL_CANCEL", 0)),
@@ -467,11 +658,13 @@ def run_capacity_phase(
                 ),
                 "legacy_final_equity": legacy_stats["final"],
                 "legacy_cagr": legacy_stats["cagr"],
-                "capacity_vs_legacy_pct": (
+                # 최종 자산 차이(비율)와 CAGR 차이(%p)는 서로 다른 지표다.
+                "final_vs_legacy_pct": (
                     (float(summary["final_equity"]) / legacy_stats["final"] - 1.0)
                     if legacy_stats["final"]
                     else None
                 ),
+                "cagr_diff_pp": (cap_stats["cagr"] - legacy_stats["cagr"]) * 100.0,
             }
             summaries.append(summary_row)
             diagnostics_all.extend({**row, "scenario": label} for row in diag)
@@ -521,23 +714,27 @@ def reconciled_strategy_runs(label: str, counter: dict[str, int]) -> Iterator[No
         rtb.run_etf_strategy = original
 
 
-def _stability_grid() -> tuple[pd.DataFrame, dict[str, Any]]:
+def _stability_grid(cap: float) -> tuple[pd.DataFrame, dict[str, Any]]:
     os.environ["STABILITY_REBALANCE_DAYS"] = "15,20,25"
     os.environ["STABILITY_MAX_POSITIONS"] = "1,2,3"
-    os.environ["STABILITY_MAX_ASSET_PCT"] = "0.5"
+    # 비중 한도는 동결값으로 고정하고 리밸런싱 주기·보유종목만 인접 변동한다.
+    os.environ["STABILITY_MAX_ASSET_PCT"] = str(cap)
+    os.environ["MAX_ASSET_PCT"] = str(cap)
     return stability.run_stability()
 
 
-def run_stability_phase() -> tuple[pd.DataFrame, int]:
+def run_stability_phase(cap: float) -> tuple[pd.DataFrame, int]:
     counter: dict[str, int] = {"runs": 0}
     base_label = "slip5_fee1x"
     stress_slippage = 0.005
-    with reconciled_strategy_runs("stability", counter):
-        base_results, _ = _stability_grid()
-    with patched_costs(3.0, slippage=stress_slippage), reconciled_strategy_runs(
-        "stability_stress", counter
-    ):
-        stress_results, _ = _stability_grid()
+    # run_stability() 내부에서 지수/가격을 다시 로드하므로 캐시 전용 가드를 함께 적용한다.
+    with network_blocked():
+        with reconciled_strategy_runs("stability", counter):
+            base_results, _ = _stability_grid(cap)
+        with patched_costs(3.0, slippage=stress_slippage), reconciled_strategy_runs(
+            "stability_stress", counter
+        ):
+            stress_results, _ = _stability_grid(cap)
     stress_label = "slip50_fee3x"
 
     key = ["rebalance_step_days", "max_positions", "max_asset_pct"]
@@ -571,7 +768,11 @@ def run_stability_phase() -> tuple[pd.DataFrame, int]:
         on=["rebalance_step_days", "max_positions", "max_asset_pct"],
         how="left",
     )
-    central = out[(out["rebalance_step_days"] == 20) & (out["max_positions"] == 2)]
+    central = out[
+        (out["rebalance_step_days"] == 20)
+        & (out["max_positions"] == 2)
+        & np.isclose(out["max_asset_pct"], cap)
+    ]
     for row in central.itertuples():
         print(f"[p0b] stability central {row.cost_scenario}: cagr={row.cagr:.3%}")
     print(f"[p0b] stability 회계 검산 {counter['runs']}회 통과")
@@ -581,6 +782,13 @@ def run_stability_phase() -> tuple[pd.DataFrame, int]:
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+def _central_rank(frame: pd.DataFrame, column: str) -> float:
+    mask = (frame.index.get_level_values("rebalance_step_days") == 20) & (
+        frame.index.get_level_values("max_positions") == 2
+    )
+    return float(frame[mask][column].iloc[0])
+
+
 def write_summary(
     metadata: dict[str, Any],
     cost_df: pd.DataFrame | None,
@@ -591,6 +799,9 @@ def write_summary(
     summary: dict[str, Any] = {
         "phase": "P0-B",
         "period": metadata["period"],
+        "max_asset_pct": metadata.get("max_asset_pct"),
+        "spread_pct": metadata.get("spread_pct"),
+        "freeze_sha256": metadata.get("freeze_sha256"),
         "git_commit": metadata["git_commit"],
         "data_cache_digest": metadata["data_cache_digest"],
         "diagnostic_only": True,
@@ -621,11 +832,13 @@ def write_summary(
     if capacity_df is not None and not capacity_df.empty:
         by_aum: dict[str, Any] = {}
         for aum, group in capacity_df.groupby("aum"):
-            worst = group.loc[group["capacity_vs_legacy_pct"].idxmin()]
+            worst = group.loc[group["final_vs_legacy_pct"].idxmin()]
             by_aum[str(int(aum))] = {
                 "min_fill_rate": float(group["fill_rate_qty"].min()),
+                "min_fill_rate_original": float(group["fill_rate_qty_original"].min()),
                 "worst_participation_rate": float(worst["participation_rate"]),
-                "worst_vs_legacy_pct": float(worst["capacity_vs_legacy_pct"]),
+                "worst_final_vs_legacy_pct": float(worst["final_vs_legacy_pct"]),
+                "worst_cagr_diff_pp": float(worst["cagr_diff_pp"]),
             }
         summary["capacity"] = {
             "min_fill_rate": float(capacity_df["fill_rate_qty"].min()),
@@ -653,8 +866,8 @@ def write_summary(
                 (joined["rank_sharpe_stress"] - joined["rank_sharpe_base"]).abs().max()
             ),
             "central_rank_cagr": {
-                "base": float(joined.loc[(20, 2, 0.5), "rank_cagr_base"]),
-                "stress": float(joined.loc[(20, 2, 0.5), "rank_cagr_stress"]),
+                "base": float(_central_rank(base, "rank_cagr")),
+                "stress": float(_central_rank(stress, "rank_cagr")),
             },
         }
     return summary
@@ -674,28 +887,47 @@ def main() -> int:
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     parser.add_argument("--phases", default="cost,capacity,stability")
+    parser.add_argument(
+        "--cap",
+        type=float,
+        default=None,
+        help="자산별 비중 한도(기본: strategy_freeze.json 값). 0.5 비교 실행용으로만 사용.",
+    )
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
     args = parser.parse_args()
 
     phases = _parse_phases(args.phases)
+    frozen_cfg = configure_frozen_settings(args.cap)
+    cap = float(frozen_cfg["applied_cap"])
+    output_dir = Path(args.output_dir).resolve()
+    digest_before = data_cache_digest()
     preflight = preflight_cache(args.start, args.end)
     rtb.START = args.start
     rtb.END = args.end
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     price, index_df, dates = load_inputs()
+    loaded = set(price["ticker"].astype(str).unique())
+    missing = sorted({str(t) for t in etf_shared.ETF_LIST} - loaded)
+    if missing:
+        raise SystemExit(f"[p0b] 필수 종목이 로딩되지 않았습니다: {missing}")
+
     metadata: dict[str, Any] = {
         "phase": "P0-B",
         "period": {"start": args.start, "end": args.end},
         "trading_days": len(dates),
         "universe": len(etf_shared.ETF_LIST),
+        "loaded_tickers": len(loaded),
         "price_basis": os.environ.get("ETF_RETURN_BASIS", "price"),
         "base_slippage": BASE_SLIPPAGE,
-        "spread_pct": rtb.SPREAD_PCT,
+        "spread_pct": frozen_cfg["spread_pct"],
         "buy_fee": BASE_BUY_FEE,
         "sell_fee": BASE_SELL_FEE,
         "taxable_sell_tax": BASE_TAX,
-        "max_positions": 2,
-        "max_asset_pct": 0.5,
+        "max_positions": int(rtb.ETF_MAX_POSITIONS),
+        "max_asset_pct": cap,
+        "frozen": frozen_cfg,
+        "output_dir": str(output_dir),
         "git_commit": git_commit(),
         **preflight,
     }
@@ -705,29 +937,30 @@ def main() -> int:
     stability_df: pd.DataFrame | None = None
 
     if "cost" in phases:
-        cost_df = run_cost_phase(price, index_df, dates)
-        cost_df.to_csv(OUTPUT_DIR / "cost_sensitivity.csv", index=False, encoding="utf-8-sig")
+        cost_df = run_cost_phase(price, index_df, dates, cap)
+        cost_df.to_csv(output_dir / "cost_sensitivity.csv", index=False, encoding="utf-8-sig")
 
     if "capacity" in phases:
-        summary_df, diag_df, recon_df = run_capacity_phase(price, index_df, dates)
+        summary_df, diag_df, recon_df = run_capacity_phase(price, index_df, dates, cap)
         capacity_df = summary_df
-        summary_df.to_csv(OUTPUT_DIR / "capacity_summary.csv", index=False, encoding="utf-8-sig")
-        diag_df.to_csv(
-            OUTPUT_DIR / "capacity_diagnostics.csv", index=False, encoding="utf-8-sig"
-        )
+        summary_df.to_csv(output_dir / "capacity_summary.csv", index=False, encoding="utf-8-sig")
+        diag_df.to_csv(output_dir / "capacity_diagnostics.csv", index=False, encoding="utf-8-sig")
         recon_df.to_csv(
-            OUTPUT_DIR / "capacity_reconciliation.csv", index=False, encoding="utf-8-sig"
+            output_dir / "capacity_reconciliation.csv", index=False, encoding="utf-8-sig"
         )
 
     if "stability" in phases:
-        stability_df, stability_runs = run_stability_phase()
+        stability_df, stability_runs = run_stability_phase(cap)
         metadata["stability_reconciled_runs"] = stability_runs
         stability_df.to_csv(
-            OUTPUT_DIR / "stability_ranking.csv", index=False, encoding="utf-8-sig"
+            output_dir / "stability_ranking.csv", index=False, encoding="utf-8-sig"
         )
 
-    summary_path = OUTPUT_DIR / "p0b_summary.json"
-    summary_path.write_text(
+    if data_cache_digest() != digest_before:
+        raise SystemExit("[p0b] 실행 중 data_cache가 변경되었습니다(캐시 전용 실행 위반).")
+    metadata["data_cache_unchanged"] = True
+
+    (output_dir / "p0b_summary.json").write_text(
         json.dumps(
             write_summary(metadata, cost_df, capacity_df, stability_df),
             ensure_ascii=False,
@@ -735,11 +968,11 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    metadata["artifacts"] = sorted(path.name for path in OUTPUT_DIR.glob("*"))
-    (OUTPUT_DIR / "run_metadata.json").write_text(
+    metadata["artifacts"] = sorted(path.name for path in output_dir.glob("*"))
+    (output_dir / "run_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
-    print(f"[p0b] 완료: {OUTPUT_DIR}")
+    print(f"[p0b] 완료: {output_dir} (cap={cap})")
     return 0
 
 

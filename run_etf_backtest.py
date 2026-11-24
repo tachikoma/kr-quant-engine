@@ -3412,6 +3412,9 @@ def _execution_capacity_scenario(
     final_cash = float(final_state.get("cash", 0.0))
     expected_cash = float(aum) + trade_cash_flow + distribution_cash
     cash_delta = final_cash - expected_cash
+    # AUM이 커지면 누적 부동소수 오차도 커진다. 절대 1e-6은 10억원 규모에서
+    # 실제 오차(1e-6 미만)를 실패로 오판하므로 거래 규모 기준 허용오차를 함께 쓴다.
+    cash_tolerance = max(1e-6, abs(float(aum)) * 1e-12)
 
     net_trade_qty: dict[str, int] = {}
     for trade in trades.to_dict("records"):
@@ -3443,9 +3446,9 @@ def _execution_capacity_scenario(
                 "net_trade_qty": net_qty,
                 "final_holdings_qty": final_qty,
                 "holdings_delta": final_qty - net_qty,
-                "cash_reconciled": abs(cash_delta) <= 1e-6,
+                "cash_reconciled": abs(cash_delta) <= cash_tolerance,
                 "holdings_reconciled": final_qty == net_qty,
-                "reconciled": abs(cash_delta) <= 1e-6 and final_qty == net_qty,
+                "reconciled": abs(cash_delta) <= cash_tolerance and final_qty == net_qty,
                 "diagnostic_only": True,
                 "executable_fill_claim": False,
             }
