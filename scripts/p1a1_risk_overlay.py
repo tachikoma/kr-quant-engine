@@ -91,21 +91,50 @@ def run_scenario(
 
 
 def slice_stats(curve: pd.DataFrame, start: pd.Timestamp | None, end: pd.Timestamp | None) -> dict:
+    """구간 통계. ``start``가 있으면 직전 평가일을 기준점으로 포함해 첫날 수익/낙폭을 잡는다."""
     frame = curve.copy()
     frame["date"] = pd.to_datetime(frame["date"])
+    window = frame
     if start is not None:
-        frame = frame[frame["date"] >= start]
+        window = frame[frame["date"] >= start]
     if end is not None:
-        frame = frame[frame["date"] <= end]
-    if len(frame) < 2:
-        return {"cagr": None, "mdd": None, "sharpe": None, "days": len(frame)}
-    stats = rtb.calc_stats(frame, "equity")
+        window = window[window["date"] <= end]
+    if len(window) < 2:
+        return {
+            "cagr": None,
+            "mdd": None,
+            "sharpe": None,
+            "total_return": None,
+            "days": len(window),
+        }
+    base = frame[frame["date"] < start].tail(1) if start is not None else frame.iloc[0:0]
+    evaluation = pd.concat([base, window]).drop_duplicates("date", keep="last")
+    stats = rtb.calc_stats(evaluation, "equity")
     return {
         "cagr": float(stats["cagr"]),
         "mdd": float(stats["mdd"]),
         "sharpe": None if pd.isna(stats["sharpe"]) else float(stats["sharpe"]),
-        "days": len(frame),
+        "total_return": float(stats["total_return"]),
+        "days": len(window),
     }
+
+
+def _risk_run_start(
+    labels: pd.DataFrame, dates: list[pd.Timestamp], index: int
+) -> pd.Timestamp | None:
+    """청산 실행일 직전의 가장 최근 risk_off 구간 시작일(신호일)을 찾는다(폴백)."""
+    for cursor in range(index - 1, -1, -1):
+        date = pd.Timestamp(dates[cursor])
+        if date in labels.index and labels.at[date, "risk"] == "risk_off":
+            origin = cursor
+            while origin > 0:
+                previous = pd.Timestamp(dates[origin - 1])
+                if previous in labels.index and labels.at[previous, "risk"] == "risk_off":
+                    origin -= 1
+                    continue
+                break
+            return pd.Timestamp(dates[origin])
+    return None
 
 
 def exit_events(
@@ -114,6 +143,8 @@ def exit_events(
     price: pd.DataFrame,
     dates: list[pd.Timestamp],
     labels: pd.DataFrame,
+    *,
+    risk_based: bool,
 ) -> pd.DataFrame:
     if reason is None:
         return pd.DataFrame()
@@ -128,9 +159,23 @@ def exit_events(
     for trade in sells.itertuples():
         date = pd.Timestamp(trade.date)
         ticker = str(trade.ticker)
+        index = position.get(date, -1)
+        recorded_origin = getattr(trade, "exit_origin_date", None)
+        if recorded_origin is None or pd.isna(recorded_origin):
+            recorded_origin = None
+        decision: pd.Timestamp | None
+        if risk_based:
+            signal = (
+                pd.Timestamp(recorded_origin)
+                if recorded_origin is not None
+                else _risk_run_start(labels, dates, index)
+            )
+            decision = signal
+        else:
+            decision = pd.Timestamp(dates[index - 1]) if index > 0 else None
+            signal = decision
         forward: dict[str, float | None] = {}
         for horizon in (5, 20):
-            index = position.get(date, -1)
             target = index + horizon
             if index >= 0 and target < len(dates):
                 later = dates[target]
@@ -144,7 +189,15 @@ def exit_events(
                 forward[f"fwd{horizon}"] = None
         rows.append(
             {
-                "date": date,
+                "exec_date": date,
+                "decision_date": decision,
+                "signal_date": signal,
+                "event_id": signal if signal is not None else decision,
+                "lag_days": (
+                    None
+                    if decision is None or index < 0
+                    else int(index - position.get(decision, index))
+                ),
                 "ticker": ticker,
                 "qty": int(trade.qty),
                 "price": float(trade.price),
@@ -155,45 +208,13 @@ def exit_events(
     return pd.DataFrame(rows)
 
 
-def signal_lag(
-    events: pd.DataFrame, dates: list[pd.Timestamp], labels: pd.DataFrame
-) -> dict[str, float | None]:
-    if events.empty:
-        return {"median_days": None, "max_days": None}
-    position = {pd.Timestamp(d): index for index, d in enumerate(dates)}
-    run_start: dict[pd.Timestamp, pd.Timestamp] = {}
-    start = None
-    for date in dates:
-        date = pd.Timestamp(date)
-        risk = labels.at[date, "risk"] if date in labels.index else None
-        if risk == "risk_off":
-            start = start or date
-            run_start[date] = start
-        else:
-            start = None
-    lags = []
-    for event in events.itertuples():
-        date = pd.Timestamp(event.date)
-        index = position.get(date, -1)
-        if index <= 0:
-            continue
-        decision = pd.Timestamp(dates[index - 1])
-        origin = run_start.get(decision)
-        if origin is None:
-            continue
-        lags.append(position[date] - position[origin])
-    if not lags:
-        return {"median_days": None, "max_days": None}
-    return {"median_days": float(np.median(lags)), "max_days": float(np.max(lags))}
-
-
 def whipsaw(events: pd.DataFrame, trades: pd.DataFrame, dates: list[pd.Timestamp]) -> dict[str, Any]:
     if events.empty:
         return {"count": 0, "avg_price_change": None}
     position = {pd.Timestamp(d): index for index, d in enumerate(dates)}
     changes = []
     for event in events.itertuples():
-        date = pd.Timestamp(event.date)
+        date = pd.Timestamp(event.exec_date)
         ticker = str(event.ticker)
         index = position.get(date, -1)
         if index < 0:
@@ -237,24 +258,35 @@ def scenario_metrics(
     episodes = p0c.drawdown_episodes(equity)
     top = episodes.head(TOP_DRAWDOWNS)
     worst = top.iloc[0]
-    events = exit_events(trades, reason, price, dates, labels)
-    lag = signal_lag(events, dates, labels)
+    risk_based = reason == "ETF_DAILY_RISK_OFF"
+    events = exit_events(trades, reason, price, dates, labels, risk_based=risk_based)
     whip = whipsaw(events, trades, dates)
+    lag_series = (
+        pd.to_numeric(events["lag_days"], errors="coerce").dropna()
+        if not events.empty
+        else pd.Series(dtype=float)
+    )
+    event_ids = (
+        pd.to_datetime(events["event_id"]).dropna().drop_duplicates()
+        if not events.empty
+        else pd.Series(dtype="datetime64[ns]")
+    )
     same_day = 0
     for date, group in trades.groupby("date"):
         sides = group.groupby(group["ticker"].astype(str))["side"].apply(set)
         same_day += int(sum(1 for value in sides if {"BUY", "SELL"} <= value))
     if same_day:
         raise AssertionError(f"{label}/{cost_case}: 같은 실행일 매수·매도 혼재 {same_day}건")
-    is_stats = slice_stats(curve, None, oos_start - pd.Timedelta(days=1))
-    oos_stats = slice_stats(curve, oos_start, None)
+    equity_path = p0c.equity_with_initial(curve, dates)
+    is_stats = slice_stats(equity_path, None, oos_start - pd.Timedelta(days=1))
+    oos_stats = slice_stats(equity_path, oos_start, None)
     reentry = 0
     if not events.empty:
         for event in events.itertuples():
             buys = trades[
                 (trades["side"] == "BUY")
                 & (trades["ticker"].astype(str) == str(event.ticker))
-                & (trades["date"] > pd.Timestamp(event.date))
+                & (trades["date"] > pd.Timestamp(event.exec_date))
             ]
             reentry += int(not buys.empty)
     row = {
@@ -270,8 +302,22 @@ def scenario_metrics(
         "risk_exit_count": len(events),
         "reentry_count": reentry,
         "same_day_reentry": same_day,
-        "signal_to_exit_median_days": lag["median_days"],
-        "signal_to_exit_max_days": lag["max_days"],
+        "event_basis": "risk_off_signal" if risk_based else "portfolio_stop_decision",
+        "independent_event_count": len(event_ids),
+        "event_years": ",".join(sorted({str(pd.Timestamp(x).year) for x in event_ids})),
+        "retry_exit_count": int((lag_series > 1).sum()) if not lag_series.empty else 0,
+        "signal_to_exit_median_days": (
+            float(lag_series.median()) if risk_based and not lag_series.empty else None
+        ),
+        "signal_to_exit_max_days": (
+            float(lag_series.max()) if risk_based and not lag_series.empty else None
+        ),
+        "decision_to_exec_lag_days": (
+            float(lag_series.median()) if not lag_series.empty else None
+        ),
+        "decision_to_exec_max_days": (
+            float(lag_series.max()) if not lag_series.empty else None
+        ),
         "whipsaw_count": whip["count"],
         "whipsaw_avg_price_change": whip["avg_price_change"],
         "missed_fwd5_mean": (
@@ -301,9 +347,11 @@ def scenario_metrics(
         ),
         "worst_unrecovered": bool(worst["unrecovered"]),
         "is_cagr": is_stats["cagr"],
+        "is_total_return": is_stats["total_return"],
         "is_mdd": is_stats["mdd"],
         "is_sharpe": is_stats["sharpe"],
         "oos_cagr": oos_stats["cagr"],
+        "oos_total_return": oos_stats["total_return"],
         "oos_mdd": oos_stats["mdd"],
         "oos_sharpe": oos_stats["sharpe"],
         "oos_days": oos_stats["days"],
@@ -334,6 +382,9 @@ def scenario_metrics(
     )
     if not events.empty:
         events = events.assign(scenario=label, cost_case=cost_case)
+        events["date"] = pd.to_datetime(events["exec_date"])
+        events["signal_date"] = pd.to_datetime(events["signal_date"])
+        events["decision_date"] = pd.to_datetime(events["decision_date"])
     return row, drawdowns, events
 
 

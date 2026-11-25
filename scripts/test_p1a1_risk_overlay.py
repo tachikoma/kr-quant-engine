@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import p1a1_risk_overlay as runner
+
 import etf_shared
 import run_etf_backtest as rtb
 
@@ -237,6 +239,76 @@ def check_pending_exit_survives_risk_on(price, index_df) -> None:
         raise AssertionError("risk_on 복귀 후에도 미체결 청산 의도가 재시도되지 않았습니다")
     if str(on_172.iloc[0]["reason"]) != "ETF_DAILY_RISK_OFF":
         raise AssertionError(f"재시도 사유가 다릅니다: {on_172.iloc[0]['reason']}")
+    origin = pd.Timestamp(on_172.iloc[0].get("exit_origin_date"))
+    if origin != pd.Timestamp(dates[170]):
+        raise AssertionError(f"청산 원 신호일이 기록되지 않았습니다: {origin}")
+
+
+def check_retry_event_attribution(price, index_df) -> None:
+    """장기 재시도 청산도 원 신호일 기준으로 1개 이벤트로 집계된다."""
+    dates = pd.DatetimeIndex(sorted(price["date"].unique()))
+    labels = pd.DataFrame({"risk": "risk_on"}, index=dates)
+    trades = pd.DataFrame(
+        [
+            {
+                "date": dates[50],
+                "ticker": DOMESTIC,
+                "side": "SELL",
+                "reason": "ETF_DAILY_RISK_OFF",
+                "qty": 1,
+                "price": 100.0,
+                "exit_origin_date": dates[38].strftime("%Y-%m-%d"),
+            }
+        ]
+    )
+    events = runner.exit_events(
+        trades, "ETF_DAILY_RISK_OFF", price, list(dates), labels, risk_based=True
+    )
+    if len(events) != 1:
+        raise AssertionError(f"이벤트 프레임 생성 실패: {len(events)}")
+    row = events.iloc[0]
+    if pd.Timestamp(row["event_id"]) != pd.Timestamp(dates[38]):
+        raise AssertionError(f"이벤트 키가 원 신호일이 아닙니다: {row['event_id']}")
+    if int(row["lag_days"]) != 12:
+        raise AssertionError(f"지연일 계산이 다릅니다: {row['lag_days']}")
+
+
+def check_oos_boundary_capture() -> None:
+    """OOS 첫 거래일 수익률·낙폭이 직전 평가액 기준으로 포함된다."""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    curve = pd.DataFrame({"date": dates, "equity": [1.0, 1.0, 0.9, 0.9, 0.9]})
+    stats = runner.slice_stats(curve, dates[2], None)
+    if stats["total_return"] is None or abs(stats["total_return"] + 0.1) > 1e-12:
+        raise AssertionError(f"OOS 첫날 수익률이 누락되었습니다: {stats}")
+    if abs(stats["mdd"] + 0.1) > 1e-12:
+        raise AssertionError(f"OOS 첫날 낙폭이 누락되었습니다: {stats}")
+    if stats["days"] != 3:
+        raise AssertionError(f"OOS 일수 계산이 다릅니다: {stats['days']}")
+
+
+def check_overlay_support_guards(price, index_df) -> None:
+    """legacy 외 조합은 명시적으로 차단된다."""
+    dates = [pd.Timestamp(d) for d in index_df["date"]]
+    base = {
+        "initial_cash": INITIAL_CASH,
+        "common_dates": dates,
+        "index_df": index_df,
+        "price_data": price,
+        "daily_risk_off_exit": True,
+    }
+    cases = (
+        ("ohlcv_capacity", {"execution_mode": "ohlcv_capacity"}),
+        ("approval_strict", {"approval_strict": True}),
+        ("initial_state", {"initial_state": {"cash": INITIAL_CASH, "holdings": {}}}),
+    )
+    for label, extra in cases:
+        try:
+            rtb.run_etf_strategy(**base, **extra)
+        except ValueError as exc:
+            if "daily_risk_off_exit" not in str(exc):
+                raise AssertionError(f"{label}: 다른 오류가 발생했습니다: {exc}") from exc
+        else:
+            raise AssertionError(f"{label}: 차단되지 않았습니다")
 
 
 def main() -> int:
@@ -260,6 +332,12 @@ def main() -> int:
             lambda: check_pending_exit_survives_risk_on(price, index_df),
         ),
         ("retry no same-day rebuy", lambda: check_retry_no_same_day_rebuy(price, index_df)),
+        ("retry event attribution", lambda: check_retry_event_attribution(price, index_df)),
+        ("oos boundary capture", check_oos_boundary_capture),
+        (
+            "overlay support guards",
+            lambda: check_overlay_support_guards(price, index_df),
+        ),
     ]
     failures = 0
     try:

@@ -1177,10 +1177,27 @@ def run_etf_strategy(
         daily_risk_off_exit: 연구용 opt-in. 매 거래일 KOSPI risk 신호를 확인해
             현재 위험 정책상 보유가 허용되지 않는 종목만 다음 거래일 시가에
             청산한다(신규 매수·재진입은 정기 리밸런싱에서만). 기본값 False는
-            기존 동작과 완전히 동일하다.
+            기존 동작과 완전히 동일하다. **legacy 실행 전용**이며
+            ``ohlcv_capacity``, ``approval_strict``, ``initial_state``(state 재개/WFA)
+            조합은 지원하지 않고 ValueError로 차단한다. 미체결 청산 의도의 상태
+            직렬화·WFA 연동은 후속 과제다.
     """
     if execution_mode not in {"legacy", "ohlcv_capacity"}:
         raise ValueError("execution_mode must be exactly legacy or ohlcv_capacity")
+    if daily_risk_off_exit:
+        # 연구용 opt-in은 legacy 단일 실행 경로에서만 검증되었다.
+        if execution_mode != "legacy":
+            raise ValueError(
+                "daily_risk_off_exit는 legacy 실행 모드에서만 지원합니다(연구 범위)."
+            )
+        if approval_strict:
+            raise ValueError(
+                "daily_risk_off_exit는 approval_strict 경로에서 지원하지 않습니다."
+            )
+        if initial_state:
+            raise ValueError(
+                "daily_risk_off_exit는 initial_state 재개(state-based WFA)에서 지원하지 않습니다."
+            )
     if isinstance(participation_rate, bool):
         raise TypeError("participation_rate must be a finite number")
     try:
@@ -1257,7 +1274,7 @@ def run_etf_strategy(
     execution_diagnostic_index: dict[str, dict[str, Any]] = {}
     pending_execution_carries: dict[tuple[str, str, str], dict[str, Any]] = {}
     execution_excluded_buy_tickers: set[str] = set()
-    pending_daily_risk_off_exits: set[str] = set()
+    pending_daily_risk_off_exits: dict[str, str] = {}
     historical_holdings: dict[pd.Timestamp, dict[str, int]] = {}
     if approval_strict:
         strict_states = {
@@ -1323,6 +1340,7 @@ def run_etf_strategy(
         next_dt: pd.Timestamp,
         reason: str,
         due_date: pd.Timestamp | None = None,
+        origin_date: str | None = None,
     ) -> bool:
         nonlocal cash
 
@@ -1406,21 +1424,22 @@ def run_etf_strategy(
         holdings.pop(ticker, None)
         holding_cost_basis.pop(ticker, None)
         holding_peak_closes.pop(ticker, None)
-        trades.append(
-            {
-                "date": next_dt,
-                "ticker": ticker,
-                "name": get_ticker_name(ticker),
-                "side": "SELL",
-                "reason": reason,
-                "qty": int(qty),
-                "price": reference_price,
-                "net_value": net_value,
-                "cash_flow": net_value,
-                "estimated_tax": estimated_tax,
-                "cash_after": cash,
-            }
-        )
+        trade = {
+            "date": next_dt,
+            "ticker": ticker,
+            "name": get_ticker_name(ticker),
+            "side": "SELL",
+            "reason": reason,
+            "qty": int(qty),
+            "price": reference_price,
+            "net_value": net_value,
+            "cash_flow": net_value,
+            "estimated_tax": estimated_tax,
+            "cash_after": cash,
+        }
+        if origin_date is not None:
+            trade["exit_origin_date"] = str(origin_date)
+        trades.append(trade)
         return True
 
     def _strict_holding_state(ticker: str) -> HoldingState:
@@ -2220,13 +2239,16 @@ def run_etf_strategy(
                     gating_mode=MULTI_INDEX_GATING_MODE,
                     liquidate_on_risk_off=risk_off_liquidate,
                 )
-                pending_daily_risk_off_exits.update(daily_gating.forced_exit_tickers)
+                for ticker in daily_gating.forced_exit_tickers:
+                    pending_daily_risk_off_exits.setdefault(
+                        ticker, pd.Timestamp(dt).strftime("%Y-%m-%d")
+                    )
             # 신호일 종가에 내린 청산 결정은 실행 실패(시가 누락 등)로 사라지지 않는다.
             # 다음 거래일에도 재시도하며, 신호가 risk_on으로 돌아와도 유지한다.
             for ticker in sorted(pending_daily_risk_off_exits):
                 qty = int(holdings.get(ticker, 0) or 0)
                 if qty <= 0:
-                    pending_daily_risk_off_exits.discard(ticker)
+                    del pending_daily_risk_off_exits[ticker]
                     continue
                 if execute_exit(
                     ticker,
@@ -2235,8 +2257,9 @@ def run_etf_strategy(
                     next_dt,
                     "ETF_DAILY_RISK_OFF",
                     carry_due_date,
+                    origin_date=pending_daily_risk_off_exits[ticker],
                 ):
-                    pending_daily_risk_off_exits.discard(ticker)
+                    del pending_daily_risk_off_exits[ticker]
                     exit_order_count += 1
                     # 같은 실행일 리밸런싱에서 즉시 재매수하지 않도록 제외한다.
                     if ticker not in holdings:
