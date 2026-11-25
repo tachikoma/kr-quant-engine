@@ -199,6 +199,6 @@
 
 ```bash
 uv run python scripts/test_p1b1_phase.py                    # 위상 fixture 6검사
-uv run python scripts/p1b1_parameter_stability.py           # 92회 실행 (약 10분)
+uv run python scripts/p1b1_parameter_stability.py           # 전체 실행 (약 10분)
 uv run python scripts/p1b1_parameter_stability.py --smoke   # 기준 재현·항등식만 점검
 ```
