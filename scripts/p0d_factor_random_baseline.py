@@ -18,9 +18,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,61 @@ COST_CASES = (
 EXCLUDE_2026_END = pd.Timestamp("2025-12-31")
 BASELINE_MOMENTUM_WEIGHT = 0.55
 BENCH_TICKERS = {"kodex200": "069500", "us": "360750", "gold": "411060"}
+REQUIRED_METRICS = (
+    "cagr",
+    "mdd",
+    "sharpe",
+    "calmar",
+    "final",
+    "total_cost",
+    "turnover",
+    "avg_cash_weight",
+    "ex2026_cagr",
+    "ex2026_mdd",
+    "is_cagr",
+    "oos_cagr",
+    "trade_count",
+)
+CODE_FILES = (
+    "scripts/p0d_factor_random_baseline.py",
+    "scripts/p0b_execution_stress.py",
+    "scripts/p1a1_risk_overlay.py",
+    "scripts/p0c_regime_drawdown.py",
+    "run_etf_backtest.py",
+    "etf_shared.py",
+)
+
+
+def code_digest() -> str:
+    payload = []
+    for name in CODE_FILES:
+        path = ROOT / name
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
+        payload.append(f"{name}:{digest}")
+    return hashlib.sha256("|".join(payload).encode("utf-8")).hexdigest()
+
+
+def binomial_cdf(k: int, n: int, p: float) -> float:
+    return sum(math.comb(n, i) * (p**i) * ((1 - p) ** (n - i)) for i in range(k + 1))
+
+
+def upper_one_sided_cp(k: int, n: int, confidence: float = 0.95) -> float:
+    """k/n의 단측 Clopper-Pearson 상한(정확 이항). 0/100 → 1-0.05^(1/100)=2.95%."""
+    if k >= n:
+        return 1.0
+    alpha = 1.0 - confidence
+    low, high = 0.0, 1.0
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        if binomial_cdf(k, n, mid) > alpha:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +255,7 @@ def summarize(
     rng = np.random.default_rng(0)
     # MDD는 0에 가까울수록(값이 클수록) 좋다. 비용·회전만 낮을수록 좋다.
     lower_is_better = {"total_cost", "turnover"}
+    informational = {"avg_cash_weight"}
     for metric in metrics_list:
         values = pd.to_numeric(frame[metric], errors="coerce").dropna().to_numpy()
         if len(values) < 2 or baseline.get(metric) is None:
@@ -213,10 +271,12 @@ def summarize(
         boot = np.array(
             [rng.choice(values, size=len(values), replace=True).mean() for _ in range(1000)]
         )
+        as_good_count = round(share_ge * len(values))
         rows.append(
             {
                 "cost_case": label,
                 "metric": metric,
+                "informational_only": metric in informational,
                 "n": len(values),
                 "mean": float(values.mean()),
                 "std": float(values.std(ddof=1)),
@@ -229,10 +289,15 @@ def summarize(
                 "baseline_percentile": percentile,
                 "share_at_least_as_good": share_ge,
                 "share_binomial_se": float(np.sqrt(share_ge * (1 - share_ge) / len(values))),
+                "share_upper_95_one_sided": upper_one_sided_cp(as_good_count, len(values)),
                 "mean_bootstrap_ci_low": float(np.quantile(boot, 0.025)),
                 "mean_bootstrap_ci_high": float(np.quantile(boot, 0.975)),
                 "higher_is_better": higher_is_better,
-                "percentile_meaning": "baseline보다 나쁜 무작위 비율(높을수록 우수)",
+                "percentile_meaning": (
+                    "정보용(순위·우열 해석 금지)"
+                    if metric in informational
+                    else "baseline보다 나쁜 무작위 비율(높을수록 우수)"
+                ),
             }
         )
     return rows
@@ -404,6 +469,97 @@ def build_benchmarks(price: pd.DataFrame, dates: list[pd.Timestamp]) -> pd.DataF
 
 
 # --------------------------------------------------------------------------- #
+# 재사용 무결성 검증
+# --------------------------------------------------------------------------- #
+def validate_reuse(
+    frame: pd.DataFrame | None,
+    stored: dict[str, Any] | None,
+    current: dict[str, Any],
+    expected_pairs: set[tuple[int, str]],
+    frame_sha256: str,
+) -> list[str]:
+    """기존 random_runs 재사용 가능 여부. 문제 목록을 반환(빈 리스트면 통과)."""
+    reasons: list[str] = []
+    if stored is None:
+        reasons.append("provenance 파일이 없습니다")
+    else:
+        for key in (
+            "code_digest",
+            "data_cache_digest",
+            "freeze_sha256",
+            "period",
+            "cost_cases",
+            "momentum_weight_60",
+            "max_asset_pct",
+            "spread_pct",
+            "oos_start_date",
+            "seeds",
+        ):
+            if stored.get(key) != current.get(key):
+                reasons.append(f"provenance 불일치: {key}")
+        if stored.get("random_runs_sha256") != frame_sha256:
+            reasons.append("random_runs SHA256 불일치")
+        failures = stored.get("failures")
+        if isinstance(failures, bool) or not isinstance(failures, int) or failures != 0:
+            reasons.append("원 실행 실패 건수 메타데이터가 정수 0이 아님")
+        if stored.get("experiment_complete") is not True:
+            reasons.append("experiment_complete가 boolean true가 아님")
+    if frame is None or frame.empty:
+        reasons.append("random_runs가 비어 있습니다")
+        return reasons
+    if not {"seed", "cost_case"}.issubset(frame.columns):
+        reasons.append("seed/cost_case 컬럼 누락")
+        return reasons
+    seed_values = pd.to_numeric(frame["seed"], errors="coerce")
+    if seed_values.isna().any() or not np.isfinite(seed_values.to_numpy()).all():
+        reasons.append("seed에 NaN/Inf 존재")
+        return reasons
+    if (seed_values % 1 != 0).any():
+        reasons.append("seed가 정수가 아님")
+        return reasons
+    pairs = list(zip(seed_values.astype(int), frame["cost_case"].astype(str), strict=False))
+    if len(pairs) != len(expected_pairs):
+        reasons.append(f"행 수 불일치: {len(pairs)} != {len(expected_pairs)}")
+    if len(set(pairs)) != len(pairs):
+        reasons.append("중복된 (seed, cost_case) 행")
+    missing = expected_pairs - set(pairs)
+    extra = set(pairs) - expected_pairs
+    if missing:
+        reasons.append(f"누락된 조합 {len(missing)}건")
+    if extra:
+        reasons.append(f"예상 밖 조합 {len(extra)}건")
+    for column in REQUIRED_METRICS:
+        if column not in frame.columns:
+            reasons.append(f"필수 지표 누락: {column}")
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.isna().any() or not np.isfinite(values.to_numpy()).all():
+            reasons.append(f"{column}에 NaN/Inf 존재")
+    return reasons
+
+
+def resolve_source_provenance(
+    preserved: dict[str, Any] | None, stored: dict[str, Any], random_sha: str
+) -> tuple[dict[str, Any], int, bool]:
+    """재사용 시 보존할 원본 provenance 선택.
+
+    반환: (보존할 provenance, reuse_count, 원본 파일 갱신 필요 여부)
+    - 같은 산출물(SHA256 일치)의 최초 full provenance는 유지한다.
+    - 다른 산출물의 잔여 파일(이전 full 실행)이면 현재 실행 것으로 교체해 계보 혼선을 막는다.
+    """
+    reuse_count = 1
+    if stored.get("run_mode") == "reused" and isinstance(stored.get("source"), dict):
+        reuse_count = int(stored["source"].get("reuse_count", 1)) + 1
+    if (
+        preserved is not None
+        and preserved.get("run_mode") == "full"
+        and preserved.get("random_runs_sha256") == random_sha
+    ):
+        return preserved, reuse_count, False
+    return stored, reuse_count, True
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def main() -> int:
@@ -460,21 +616,65 @@ def main() -> int:
     random_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     reuse_path = OUTPUT_DIR / "random_runs.csv"
+    provenance_path = OUTPUT_DIR / "run_provenance.json"
+    source_provenance_path = OUTPUT_DIR / "run_provenance_source.json"
+    expected_pairs = {(seed, label) for label, _, _ in COST_CASES for seed in SEEDS}
+    current_provenance = {
+        "git_commit": p0b.git_commit(),
+        "code_digest": code_digest(),
+        "data_cache_digest": digest_before,
+        "freeze_sha256": frozen["freeze_sha256"],
+        "period": {"start": p0b.DEFAULT_START, "end": p0b.DEFAULT_END},
+        "cost_cases": {
+            label: [slippage, multiplier] for label, slippage, multiplier in COST_CASES
+        },
+        "momentum_weight_60": BASELINE_MOMENTUM_WEIGHT,
+        "max_asset_pct": CAP,
+        "spread_pct": frozen["spread_pct"],
+        "oos_start_date": frozen["oos_start_date"],
+        "seeds": {"count": len(SEEDS), "range": [min(SEEDS), max(SEEDS)]},
+    }
+    run_mode = "full"
+    source_info: dict[str, Any] | None = None
+    random_sha = ""
     if args.reuse_random_runs:
         if not reuse_path.exists():
             raise SystemExit("[p0d] 재사용할 random_runs.csv가 없습니다.")
-        existing = pd.read_csv(reuse_path)
-        expected_pairs = {(seed, label) for label, _, _ in COST_CASES for seed in SEEDS}
-        actual_pairs = set(
-            zip(existing["seed"].astype(int), existing["cost_case"].astype(str), strict=False)
+        if not provenance_path.exists():
+            raise SystemExit("[p0d] 재사용에 필요한 run_provenance.json이 없습니다.")
+        existing = pd.read_csv(reuse_path, float_precision="round_trip")
+        stored = json.loads(provenance_path.read_text(encoding="utf-8"))
+        random_sha = file_sha256(reuse_path)
+        reasons = validate_reuse(
+            existing, stored, current_provenance, expected_pairs, random_sha
         )
-        if actual_pairs != expected_pairs:
-            raise SystemExit(
-                f"[p0d] 재사용 불가: seed·비용 조건 불일치 "
-                f"(missing={len(expected_pairs - actual_pairs)}, extra={len(actual_pairs - expected_pairs)})"
+        if reasons:
+            raise SystemExit("[p0d] 재사용 거부: " + "; ".join(reasons))
+        preserved = (
+            json.loads(source_provenance_path.read_text(encoding="utf-8"))
+            if source_provenance_path.exists()
+            else None
+        )
+        original, reuse_count, needs_write = resolve_source_provenance(
+            preserved, stored, random_sha
+        )
+        if needs_write:
+            source_provenance_path.write_text(
+                json.dumps(original, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        source_info = {
+            "run_mode": original.get("run_mode"),
+            "created_at": original.get("created_at"),
+            "random_runs_sha256": original.get("random_runs_sha256"),
+            "git_commit": original.get("git_commit"),
+            "provenance_sha256": file_sha256(source_provenance_path),
+            "reused_from_provenance_sha256": file_sha256(provenance_path),
+            "reuse_count": reuse_count,
+            "preserved_at": source_provenance_path.name,
+        }
+        run_mode = "reused"
         random_rows = existing.to_dict(orient="records")
-        print(f"[p0d] 기존 무작위 실행 재사용: {len(random_rows)}건")
+        print(f"[p0d] 기존 무작위 실행 재사용(검증 통과): {len(random_rows)}건")
     else:
         for cost_label, slippage, multiplier in COST_CASES:
             for seed in SEEDS:
@@ -508,10 +708,13 @@ def main() -> int:
     random_frame = pd.DataFrame(random_rows)
     if random_frame.empty:
         raise SystemExit("[p0d] 무작위 실행이 모두 실패했습니다.")
-    random_frame.to_csv(OUTPUT_DIR / "random_runs.csv", index=False, encoding="utf-8-sig")
+    if run_mode == "full":
+        random_frame.to_csv(reuse_path, index=False, encoding="utf-8-sig")
+        random_sha = file_sha256(reuse_path)
     pd.DataFrame(failures).to_csv(
         OUTPUT_DIR / "random_failures.csv", index=False, encoding="utf-8-sig"
     )
+    experiment_complete = len(failures) == 0 and len(random_frame) == len(expected_pairs)
 
     summary_rows: list[dict[str, Any]] = []
     for cost_label, _, _ in COST_CASES:
@@ -530,8 +733,25 @@ def main() -> int:
     if p0b.data_cache_digest() != digest_before:
         raise SystemExit("[p0d] 실행 중 data_cache가 변경되었습니다.")
 
+    provenance = {
+        **current_provenance,
+        "run_mode": run_mode,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "random_runs_sha256": random_sha,
+        "random_runs_rows": len(random_frame),
+        "failures": len(failures),
+        "experiment_complete": experiment_complete,
+        "source": source_info,
+    }
+    provenance_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     metadata = {
         "phase": "P0-D",
+        "run_mode": run_mode,
+        "experiment_complete": experiment_complete,
+        "random_runs_sha256": random_sha,
+        "provenance": provenance,
         "period": {"start": p0b.DEFAULT_START, "end": p0b.DEFAULT_END},
         "seeds": {"count": len(SEEDS), "range": [min(SEEDS), max(SEEDS)]},
         "runs": {

@@ -117,6 +117,111 @@ def check_date_variation() -> None:
         raise AssertionError("결정일이 달라도 순서가 동일합니다(seed·날짜 키 미적용 의심)")
 
 
+def _reuse_fixture():
+    frame = pd.DataFrame(
+        {
+            "seed": [0, 0, 1, 1],
+            "cost_case": ["base", "stress_50bp_3x", "base", "stress_50bp_3x"],
+            "cagr": [0.1, 0.05, 0.2, 0.1],
+            "mdd": [-0.2, -0.3, -0.1, -0.2],
+            "sharpe": [1.0, 0.5, 1.5, 0.8],
+            "calmar": [0.5, 0.2, 0.8, 0.4],
+            "final": [2e6, 1.5e6, 3e6, 2e6],
+            "total_cost": [1e5, 3e5, 1.1e5, 3.1e5],
+            "turnover": [50.0, 49.0, 51.0, 50.0],
+            "avg_cash_weight": [0.3, 0.31, 0.29, 0.3],
+            "ex2026_cagr": [0.08, 0.04, 0.15, 0.08],
+            "ex2026_mdd": [-0.1, -0.15, -0.05, -0.1],
+            "is_cagr": [0.09, 0.05, 0.17, 0.09],
+            "oos_cagr": [0.01, -0.01, 0.03, 0.0],
+            "trade_count": [100, 100, 110, 110],
+        }
+    )
+    current = {
+        "code_digest": "code",
+        "data_cache_digest": "data",
+        "freeze_sha256": "freeze",
+        "period": {"start": "20160105", "end": "20260928"},
+        "cost_cases": {"base": [0.0005, 1.0], "stress_50bp_3x": [0.005, 3.0]},
+        "momentum_weight_60": 0.55,
+        "max_asset_pct": 0.85,
+        "spread_pct": 0.0002,
+        "oos_start_date": "2026-07-22",
+        "seeds": {"count": 2, "range": [0, 1]},
+    }
+    stored = {
+        **current,
+        "run_mode": "full",
+        "created_at": "2026-11-25T00:00:00+00:00",
+        "random_runs_sha256": "hash",
+        "failures": 0,
+        "experiment_complete": True,
+    }
+    expected = {(0, "base"), (0, "stress_50bp_3x"), (1, "base"), (1, "stress_50bp_3x")}
+    return frame, stored, current, expected
+
+
+def check_reuse_validation() -> None:
+    frame, stored, current, expected = _reuse_fixture()
+    reasons = p0d.validate_reuse(frame, stored, current, expected, "hash")
+    if reasons:
+        raise AssertionError(f"정상 입력이 거부되었습니다: {reasons}")
+
+    cases = {
+        "duplicate": (
+            pd.concat([frame, frame.iloc[[0]]], ignore_index=True),
+            stored,
+            current,
+            "hash",
+        ),
+        "missing": (frame.iloc[:-1].copy(), stored, current, "hash"),
+        "fractional_seed": (frame.assign(seed=[0.9, 0.0, 1.0, 1.0]), stored, current, "hash"),
+        "missing_metric": (frame.drop(columns=["ex2026_mdd"]), stored, current, "hash"),
+        "failures_str": (frame, {**stored, "failures": "0"}, current, "hash"),
+        "failures_negative": (frame, {**stored, "failures": -1}, current, "hash"),
+        "complete_str": (frame, {**stored, "experiment_complete": "true"}, current, "hash"),
+        "nan_metric": (frame.assign(cagr=[0.1, None, 0.2, 0.1]), stored, current, "hash"),
+        "inf_metric": (frame.assign(final=[2e6, float("inf"), 3e6, 2e6]), stored, current, "hash"),
+        "digest_mismatch": (frame, {**stored, "data_cache_digest": "other"}, current, "hash"),
+        "code_mismatch": (frame, {**stored, "code_digest": "other"}, current, "hash"),
+        "sha_mismatch": (frame, stored, current, "other"),
+        "incomplete": (frame, {**stored, "failures": 1}, current, "hash"),
+        "no_provenance": (frame, None, current, "hash"),
+    }
+    for label, (f, st, cu, sha) in cases.items():
+        if not p0d.validate_reuse(f, st, cu, expected, sha):
+            raise AssertionError(f"{label}: 거부되지 않았습니다")
+
+
+def check_source_provenance_chain() -> None:
+    full_a = {"run_mode": "full", "random_runs_sha256": "A", "created_at": "a"}
+    reused_a = {"run_mode": "reused", "random_runs_sha256": "A", "source": {"reuse_count": 1}}
+    full_b = {"run_mode": "full", "random_runs_sha256": "B", "created_at": "b"}
+
+    # 같은 산출물의 최초 full provenance는 유지되고 reuse_count만 증가
+    original, count, write = p0d.resolve_source_provenance(full_a, reused_a, "A")
+    if (original, count, write) != (full_a, 2, False):
+        raise AssertionError(f"동일 산출물 계보 유지 실패: {original}, {count}, {write}")
+    original, count, write = p0d.resolve_source_provenance(None, full_a, "A")
+    if (original, count, write) != (full_a, 1, True):
+        raise AssertionError(f"최초 full 보존 실패: {original}, {count}, {write}")
+    # 새 full 실행(B) 뒤 재사용이면 이전 실험(A) 잔여 파일을 계보로 쓰지 않는다
+    original, count, write = p0d.resolve_source_provenance(full_a, full_b, "B")
+    if (original, count, write) != (full_b, 1, True):
+        raise AssertionError(f"잔여 provenance 교체 실패: {original}, {count}, {write}")
+
+
+def check_clopper_pearson() -> None:
+    upper = p0d.upper_one_sided_cp(0, 100)
+    if abs(upper - 0.0295) > 5e-4:
+        raise AssertionError(f"0/100 단측 상한이 2.95%가 아닙니다: {upper}")
+    if p0d.upper_one_sided_cp(100, 100) != 1.0:
+        raise AssertionError("100/100 상한이 1이 아닙니다")
+    mid = p0d.upper_one_sided_cp(48, 100)
+    if not 0.38 <= mid <= 0.60:
+        raise AssertionError(f"48/100 상한이 비정상입니다: {mid}")
+
+
 def main() -> int:
     checks = [
         ("determinism", check_determinism),
@@ -126,6 +231,9 @@ def main() -> int:
         ("filters respected", check_filters_respected),
         ("empty snapshot", check_empty_snapshot),
         ("date variation", check_date_variation),
+        ("reuse validation", check_reuse_validation),
+        ("source provenance chain", check_source_provenance_chain),
+        ("clopper-pearson bound", check_clopper_pearson),
     ]
     failures = 0
     for label, check in checks:

@@ -1,20 +1,22 @@
 # P0-D: 팩터 기여도 및 Random Ranking Baseline (연구용)
 
 - 실행: `scripts/p0d_factor_random_baseline.py` (100 seeds × 2 비용 조건, 약 12분)
-- ranker 검증: `scripts/test_p0d_random_ranker.py` (7검사)
+  - `--reuse-random-runs`: 검증된 `random_runs.csv` 재사용(무결성 실패 시 거부, 데이터 로딩 포함 약 1.5분)
+- ranker/재사용/통계 검증: `scripts/test_p0d_random_ranker.py` (10검사)
 - 동결 전략(cap 0.85, 20일, 상위 2종목), 2016-01-05~2026-09-28, 16종, price, 5bp/2bp
 - 데이터: `data_cache/` 복제본, digest 불변, `preflight_cache` 재사용, 16/16 로딩
 - 기준 재현: CAGR **24.5411%**, MDD **-51.21%**, Sharpe **1.0391** (P1-A-2 일치)
 - 모멘텀 가중치(freeze 외부): **60일 0.55 / 120일 0.45로 명시 고정**, metadata 기록
 - 산출물: `outputs_p0d/` (`random_runs.csv`, `random_summary.csv`, `factor_ablation.csv`,
-  `benchmarks.csv`, `random_failures.csv`, `p0d_summary.json`, `run_metadata.json`)
+  `benchmarks.csv`, `random_failures.csv`, `p0d_summary.json`, `run_metadata.json`,
+  `run_provenance.json[.run_provenance_source.json]`)
 
 ## 1. 재사용·신규 범위
 
 | 구분 | 내용 |
 |---|---|
 | 재사용 | `etf_shared.rank_etfs()`(필터·점수), `run_etf_strategy`(게이트·주문·비용), `p0b`(동결 설정·가드·검산), `p0c`(낙폭·가격행렬), `p1a1`(구간 경계 `slice_stats`), `benchmark_comparison.calc_stats`, `factorial_ablation.run_scenario`(교차검증) |
-| 신규 | `make_random_ranker(seed, original)` — **순위만** 섞는 연구용 래퍼, 연구 러너, ranker fixture 테스트. 운영 코드·동결 설정·주문 경로 변경 없음 |
+| 신규 | `make_random_ranker(seed, original)` — **순위만** 섞는 연구용 래퍼, 연구 러너, ranker/reuse fixture 테스트, 재사용 무결성 검증. 운영 코드·동결 설정·주문 경로 변경 없음 |
 
 ## 2. Random Ranking의 공정한 비교 조건
 
@@ -33,7 +35,36 @@
 - 500개 확장은 하지 않았습니다: 1회 약 3.5초로 1,000회 실행이 약 60분 소요되어, MVP 자원 한도에서
   중단했습니다. seed 목록은 0~99의 접두 확장이므로 추후 500개로 늘려도 동일 규칙입니다.
 - 각 실행은 fresh state이며, 표본오차는 `random_summary.csv`의 `share_binomial_se`와
-  bootstrap 95% CI(평균)로 기록했습니다.
+  bootstrap 95% CI(평균)로 기록했습니다. 다만 0/100·100/100에서 플러그인 이항 SE는 0이 되어
+  의미가 없으므로, **단측 95% Clopper-Pearson 상한**(`share_upper_95_one_sided`, 0/100 → **2.95%**)을
+  함께 기록하고 본문 통계는 이 값을 사용합니다.
+- **재사용 무결성**: `run_provenance.json`에 코드 digest(연구 러너·`etf_shared`·`run_etf_backtest`
+  ·`p0b`·`p0c`·`p1a1`), data_cache digest, freeze SHA256, 기간, 비용 조건, 모멘텀 가중치,
+  비중 한도, 호가 스프레드, OOS 시작일, seed 범위, `random_runs.csv` SHA256, 실패 건수,
+  `experiment_complete`를 기록합니다. `--reuse-random-runs`는 (seed×비용) 조합이 정확히 1행씩
+  존재하는지, 중복·누락이 없는지, 필수 지표 13종에 NaN/Inf가 없는지, 위 메타데이터와 파일
+  SHA256이 모두 일치하는지, 원 실행이 완전했는지를 검사하고 **하나라도 어긋나면 거부**합니다.
+  재사용 실행은 원 provenance를 `run_provenance_source.json`으로 보존하고 `run_mode=reused`로
+  구분해 기록합니다. 반복 재사용해도 **같은 산출물의 최초 full 실행 provenance는 덮어쓰지 않고**,
+  `source`에 `reused_from_provenance_sha256`·`reuse_count`를 남겨 계보를 추적할 수 있습니다.
+  새 full 실행으로 `random_runs.csv`가 바뀐 뒤 재사용하면 이전 실험의 잔여 source 파일을
+  계보로 쓰지 않고 현재 실행 provenance로 교체합니다(산출물 SHA256 불일치 시).
+- 메타데이터 타입도 엄격히 검사합니다: `seed`는 정수(소수·NaN 거부), `failures`는 정수 0,
+  `experiment_complete`는 JSON boolean `true`여야 하며, 검증 대상 13개 지표(요약 사용 12개 포함)가
+  모두 존재해야 합니다.
+- **결정성**: 최종 코드로 200회를 두 번 독립 실행했을 때 `random_runs.csv`(`cdddc3a6…`),
+  `random_summary.csv`(`6d76650b…`), `factor_ablation.csv`(`5ff083a9…`), `benchmarks.csv`
+  (`2dbc396e…`), `p0d_summary.json`(`e9e75fa9…`)의 SHA256이 **모두 동일**했습니다. 200회 전부
+  CAGR·MDD·Sharpe·Calmar·회전·현금비중·거래수가 비트 동일합니다.
+- **파서 정밀도**: `random_runs.csv`의 4,200개 수치를 pandas 기본 float 파서로 읽으면 1,774개가
+  1ulp 어긋납니다. 재사용 경로는 `float_precision="round_trip"`으로 읽고, 재사용 시
+  `random_runs.csv`를 재작성하지 않습니다(원 파일 SHA256 유지).
+- 아카이브(fe7c3ad) 산출물과 현재 재현 산출물은 200행 중 4개 셀에서 1ulp(상대 1e-16) 차이가
+  있습니다(수치 라이브러리 누적 순서 차이로 추정, 엔진·설정 변경 없음). 어떤 지표도 표시 정밀도
+  에서 달라지지 않으며, 현재 코드로의 독립 실행 2회는 비트 동일합니다.
+- 최종 산출물은 검증된 `random_runs.csv`를 `--reuse-random-runs`로 재사용해 생성했고, 재사용
+  실행의 데이터 산출물 SHA256이 직전 full 실행과 **동일**했습니다(달라지는 것은 `created_at`·
+  `run_mode`·`source`를 담는 `run_metadata.json`·`run_provenance.json`뿐).
 
 ## 4. 무작위 성과 분포와 기존 전략 백분위 (base 5bp/1x, n=100)
 
@@ -46,12 +77,16 @@
 | 최종 평가액 | 5.94M | 1.47M | 5.82M | 3.95M | 8.53M | 3.53M | 9.94M | 10.54M | 100 |
 | 총비용 | 563,108 | 92,563 | 558,754 | 416,757 | 752,567 | 384,066 | 803,836 | 322,611 | 100 |
 | 회전(gross) | 109.9 | 6.4 | 109.2 | 101.0 | 120.2 | 95.9 | 129.6 | 56.3 | 100 |
-| 평균 현금 | 30.2% | 0.1% | 30.2% | 30.0% | 30.5% | 29.9% | 30.8% | 30.2% | 44 |
+| 평균 현금* | 30.2% | 0.1% | 30.2% | 30.0% | 30.5% | 29.9% | 30.8% | 30.2% | — |
 | 2026 제외 CAGR | 14.37% | 1.56% | 14.28% | 12.09% | 16.73% | 10.72% | 18.92% | **16.73%** | **95** |
 | OOS CAGR(46일) | 8.76% | 9.31% | 9.40% | -7.46% | 21.34% | -11.72% | 30.20% | 13.26% | 66 |
 
 *기준 백분위 = **기준보다 나쁜 무작위 비율**(100에 가까울수록 기준 우수; MDD는 0에 가까운 쪽이 우수).
-"기준 이상" 비율은 CAGR 0/100(SE 0.014), Sharpe 48/100(SE 0.05), MDD 98/100.
+\*평균 현금 비중은 전략 구조(상위 2종목·비중 한도)에서 결정되는 **기술 통계**이며, 순위·우열 비교에
+사용하지 않습니다(`random_summary.csv`의 `informational_only=true`).
+"기준 이상" 비율은 CAGR 0/100, Sharpe 48/100, MDD 98/100. 0/100·100/100에서 플러그인 이항
+표준오차는 0이므로, 단측 95% Clopper-Pearson 상한(**0/100 → 2.95%**)을 함께 기록했습니다.
+이 상한은 **고정된 데이터·설정에서 관측된 오차율의 추정치**이며, 전략의 미래 성공 확률이 아닙니다.
 → **수익(CAGR)은 무작위 분포의 최상위(0/100이 기준 이상)**지만, **위험조정(Sharpe)은 중앙값 수준**이고
 **낙폭은 무작위의 98%보다 나쁩니다**. 무작위는 회전이 약 2배(109.9 vs 56.3)로 비용도 1.7배입니다.
 
@@ -71,8 +106,10 @@ Sharpe 0.626 vs 기준 0.833 → 백분위 93, MDD -33.74% vs -51.11% → 백분
 
 - **trend_ok 필터가 가장 큰 기여**(-5.69%p, Sharpe -0.22)이고, 그룹 override(-4.17%p)와
   KOSPI 필터(-0.78%p, Sharpe -0.095)도 양(+)의 기여입니다.
-- 60일만 사용하면 -4.48%p, **120일만 사용하면 +2.93%p**입니다. 55/45 혼합이 표본 내에서
-  120일 단독보다 열등하다는 관찰이지만, **가중치 최적화·채택은 하지 않습니다**(팩터 진단).
+- 60일만 사용하면 -4.48%p, **120일만 사용하면 +2.93%p**입니다. 다만 이는 단일 in-sample
+  제거 실험이고(2026 제외 CAGR도 +18.21% vs 16.73%로 같은 방향), **가중치 최적화·채택 근거로
+  사용하지 않습니다**. 120일 가중치 상향은 **후속 검증 후보**로만 기록하며, 채택 전 WFA·파라미터
+  안정성·다중 비교 보정이 필요합니다.
 - 요소 간 상호작용이 있으므로 개별 Δ를 합산해 전체 기여도로 해석하지 않습니다.
 - KOSPI 필터/override 제거는 `factorial_ablation.run_scenario`로 최종자산·MDD·거래수를 교차검증했습니다.
 
@@ -102,27 +139,49 @@ Sharpe 0.626 vs 기준 0.833 → 백분위 93, MDD -33.74% vs -51.11% → 백분
 
 ## 8. 모멘텀 신호 초과성과 평가
 
-- **수익**: 동일 필터·동일 엔진에서 순위만 무작위화한 100개 전략을 모두 상회(0/100, 이항 SE 0.014
-  → 100개 기준 95% 상한 약 3%). 2026 제외·고비용에서도 유지됩니다.
+- **수익**: 동일 필터·동일 엔진에서 순위만 무작위화한 100개 전략을 모두 상회했습니다(0/100).
+  플러그인 이항 SE는 0/100에서 0이므로 의미가 없고, 단측 95% Clopper-Pearson 상한 **2.95%**로
+  표기합니다. 이는 **고정 표본에서의 오차율 추정치**일 뿐 전략의 미래 성공 확률이 아닙니다.
+  2026 제외·고비용 조건에서도 순위 우위는 유지됩니다.
 - **위험조정**: Sharpe는 무작위 중앙값 수준(52백분위, 48/100이 기준 이상)이고 Calmar는 35백분위로
-  오히려 열등합니다. 즉 초과수익은 **더 큰 낙폭(-51.2% vs 무작위 평균 -33.1%)과 집중**을 대가로 합니다.
-- **비용**: 무작위는 회전 109.9(기준 56.3), 비용 563k(기준 323k)입니다. 모멘텀 순위의 **지속성**이
-  거래비용을 낮추는 효과도 성과 차이의 일부입니다(선정 자체와 분리해 해석해야 함).
+  오히려 열등합니다.
+- **선정 효과와 지속성 효과는 이번 실험에서 분리 식별되지 않았습니다.** 무작위 ranker도 같은
+  필터·게이트·비중 한도를 통과한 종목만 보유하므로 수익 차이가 전적으로 순위 신호 탓이라거나,
+  회전 109.9 vs 56.3·비용 563k vs 323k의 차이가 전적으로 순위 지속성 탓이라고 귀속할 수 없습니다
+  (순수익에는 비용 차이도 포함). 회전을 고정한 무작위 등 **분리 실험은 이번 범위에 포함하지
+  않았습니다**.
+- **낙폭**: 기준 MDD -51.2%는 무작위 평균 -33.1%보다 깊습니다. 이 표본에서는 수익 우위와 깊은
+  낙폭이 **함께 관측**되었지만, 낙폭이 초과수익의 원인이라거나 그 대가라고 단정하지 않습니다
+  (동일 표본·단일 기간의 연관성 기술).
 - **벤치마크**: 유니버스 균등비중 대비 +8.2%p CAGR이지만 MDD는 -14.9%p 더 깊습니다.
 - 이 실험은 **모든 데이터 마이닝 편향을 제거하는 통계 검정이 아닙니다**. 고정 유니버스·단일 기간·
-  in-sample 중심·중첩 구간이라는 한계를 유지합니다.
+  in-sample 중심·중첩 구간이라는 한계를 유지합니다. Clopper-Pearson 상한도 seed 재추출·설정
+  탐색을 포함한 전체 절차의 불확실성을 반영하지 않습니다.
 
 ## 9. 검증
 
-- ranker fixture **7/7 PASS**: 동일 seed·날짜 결정성, seed 다양성, 행 순서 독립, 적격 집합 불변,
-  필터 유지(trend/liquidity/listing/deviation), 빈 스냅샷, 날짜별 순열 변화
+- ranker + 재사용 + 통계 fixture **10/10 PASS**: 동일 seed·날짜 결정성, seed 다양성, 행 순서 독립,
+  적격 집합 불변, 필터 유지(trend/liquidity/listing/deviation), 빈 스냅샷, 날짜별 순열 변화,
+  재사용 무결성(정상 통과 + 중복·누락·소수 seed·지표 누락·NaN·Inf·data digest·code digest·파일
+  SHA256·`failures` 타입/음수·`experiment_complete` 문자열·불완전 실행·provenance 부재 14종 거부),
+  Clopper-Pearson 상한(0/100 = 2.95%, 100/100 = 1.0, 48/100 구간), source provenance 계보
+  (동일 산출물 유지·`reuse_count` 증가·다른 산출물 잔여 파일 교체)
 - 기준 재현 P1-A-2 일치(1e-9), 전 실행 회계 검산, 캐시 digest 불변
-- seed·비용 조건 커버리지 검증(재사용 경로), 실패 0건 기록(`random_failures.csv`)
-- 회귀 테스트 PASS(엔진·ranker 변경 없음)
+- 독립 full 실행 2회 + 재사용 1회의 `random_runs`·`random_summary`·`factor_ablation`·
+  `benchmarks`·`p0d_summary` SHA256 동일
+- `--reuse-random-runs`를 **연속 실행**해도 데이터 산출물 SHA256은 불변이고, `reuse_count`가
+  1→2로 증가하며 `reused_from_provenance_sha256`이 직전 실행 provenance를 가리킵니다. 잔여
+  source 파일의 `random_runs_sha256`이 현재 산출물과 다르면 현재 provenance로 교체되는 것도
+  실측 확인했습니다(인위적 stale 파일 주입 → 교체).
+- 손상 산출물 실측: `random_runs.csv`에 중복 행을 주입하면 `재사용 거부: random_runs SHA256
+  불일치; 행 수 불일치: 201 != 200; 중복된 (seed, cost_case) 행`으로 중단(원복 후 재사용 정상)
+- 실패 0건 기록(`random_failures.csv`), 회귀 테스트 PASS(엔진·ranker 변경 없음)
 
 ## 10. 한계
 
 - 100 seeds는 분포의 꼬리(특히 p99)를 정밀 추정하기에 부족합니다. 500 확장은 자원 한도로 보류.
+- "기준 이상 0/100"과 Clopper-Pearson 상한 2.95%는 **이 데이터·이 설정에서의 오차율 추정**이며,
+  미래 수익성 확률이나 다른 기간·유니버스로의 일반화를 뜻하지 않습니다.
 - 무작위 전략도 동일 필터를 통과한 종목만 보유하므로 "필터 없는 무작위"와는 다릅니다.
 - 단일 유니버스(16종)·단일 기간·in-sample 중심이며, OOS 46거래일은 검증 근거가 아닙니다.
 - 벤치마크는 비용 0·일별 리밸런싱 가정이며 전략과 비용 조건이 다릅니다.
