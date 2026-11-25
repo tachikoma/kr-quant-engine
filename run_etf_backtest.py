@@ -1159,6 +1159,7 @@ def run_etf_strategy(
     execution_mode: str = "legacy",
     participation_rate: float = 0.05,
     daily_risk_off_exit: bool = False,
+    rebalance_phase_offset: int = 0,
 ):
     """ETF 로테이션 전략을 백테스트한다.
 
@@ -1181,6 +1182,11 @@ def run_etf_strategy(
             ``ohlcv_capacity``, ``approval_strict``, ``initial_state``(state 재개/WFA)
             조합은 지원하지 않고 ValueError로 차단한다. 미체결 청산 의도의 상태
             직렬화·WFA 연동은 후속 과제다.
+        rebalance_phase_offset: 연구용 opt-in. 정기 리밸런싱 일정을 offset만큼
+            앞당긴다(``(i - warmup + offset) % REBALANCE_STEP_DAYS == 0``).
+            기본값 0은 기존 동작과 완전히 동일하다. legacy·비승인·fresh-state
+            실행에서만 허용하며 그 외 조합은 ValueError로 차단한다.
+            실전 경로(``live_trading``)에서는 사용하지 않는다.
     """
     if execution_mode not in {"legacy", "ohlcv_capacity"}:
         raise ValueError("execution_mode must be exactly legacy or ohlcv_capacity")
@@ -1198,6 +1204,17 @@ def run_etf_strategy(
             raise ValueError(
                 "daily_risk_off_exit는 initial_state 재개(state-based WFA)에서 지원하지 않습니다."
             )
+    if isinstance(rebalance_phase_offset, bool) or int(rebalance_phase_offset) != rebalance_phase_offset:
+        raise ValueError("rebalance_phase_offset는 정수여야 합니다.")
+    phase_offset = int(rebalance_phase_offset)
+    if phase_offset < 0 or phase_offset >= int(REBALANCE_STEP_DAYS):
+        raise ValueError(
+            "rebalance_phase_offset는 0 이상 REBALANCE_STEP_DAYS 미만이어야 합니다."
+        )
+    if phase_offset and (execution_mode != "legacy" or approval_strict or initial_state):
+        raise ValueError(
+            "rebalance_phase_offset은 legacy·비승인·fresh-state 실행에서만 지원합니다(연구 범위)."
+        )
     if isinstance(participation_rate, bool):
         raise TypeError("participation_rate must be a finite number")
     try:
@@ -1264,6 +1281,8 @@ def run_etf_strategy(
         }
         rebalance_phase_offset = int(initial_state.get("rebalance_phase_offset", 0))
         exit_phase_offset = int(initial_state.get("exit_phase_offset", rebalance_phase_offset))
+    else:
+        rebalance_phase_offset = phase_offset
     strict_states: dict[str, HoldingState] = {}
     strict_state_event_ids: dict[str, str] = {}
     pending_receivables = []
