@@ -144,10 +144,17 @@ def rolling_windows(equity: pd.DataFrame) -> pd.DataFrame:
         for year in years:
             start = pd.Timestamp(f"{year}-01-01")
             end = pd.Timestamp(f"{year + length - 1}-12-31")
+            # 데이터 종료일을 넘는(미완결) 달력 창은 제외한다.
             if end > pd.Timestamp(equity["date"].max()):
                 continue
             stats = p1a1.slice_stats(equity, start, end)
             rows.append({"window_type": label, "start": start, "end": end, **stats})
+    # 데이터 종료일까지의 최근 N년(비달력, as-of) 창을 별도로 비교한다.
+    last = pd.Timestamp(equity["date"].max())
+    for length, label in ((3, "3y_asof"), (5, "5y_asof")):
+        start = last - pd.DateOffset(years=length) + pd.Timedelta(days=1)
+        stats = p1a1.slice_stats(equity, start, last)
+        rows.append({"window_type": label, "start": start, "end": last, **stats})
     return pd.DataFrame(rows)
 
 
@@ -279,6 +286,7 @@ def event_dependency(
             rows.append(
                 {
                     "scenario": name,
+                    "event_id": pd.Timestamp(event.event_id),
                     "signal_date": pd.Timestamp(event.signal_date),
                     "decision_date": pd.Timestamp(event.decision_date),
                     "exec_date": exec_date,
@@ -297,6 +305,67 @@ def event_dependency(
                     "exit_cost": exit_cost,
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def event_summary(
+    events: pd.DataFrame,
+    results: dict[str, dict[str, Any]],
+    dates: list[pd.Timestamp],
+) -> pd.DataFrame:
+    """결정일 단위 이벤트 요약. 포트폴리오 지표를 이벤트당 1회만 계산한다."""
+    if events.empty:
+        return pd.DataFrame()
+    base_equity = p0c.equity_with_initial(
+        results["baseline|base|full"]["curve"], dates
+    ).set_index("date")["equity"]
+    position = {pd.Timestamp(d): index for index, d in enumerate(dates)}
+    rows: list[dict[str, Any]] = []
+    for (scenario, event_id), group in events.groupby(["scenario", "event_id"]):
+        item = results[f"{scenario}|base|full"]
+        equity = p0c.equity_with_initial(item["curve"], dates).set_index("date")["equity"]
+        exec_date = pd.Timestamp(group["exec_date"].min())
+        index = position.get(exec_date, -1)
+        if index < 0:
+            continue
+        peak = equity.cummax()
+        decision_date = pd.Timestamp(group["decision_date"].min())
+        drawdown_at_exit = float(
+            equity.loc[:decision_date].iloc[-1] / peak.loc[:decision_date].iloc[-1] - 1
+        )
+        row: dict[str, Any] = {
+            "scenario": scenario,
+            "event_id": pd.Timestamp(event_id),
+            "signal_date": pd.Timestamp(group["signal_date"].min()),
+            "decision_date": decision_date,
+            "exec_date": exec_date,
+            "tickers": ",".join(sorted(group["ticker"].astype(str))),
+            "exit_rows": len(group),
+            "lag_days_min": float(group["lag_days"].min()),
+            "lag_days_max": float(group["lag_days"].max()),
+            "drawdown_at_exit": drawdown_at_exit,
+            "exit_cost_total": float(group["exit_cost"].sum()),
+            "reentry_count": int(group["reentry_days"].notna().sum()),
+        }
+        for horizon in (5, 20, 60):
+            target = index + horizon
+            if target < len(dates):
+                later = dates[target]
+                row[f"fwd{horizon}"] = float(
+                    equity.loc[:later].iloc[-1] / equity.loc[:exec_date].iloc[-1] - 1
+                )
+                row[f"vs_base_{horizon}d"] = float(
+                    (equity.loc[:later].iloc[-1] / equity.loc[:exec_date].iloc[-1] - 1)
+                    - (
+                        base_equity.loc[:later].iloc[-1]
+                        / base_equity.loc[:exec_date].iloc[-1]
+                        - 1
+                    )
+                )
+            else:
+                row[f"fwd{horizon}"] = None
+                row[f"vs_base_{horizon}d"] = None
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -433,6 +502,8 @@ def main() -> int:
 
     events = event_dependency(full, price, dates, labels)
     events.to_csv(OUTPUT_DIR / "event_dependency.csv", index=False, encoding="utf-8-sig")
+    summaries = event_summary(events, full, dates)
+    summaries.to_csv(OUTPUT_DIR / "event_summary.csv", index=False, encoding="utf-8-sig")
 
     phase = phase_support_check(price, index_df, dates)
     (OUTPUT_DIR / "phase_status.json").write_text(
@@ -471,6 +542,7 @@ def main() -> int:
         "ex2026": ex_metrics.to_dict(orient="records"),
         "rolling_summary": rolling_summary.to_dict(orient="records"),
         "events": events.to_dict(orient="records"),
+        "event_summary": summaries.to_dict(orient="records"),
         "phase": phase,
     }
     (OUTPUT_DIR / "p1a2_summary.json").write_text(
