@@ -455,16 +455,27 @@ def policy_improvement(fold_frame: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # 위험 이벤트·휩쏘
 # --------------------------------------------------------------------------- #
-def risk_events(trades: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def risk_events(
+    trades: pd.DataFrame, dates: list[pd.Timestamp]
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     if trades.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {"ticker_exits": 0, "decision_events": 0}
     exits = trades[
         (trades["side"] == "SELL") & (trades["reason"].astype(str) == "ETF_DAILY_RISK_OFF")
     ].copy()
     if exits.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {"ticker_exits": 0, "decision_events": 0}
     exits["date"] = pd.to_datetime(exits["date"])
     exits["year"] = exits["date"].dt.year
+    exits["origin"] = exits.get("exit_origin_date", pd.Series(index=exits.index, dtype=object))
+    exits["origin_date"] = pd.to_datetime(exits["origin"], errors="coerce")
+    exits["origin_year"] = exits["origin_date"].dt.year
+    origin_lookup = {
+        (str(pd.Timestamp(row.date).date()), str(row.ticker)): (
+            None if pd.isna(row.origin_date) else str(row.origin_date.date())
+        )
+        for row in exits.itertuples()
+    }
     position = {pd.Timestamp(day): index for index, day in enumerate(dates)}
     exits["index"] = exits["date"].map(position)
     buys = trades[trades["side"] == "BUY"].copy()
@@ -472,6 +483,9 @@ def risk_events(trades: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[pd.Dat
     buys["index"] = buys["date"].map(position)
     rows = []
     for exit_row in exits.itertuples():
+        origin_value = origin_lookup.get(
+            (str(pd.Timestamp(exit_row.date).date()), str(exit_row.ticker))
+        )
         later = buys[
             (buys["ticker"] == exit_row.ticker) & (buys["index"] > exit_row.index)
         ].sort_values("index")
@@ -480,6 +494,7 @@ def risk_events(trades: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[pd.Dat
             rows.append(
                 {
                     "date": str(exit_row.date.date()),
+                    "origin_date": origin_value,
                     "ticker": exit_row.ticker,
                     "qty": int(exit_row.qty),
                     "exit_price": float(exit_row.price),
@@ -496,7 +511,8 @@ def risk_events(trades: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[pd.Dat
         reentry = later.iloc[0]
         rows.append(
             {
-                "date": str(exit_row.date.date()),
+                "date": str(pd.Timestamp(exit_row.date).date()),
+                "origin_date": origin_value,
                 "ticker": exit_row.ticker,
                 "qty": int(exit_row.qty),
                 "exit_price": float(exit_row.price),
@@ -511,9 +527,28 @@ def risk_events(trades: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[pd.Dat
         )
     detail = pd.DataFrame(rows)
     by_year = (
-        exits.groupby("year").size().rename("risk_off_exits").reset_index().to_dict(orient="records")
+        exits.groupby("year").size().rename("risk_off_ticker_exits").reset_index().to_dict(orient="records")
     )
-    return detail, pd.DataFrame(by_year)
+    decision_by_year = (
+        exits.dropna(subset=["origin_year"])
+        .drop_duplicates(subset=["origin_date"])
+        .groupby("origin_year")
+        .size()
+        .rename("risk_off_decision_events")
+        .reset_index()
+    )
+    by_year_frame = pd.DataFrame(by_year).merge(
+        decision_by_year, left_on="year", right_on="origin_year", how="outer"
+    )
+    if "origin_year" in by_year_frame:
+        by_year_frame["year"] = by_year_frame["year"].fillna(by_year_frame["origin_year"])
+        by_year_frame = by_year_frame.drop(columns=["origin_year"])
+    by_year_frame[["year"]] = by_year_frame[["year"]].astype("Int64")
+    counts = {
+        "ticker_exits": len(exits),
+        "decision_events": int(exits["origin_date"].nunique(dropna=True)),
+    }
+    return detail, by_year_frame, counts
 
 
 def whipsaw_summary(detail: pd.DataFrame) -> dict[str, Any]:
@@ -729,7 +764,7 @@ def main() -> int:
     monitoring = pd.DataFrame(monitoring_rows)
 
     # 위험 이벤트·휩쏘(연결 곡선 기준, A)
-    event_detail, event_by_year = risk_events(
+    event_detail, event_by_year, event_counts = risk_events(
         connected[(FOLD_CONFIGS[0][0], "A")][1], full_dates
     )
     whipsaw = whipsaw_summary(event_detail)
@@ -939,9 +974,14 @@ def main() -> int:
         },
         "monitoring_2026": monitoring.to_dict(orient="records"),
         "risk_events": {
-            "detail_rows": len(event_detail),
+            "ticker_exits": event_counts["ticker_exits"],
+            "decision_events": event_counts["decision_events"],
             "by_year": event_by_year.to_dict(orient="records") if not event_by_year.empty else [],
             "whipsaw": whipsaw,
+            "note": (
+                "ticker_exits는 종목별 청산 행 수, decision_events는 원 신호일(decision date) "
+                "기준 고유 이벤트 수다."
+            ),
         },
         "mdd_concentration": {
             **concentration,

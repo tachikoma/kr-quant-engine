@@ -153,7 +153,16 @@ def segmented_run(
 def trade_key(trades: pd.DataFrame) -> list[tuple]:
     if trades.empty:
         return []
-    columns = ["date", "ticker", "side", "qty", "price", "cash_flow", "reason"]
+    columns = [
+        "date",
+        "ticker",
+        "side",
+        "qty",
+        "price",
+        "cash_flow",
+        "reason",
+        "exit_origin_date",
+    ]
     frame = trades[[column for column in columns if column in trades.columns]].copy()
     return sorted(map(tuple, frame.astype(str).values.tolist()))
 
@@ -204,7 +213,7 @@ def assert_continuous_matches_split(
     total_cost_split = float(pd.to_numeric(split_trades["cost"], errors="coerce").fillna(0).sum()) if "cost" in split_trades else 0.0
     if abs(total_cost_full - total_cost_split) > 1e-6:
         raise AssertionError(f"{label}: 거래비용 불일치")
-    return continuous_curve, continuous_state
+    return continuous_curve, continuous_state, split_state
 
 
 def check_signal_at_boundary(price, index_df) -> None:
@@ -217,7 +226,7 @@ def check_signal_at_boundary(price, index_df) -> None:
         if bool(index["risk_on"].iloc[position]):
             raise AssertionError(f"경계 {position}이 risk_off 신호일이 아닙니다")
     boundaries = [pd.Timestamp(index["date"].iloc[position]) for position in boundary_indices]
-    _, state = assert_continuous_matches_split(
+    _, state, _ = assert_continuous_matches_split(
         price, index, boundaries, overlay=True, label="signal at boundary"
     )
     # 경계 재처리로 pending이 남아있지 않아야 한다(다음 세그먼트가 실행).
@@ -239,19 +248,43 @@ def check_missing_open_across_fold(price, index_df) -> None:
         price, index, [boundary], overlay=True, label="missing open across fold"
     )
     full_dates = [pd.Timestamp(day) for day in index["date"]]
-    trades = rtb.run_etf_strategy(
-        INITIAL_CASH,
-        full_dates,
-        index,
-        use_market_filter=True,
-        max_positions=2,
-        slippage=0.0005,
-        risk_off_liquidate=True,
-        price_data=price,
-        max_asset_pct=0.85,
-        daily_risk_off_exit=True,
-        return_final_state=True,
-    )[1]
+    signal_date = str(pd.Timestamp(full_dates[MISSING_OPEN_INDEX - 1]).date())
+    position = {pd.Timestamp(day): position for position, day in enumerate(full_dates)}
+
+    # 1) 경계(시가 누락일)에서 끝난 세그먼트의 상태에 pending과 원 신호일이 남아야 한다.
+    first_segment = [day for day in full_dates if day <= boundary]
+    _, _, state_after_first = run(
+        price, index, first_segment, state=None, overlay=True
+    )
+    pending_after_first = dict(state_after_first.get("pending_daily_risk_off_exits", {}))
+    if not pending_after_first:
+        raise AssertionError("경계 시가 누락 후 pending 청산 의도가 상태에 없습니다")
+    for ticker, origin in pending_after_first.items():
+        if str(origin) != signal_date:
+            raise AssertionError(f"pending 원 신호일 불일치: {ticker}={origin} != {signal_date}")
+
+    # 2) 다음 세그먼트가 상태를 이어받아 재시도하고, 원 신호일을 체결 기록에 보존한다.
+    second_segment = [day for day in full_dates if day >= boundary]
+    resumed = dict(state_after_first)
+    start_index = position[pd.Timestamp(second_segment[0])]
+    resumed["rebalance_phase_offset"] = (start_index - WARMUP) % STEP
+    resumed["exit_phase_offset"] = resumed["rebalance_phase_offset"]
+    _, resumed_trades, state_after_second = run(
+        price, index, second_segment, state=resumed, overlay=True
+    )
+    resumed_sells = resumed_trades[
+        (resumed_trades["side"] == "SELL")
+        & (resumed_trades["reason"].astype(str) == "ETF_DAILY_RISK_OFF")
+    ]
+    if resumed_sells.empty:
+        raise AssertionError("분할 실행에서 청산 재시도가 체결되지 않았습니다")
+    for origin in resumed_sells["exit_origin_date"].astype(str):
+        if origin != signal_date:
+            raise AssertionError(f"분할 실행 청산 원 신호일 불일치: {origin} != {signal_date}")
+    if state_after_second.get("pending_daily_risk_off_exits"):
+        raise AssertionError("재시도 후에도 pending 청산 의도가 남아 있습니다")
+
+    trades = run(price, index, full_dates, overlay=True)[1]
     sells = trades[
         (trades["side"] == "SELL")
         & (trades["reason"].astype(str) == "ETF_DAILY_RISK_OFF")
@@ -322,7 +355,7 @@ def check_boundary_decision_execution(price, index_df) -> None:
     # 결정 격자(index % 20)에 정확히 걸리는 날을 경계로 선택
     boundary_index = WARMUP + 20 * 4
     boundaries = [full_dates[boundary_index]]
-    curve, _ = assert_continuous_matches_split(
+    curve, _, _ = assert_continuous_matches_split(
         price, index, boundaries, overlay=False, label="decision at boundary"
     )
     trades = run(price, index, full_dates, overlay=False)[1]
@@ -378,9 +411,23 @@ def check_guard_backlog(price, index_df) -> None:
         bad = {**state, "pending_daily_risk_off_exits": {DOMESTIC: bad_origin}}
         try:
             run(price, index, full_dates[-5:], state=bad, overlay=True)
-        except ValueError:
+        except (ValueError, TypeError):
             continue
         raise AssertionError(f"잘못된 원 신호일({bad_origin!r})이 차단되지 않았습니다")
+    for bad_type in (20221010, 20221010.0, True):
+        bad = {**state, "pending_daily_risk_off_exits": {DOMESTIC: bad_type}}
+        try:
+            run(price, index, full_dates[-5:], state=bad, overlay=True)
+        except TypeError:
+            continue
+        raise AssertionError(f"날짜가 아닌 타입({bad_type!r})이 차단되지 않았습니다")
+
+    # 정상 문자열 날짜는 기존처럼 복원되어야 한다.
+    good = {
+        **state,
+        "pending_daily_risk_off_exits": {DOMESTIC: str(pd.Timestamp(full_dates[200]).date())},
+    }
+    run(price, index, full_dates[-5:], state=good, overlay=True)
 
 
 def main() -> int:

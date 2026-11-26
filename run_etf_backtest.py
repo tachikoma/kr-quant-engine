@@ -1298,6 +1298,12 @@ def run_etf_strategy(
                 "pending_daily_risk_off_exits 상태를 복원하려면 daily_risk_off_exit=True가 필요합니다."
             )
         for ticker, origin in restored_pending.items():
+            # 날짜 타입만 허용한다. int/float/bool은 pandas가 epoch ns로 해석하므로 명시적으로 거부.
+            if isinstance(origin, bool) or not isinstance(origin, (str, date, datetime, pd.Timestamp)):
+                raise TypeError(
+                    "pending_daily_risk_off_exits 원 신호일 타입이 잘못되었습니다: "
+                    f"{ticker}={origin!r} ({type(origin).__name__})"
+                )
             parsed_origin = pd.to_datetime(origin, errors="raise")
             if parsed_origin is None or pd.isna(parsed_origin):
                 raise ValueError(
