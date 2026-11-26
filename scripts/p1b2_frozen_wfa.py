@@ -363,6 +363,12 @@ def segmented_run(
     return joined_curve, joined_trades, state, segments
 
 
+def _trade_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple]:
+    """체결 비교 키. 없는 열(baseline의 exit_origin_date 등)은 빈 값으로 정렬한다."""
+    normalized = frame.reindex(columns=columns).fillna("")
+    return sorted(map(tuple, normalized.astype(str).values.tolist()))
+
+
 def assert_segments_match_continuous(
     continuous_curve: pd.DataFrame,
     split_curve: pd.DataFrame,
@@ -379,9 +385,17 @@ def assert_segments_match_continuous(
     cash_diff = float(np.max(np.abs(merged["cash_full"] - merged["cash_split"])))
     if equity_diff > 1e-6 or cash_diff > 1e-6:
         raise SystemExit(f"[p1b2] {label}: 연속/분할 실행 불일치 equity={equity_diff} cash={cash_diff}")
-    columns = ["date", "ticker", "side", "qty", "price", "cash_flow"]
-    keys_full = sorted(map(tuple, continuous_trades[columns].astype(str).values.tolist()))
-    keys_split = sorted(map(tuple, split_trades[columns].astype(str).values.tolist()))
+    columns = [
+        "date",
+        "ticker",
+        "side",
+        "qty",
+        "price",
+        "cash_flow",
+        "exit_origin_date",
+    ]
+    keys_full = _trade_keys(continuous_trades, columns)
+    keys_split = _trade_keys(split_trades, columns)
     if keys_full != keys_split:
         raise SystemExit(f"[p1b2] {label}: 연속/분할 체결 내역 불일치")
     return {"equity_max_diff": equity_diff, "cash_max_diff": cash_diff, "trades": len(keys_full)}

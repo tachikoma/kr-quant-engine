@@ -115,6 +115,24 @@ def exclude_2026(dates: pd.Series, returns: np.ndarray) -> tuple[pd.Series, np.n
     return parsed[mask].reset_index(drop=True), returns[mask.to_numpy()]
 
 
+def validate_paired_inputs(
+    base_dates: pd.Series,
+    base_returns: np.ndarray,
+    overlay_dates: pd.Series,
+    overlay_returns: np.ndarray,
+    label: str,
+) -> None:
+    """재표본화 전 Baseline/A의 날짜·길이 동일성을 검증한다."""
+    base_parsed = pd.to_datetime(base_dates)
+    overlay_parsed = pd.to_datetime(overlay_dates)
+    if len(base_parsed) != len(overlay_parsed):
+        raise ValueError(f"{label}: Baseline/A 길이 불일치 {len(base_parsed)} != {len(overlay_parsed)}")
+    if not np.array_equal(base_parsed.to_numpy(), overlay_parsed.to_numpy()):
+        raise ValueError(f"{label}: Baseline/A 날짜 배열 불일치")
+    validate_returns(base_parsed, base_returns, f"{label}:baseline")
+    validate_returns(overlay_parsed, overlay_returns, f"{label}:A")
+
+
 def block_seed_key(*parts: int) -> list[int]:
     return [int(SEED), *[int(part) for part in parts]]
 
@@ -137,10 +155,10 @@ def circular_block_indices(
     return indices.reshape(n_paths, blocks * block)[:, :horizon]
 
 
-def shuffle_indices(
+def iid_bootstrap_indices(
     n: int, horizon: int, n_paths: int, seed_key: list[int]
 ) -> np.ndarray:
-    """일별 독립 셔플(참고군)."""
+    """일별 IID bootstrap(복원추출) 참고군."""
     rng = np.random.default_rng(seed_key)
     return rng.integers(0, n, size=(n_paths, horizon), dtype=np.int64)
 
@@ -182,7 +200,8 @@ def path_metrics(equity: np.ndarray) -> dict[str, np.ndarray]:
     recovered_mask = (equity >= peak_value[:, None]) & after_trough
     recovered = recovered_mask.any(axis=1)
     recovery_index = np.where(recovered, recovered_mask.argmax(axis=1), -1)
-    recovery_days = np.where(recovered, recovery_index - trough, np.nan)
+    has_drawdown = mdd < 0
+    recovery_days = np.where(recovered & has_drawdown, recovery_index - trough, np.nan)
     tuw = longest_underwater_run(equity)
     min_equity = equity.min(axis=1)
     running_final = running[:, -1]
@@ -194,6 +213,7 @@ def path_metrics(equity: np.ndarray) -> dict[str, np.ndarray]:
         "tuw": tuw,
         "recovery_days": recovery_days,
         "recovered": recovered,
+        "has_drawdown": has_drawdown,
         "terminal_underwater": final < running_final,
         "terminal_loss": final < initial,
         "loss_from_initial": min_equity / initial - 1.0,
@@ -202,6 +222,14 @@ def path_metrics(equity: np.ndarray) -> dict[str, np.ndarray]:
 
 def proportion_se(rate: float, n_paths: int) -> float:
     return float(np.sqrt(max(rate * (1 - rate), 0.0) / n_paths))
+
+
+def conditional_unrecovered_rate(metrics: dict[str, np.ndarray]) -> float | None:
+    """낙폭 발생 경로 기준 미회복 비율(무낙폭 경로 제외)."""
+    drawdown = metrics["has_drawdown"]
+    if not drawdown.any():
+        return None
+    return float(np.mean(~metrics["recovered"][drawdown]))
 
 
 def summarize(
@@ -234,8 +262,7 @@ def summarize(
         "tuw_p95": float(np.quantile(metrics["tuw"], 0.95)),
         "tuw_gt_1y_rate": float(np.mean(metrics["tuw"] > 252)),
         "tuw_gt_1y_se": proportion_se(float(np.mean(metrics["tuw"] > 252)), n_paths),
-        "mdd_unrecovered_rate": float(np.mean(~metrics["recovered"])),
-        "mdd_unrecovered_se": proportion_se(float(np.mean(~metrics["recovered"])), n_paths),
+        "no_drawdown_rate": float(np.mean(~metrics["has_drawdown"])),
         "terminal_underwater_rate": float(np.mean(metrics["terminal_underwater"])),
         "terminal_underwater_se": proportion_se(
             float(np.mean(metrics["terminal_underwater"])), n_paths
@@ -246,6 +273,7 @@ def summarize(
         "recovery_days_p95": float(np.nanquantile(metrics["recovery_days"], 0.95))
         if np.isfinite(metrics["recovery_days"]).any()
         else None,
+        "recovery_days_scope": "drawdown_paths_recovered_only",
         "loss_from_initial_p05": float(np.quantile(metrics["loss_from_initial"], 0.05)),
         "horizon_days": horizon,
     }
@@ -257,6 +285,21 @@ def summarize(
         rate = float(np.mean(metrics["loss_from_initial"] <= threshold))
         row[f"loss_from_initial_le_{abs(int(threshold * 100))}"] = rate
         row[f"loss_from_initial_le_{abs(int(threshold * 100))}_se"] = proportion_se(rate, n_paths)
+    drawdown_mask = metrics["has_drawdown"]
+    drawdown_paths = int(drawdown_mask.sum())
+    row["drawdown_paths"] = drawdown_paths
+    if drawdown_paths:
+        unrecovered_rate = conditional_unrecovered_rate(metrics)
+        recovered_rate = float(np.mean(metrics["recovered"][drawdown_mask]))
+        row["mdd_unrecovered_rate"] = unrecovered_rate
+        row["mdd_unrecovered_se"] = proportion_se(unrecovered_rate, drawdown_paths)
+        row["recovered_drawdown_rate"] = recovered_rate
+        row["mdd_unrecovered_denominator"] = "drawdown_paths"
+    else:
+        row["mdd_unrecovered_rate"] = None
+        row["mdd_unrecovered_se"] = None
+        row["recovered_drawdown_rate"] = None
+        row["mdd_unrecovered_denominator"] = "drawdown_paths(0)"
     return row
 
 
@@ -306,7 +349,7 @@ def bootstrap_chunked(
     return {key: np.concatenate(values) for key, values in parts.items()}
 
 
-def shuffle_chunked(
+def iid_bootstrap_chunked(
     returns: np.ndarray,
     *,
     horizon: int,
@@ -317,7 +360,7 @@ def shuffle_chunked(
     parts: dict[str, list[np.ndarray]] = {}
     for start in range(0, n_paths, chunk):
         size = min(chunk, n_paths - start)
-        indices = shuffle_indices(len(returns), horizon, size, [*seed_key, start])
+        indices = iid_bootstrap_indices(len(returns), horizon, size, [*seed_key, start])
         metrics = bootstrap_metrics(returns, indices=indices)
         for key, values in metrics.items():
             parts.setdefault(key, []).append(values)
@@ -386,6 +429,16 @@ def build_source_returns(
 # --------------------------------------------------------------------------- #
 # Monte Carlo 실행
 # --------------------------------------------------------------------------- #
+def _conditional_delta(
+    overlay_metrics: dict[str, np.ndarray], base_metrics: dict[str, np.ndarray]
+) -> float | None:
+    overlay_rate = conditional_unrecovered_rate(overlay_metrics)
+    base_rate = conditional_unrecovered_rate(base_metrics)
+    if overlay_rate is None or base_rate is None:
+        return None
+    return float(overlay_rate - base_rate)
+
+
 def run_grid(
     returns_by_condition: dict[tuple[str, int, str], tuple[pd.Series, np.ndarray]],
     *,
@@ -404,22 +457,27 @@ def run_grid(
                 for block in blocks:
                     for horizon in horizons:
                         key = block_seed_key(phase, cost_index, block, horizon, n_paths)
-                        base_dates, base_returns = returns_by_condition[
-                            ("baseline", phase, cost_label)
-                        ]
-                        if subset == "ex2026":
-                            base_dates, base_returns = exclude_2026(base_dates, base_returns)
-                        if len(base_returns) < block:
-                            continue
-                        metrics_by_policy: dict[str, dict[str, np.ndarray]] = {}
+                        payload: dict[str, tuple[pd.Series, np.ndarray]] = {}
                         for policy_label in policy_names:
                             condition_dates, returns_p = returns_by_condition[
                                 (policy_label, phase, cost_label)
                             ]
                             if subset == "ex2026":
-                                _, returns_p = exclude_2026(condition_dates, returns_p)
+                                condition_dates, returns_p = exclude_2026(
+                                    condition_dates, returns_p
+                                )
+                            payload[policy_label] = (condition_dates, returns_p)
+                        validate_paired_inputs(
+                            *payload["baseline"],
+                            *payload["A"],
+                            f"{subset}:p{phase}:{cost_label}",
+                        )
+                        if len(payload["baseline"][1]) < block:
+                            continue
+                        metrics_by_policy: dict[str, dict[str, np.ndarray]] = {}
+                        for policy_label in policy_names:
                             metrics_by_policy[policy_label] = bootstrap_chunked(
-                                returns_p,
+                                payload[policy_label][1],
                                 block=block,
                                 horizon=horizon,
                                 n_paths=n_paths,
@@ -467,9 +525,8 @@ def run_grid(
                                     np.mean(overlay_metrics["terminal_loss"])
                                     - np.mean(base_metrics["terminal_loss"])
                                 ),
-                                "delta_mdd_unrecovered_rate": float(
-                                    np.mean(~overlay_metrics["recovered"])
-                                    - np.mean(~base_metrics["recovered"])
+                                "delta_mdd_unrecovered_rate": _conditional_delta(
+                                    overlay_metrics, base_metrics
                                 ),
                                 "mdd_improve_5pp_share": float(np.mean(delta_mdd >= 0.05)),
                                 "cagr_worse_1pp_share": float(np.mean(delta_cagr <= -0.01)),
@@ -492,7 +549,7 @@ def run_shuffle_reference(
         for horizon in HORIZONS:
             _, returns_p = returns_by_condition[(policy_label, 0, cost_label)]
             key = block_seed_key(0, 0, 0, horizon, n_paths)
-            metrics = shuffle_chunked(
+            metrics = iid_bootstrap_chunked(
                 returns_p, horizon=horizon, n_paths=n_paths, seed_key=key
             )
             rows.append(
@@ -501,7 +558,7 @@ def run_shuffle_reference(
                     "policy": policy_label,
                     "cost_case": cost_label,
                     "subset": "full",
-                    "method": "iid_shuffle",
+                    "method": "iid_bootstrap",
                     "block_length": 0,
                     "horizon": horizon,
                     "stage": "reference",
@@ -708,9 +765,15 @@ def main() -> int:
         "tuw_median",
         "tuw_p95",
         "tuw_gt_1y_rate",
+        "drawdown_paths",
+        "no_drawdown_rate",
+        "recovered_drawdown_rate",
         "mdd_unrecovered_rate",
+        "mdd_unrecovered_se",
+        "mdd_unrecovered_denominator",
         "terminal_underwater_rate",
         "recovery_days_median",
+        "recovery_days_scope",
         "recovery_days_p95",
         "mdd_p05",
     ]

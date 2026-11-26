@@ -96,6 +96,52 @@ def check_paired_indices() -> None:
         raise AssertionError("seed가 다른데 경로 결과가 같습니다")
 
 
+def check_paired_inputs() -> None:
+    dates = pd.Series(pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]))
+    returns = np.array([0.01, -0.005, 0.002])
+    mc.validate_paired_inputs(dates, returns, dates.copy(), returns.copy(), "valid")
+    cases = (
+        ("length", dates, returns, dates.iloc[:2], returns[:2]),
+        (
+            "different dates",
+            dates,
+            returns,
+            pd.Series(pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-05"])),
+            returns,
+        ),
+        (
+            "missing date",
+            dates,
+            returns,
+            pd.Series(pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-03"])),
+            returns,
+        ),
+    )
+    for label, base_dates, base_returns, overlay_dates, overlay_returns in cases:
+        try:
+            mc.validate_paired_inputs(
+                base_dates, base_returns, overlay_dates, overlay_returns, label
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"paired 입력 검증({label})이 거부되지 않았습니다")
+
+
+def check_iid_bootstrap() -> None:
+    n, horizon, paths = 50, 100, 100
+    key = mc.block_seed_key(7)
+    indices = mc.iid_bootstrap_indices(n, horizon, paths, key)
+    if indices.shape != (paths, horizon):
+        raise AssertionError("iid bootstrap shape 오류")
+    if indices.min() < 0 or indices.max() >= n:
+        raise AssertionError("iid bootstrap 인덱스 범위 오류")
+    if len(np.unique(indices)) >= n * horizon:
+        raise AssertionError("복원추출이 아닙니다(중복 인덱스 없음)")
+    again = mc.iid_bootstrap_indices(n, horizon, paths, key)
+    if not np.array_equal(indices, again):
+        raise AssertionError("iid bootstrap seed 재현성이 없습니다")
+
+
 def check_path_metrics() -> None:
     paths = np.array(
         [
@@ -127,6 +173,10 @@ def check_path_metrics() -> None:
         raise AssertionError("원금 손실/중간 손실 구분 오류")
     if abs(metrics["mdd"][3]) > 1e-12 or bool(metrics["terminal_loss"][3]):
         raise AssertionError("무변동 경로 계산 오류")
+    if bool(metrics["has_drawdown"][3]):
+        raise AssertionError("MDD=0 경로가 낙폭 발생으로 분류되었습니다")
+    if not np.isnan(metrics["recovery_days"][3]):
+        raise AssertionError("MDD=0 경로의 회복 기간이 계산되었습니다")
 
 
 def check_input_validation() -> None:
@@ -166,6 +216,28 @@ def check_no_double_cost() -> None:
         raise AssertionError("순수익률 외 비용이 추가로 차감되었습니다")
 
 
+def check_conditional_unrecovered() -> None:
+    mixed = np.array(
+        [
+            [1000.0, 900.0, 800.0, 950.0],
+            [1000.0, 1000.0, 1000.0, 1000.0],
+            [1000.0, 1200.0, 900.0, 1300.0],
+        ]
+    )
+    metrics = mc.path_metrics(mixed)
+    rate = mc.conditional_unrecovered_rate(metrics)
+    if abs(rate - 0.5) > 1e-12:
+        raise AssertionError(f"조건부 미회복 비율 오류: {rate}")
+    row = mc.summarize(metrics, n_paths=3, horizon=3)
+    if abs(row["mdd_unrecovered_rate"] - rate) > 1e-12:
+        raise AssertionError("summary와 조건부 미회복 비율이 다릅니다")
+    if mc._conditional_delta(metrics, metrics) != 0.0:
+        raise AssertionError("동일 지표의 paired delta가 0이 아닙니다")
+    flat_only = mc.path_metrics(np.array([[1000.0, 1000.0, 1000.0, 1000.0]]))
+    if mc.conditional_unrecovered_rate(flat_only) is not None:
+        raise AssertionError("무낙폭 경로만 있을 때 조건부 비율이 None이 아닙니다")
+
+
 def check_summary_and_stability() -> None:
     rng = np.random.default_rng(2)
     returns = rng.normal(0.0003, 0.01, size=800)
@@ -190,9 +262,32 @@ def check_summary_and_stability() -> None:
     ):
         if key not in row:
             raise AssertionError(f"{key} 누락")
-    expected_unrecovered_se = mc.proportion_se(row["mdd_unrecovered_rate"], 2000)
+    expected_unrecovered_se = mc.proportion_se(row["mdd_unrecovered_rate"], row["drawdown_paths"])
     if abs(row["mdd_unrecovered_se"] - expected_unrecovered_se) > 1e-12:
         raise AssertionError("미회복 비율 SE 계산이 다릅니다")
+    if row["mdd_unrecovered_denominator"] != "drawdown_paths":
+        raise AssertionError("미회복 비율 분모 표기가 다릅니다")
+    if not (0.0 <= row["no_drawdown_rate"] <= 1.0):
+        raise AssertionError("무낙폭 비율 범위 오류")
+
+    # MDD=0 경로는 회복/미회복 통계에서 분리된다.
+    mixed = np.array(
+        [
+            [1000.0, 900.0, 800.0, 950.0],
+            [1000.0, 1000.0, 1000.0, 1000.0],
+            [1000.0, 1200.0, 900.0, 1300.0],
+        ]
+    )
+    mixed_metrics = mc.path_metrics(mixed)
+    mixed_row = mc.summarize(mixed_metrics, n_paths=3, horizon=3)
+    if mixed_row["drawdown_paths"] != 2:
+        raise AssertionError(f"낙폭 경로 수 오류: {mixed_row['drawdown_paths']}")
+    if abs(mixed_row["no_drawdown_rate"] - 1 / 3) > 1e-12:
+        raise AssertionError("무낙폭 비율 오류")
+    if abs(mixed_row["mdd_unrecovered_rate"] - 0.5) > 1e-12:
+        raise AssertionError(f"분모 적용 오류: {mixed_row['mdd_unrecovered_rate']}")
+    if abs(mixed_row["recovered_drawdown_rate"] - 0.5) > 1e-12:
+        raise AssertionError("낙폭 경로 회복 비율 오류")
     if not (row["cagr_p05"] <= row["cagr_p50"] <= row["cagr_p95"]):
         raise AssertionError("CAGR 분위수 순서 오류")
 
@@ -240,10 +335,13 @@ def main() -> int:
         ("compounding identity", check_compounding_identity),
         ("circular blocks", check_circular_blocks),
         ("paired indices", check_paired_indices),
+        ("paired inputs", check_paired_inputs),
+        ("iid bootstrap", check_iid_bootstrap),
         ("path metrics", check_path_metrics),
         ("input validation", check_input_validation),
         ("exclude 2026", check_exclude_2026),
         ("no double cost", check_no_double_cost),
+        ("conditional unrecovered", check_conditional_unrecovered),
         ("summary and stability", check_summary_and_stability),
         ("phase summary positions", check_phase_summary_positions),
     ]
