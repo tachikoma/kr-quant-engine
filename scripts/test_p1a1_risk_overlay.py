@@ -287,7 +287,7 @@ def check_oos_boundary_capture() -> None:
 
 
 def check_overlay_support_guards(price, index_df) -> None:
-    """legacy 외 조합은 명시적으로 차단된다."""
+    """legacy 외 조합은 차단되고, 상태 재개는 pending 청산 상태와 함께일 때만 허용된다."""
     dates = [pd.Timestamp(d) for d in index_df["date"]]
     base = {
         "initial_cash": INITIAL_CASH,
@@ -299,7 +299,6 @@ def check_overlay_support_guards(price, index_df) -> None:
     cases = (
         ("ohlcv_capacity", {"execution_mode": "ohlcv_capacity"}),
         ("approval_strict", {"approval_strict": True}),
-        ("initial_state", {"initial_state": {"cash": INITIAL_CASH, "holdings": {}}}),
     )
     for label, extra in cases:
         try:
@@ -309,6 +308,39 @@ def check_overlay_support_guards(price, index_df) -> None:
                 raise AssertionError(f"{label}: 다른 오류가 발생했습니다: {exc}") from exc
         else:
             raise AssertionError(f"{label}: 차단되지 않았습니다")
+
+    # P1-B-2: initial_state 재개 지원. 단 pending 상태는 overlay 활성일 때만 복원한다.
+    resume_base = {**base, "common_dates": dates[-60:]}
+    state = {"cash": INITIAL_CASH, "holdings": {}}
+    rtb.run_etf_strategy(**resume_base, initial_state=state, return_final_state=True)
+    pending_state = {
+        "cash": INITIAL_CASH,
+        "holdings": {},
+        "pending_daily_risk_off_exits": {DOMESTIC: str(pd.Timestamp(dates[0]).date())},
+    }
+    try:
+        rtb.run_etf_strategy(
+            **{**resume_base, "daily_risk_off_exit": False},
+            initial_state=pending_state,
+            return_final_state=True,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("overlay 비활성 상태에서 pending 청산 복원이 차단되지 않았습니다")
+    bad_origin = {
+        "cash": INITIAL_CASH,
+        "holdings": {},
+        "pending_daily_risk_off_exits": {DOMESTIC: "not-a-date"},
+    }
+    try:
+        rtb.run_etf_strategy(
+            **resume_base, initial_state=bad_origin, return_final_state=True
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("잘못된 원 신호일 형식이 차단되지 않았습니다")
 
 
 def main() -> int:

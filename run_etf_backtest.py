@@ -1179,9 +1179,10 @@ def run_etf_strategy(
             현재 위험 정책상 보유가 허용되지 않는 종목만 다음 거래일 시가에
             청산한다(신규 매수·재진입은 정기 리밸런싱에서만). 기본값 False는
             기존 동작과 완전히 동일하다. **legacy 실행 전용**이며
-            ``ohlcv_capacity``, ``approval_strict``, ``initial_state``(state 재개/WFA)
-            조합은 지원하지 않고 ValueError로 차단한다. 미체결 청산 의도의 상태
-            직렬화·WFA 연동은 후속 과제다.
+            ``ohlcv_capacity``, ``approval_strict`` 조합은 지원하지 않고 ValueError로
+            차단한다. ``initial_state`` 재개(state-based WFA)는 미체결 청산 의도
+            (``pending_daily_risk_off_exits``, 원 신호일 포함)를 직렬화·복원하는
+            경로에서 지원한다.
         rebalance_phase_offset: 연구용 opt-in. 정기 리밸런싱 일정을 offset만큼
             앞당긴다(``(i - warmup + offset) % REBALANCE_STEP_DAYS == 0``).
             기본값 0은 기존 동작과 완전히 동일하다. legacy·비승인·fresh-state
@@ -1199,10 +1200,6 @@ def run_etf_strategy(
         if approval_strict:
             raise ValueError(
                 "daily_risk_off_exit는 approval_strict 경로에서 지원하지 않습니다."
-            )
-        if initial_state:
-            raise ValueError(
-                "daily_risk_off_exit는 initial_state 재개(state-based WFA)에서 지원하지 않습니다."
             )
     if isinstance(rebalance_phase_offset, bool) or int(rebalance_phase_offset) != rebalance_phase_offset:
         raise ValueError("rebalance_phase_offset는 정수여야 합니다.")
@@ -1294,6 +1291,27 @@ def run_etf_strategy(
     pending_execution_carries: dict[tuple[str, str, str], dict[str, Any]] = {}
     execution_excluded_buy_tickers: set[str] = set()
     pending_daily_risk_off_exits: dict[str, str] = {}
+    if initial_state:
+        restored_pending = dict(initial_state.get("pending_daily_risk_off_exits", {}) or {})
+        if restored_pending and not daily_risk_off_exit:
+            raise ValueError(
+                "pending_daily_risk_off_exits 상태를 복원하려면 daily_risk_off_exit=True가 필요합니다."
+            )
+        for ticker, origin in restored_pending.items():
+            # 날짜 타입만 허용한다. int/float/bool은 pandas가 epoch ns로 해석하므로 명시적으로 거부.
+            if isinstance(origin, bool) or not isinstance(origin, (str, date, datetime, pd.Timestamp)):
+                raise TypeError(
+                    "pending_daily_risk_off_exits 원 신호일 타입이 잘못되었습니다: "
+                    f"{ticker}={origin!r} ({type(origin).__name__})"
+                )
+            parsed_origin = pd.to_datetime(origin, errors="raise")
+            if parsed_origin is None or pd.isna(parsed_origin):
+                raise ValueError(
+                    f"pending_daily_risk_off_exits 원 신호일이 유효하지 않습니다: {ticker}={origin!r}"
+                )
+            pending_daily_risk_off_exits[str(ticker)] = str(
+                pd.Timestamp(parsed_origin).date()
+            )
     historical_holdings: dict[pd.Timestamp, dict[str, int]] = {}
     if approval_strict:
         strict_states = {
@@ -2681,6 +2699,7 @@ def run_etf_strategy(
             "last_valid_closes": last_valid_closes,
             "rebalance_phase_offset": rebalance_phase_offset,
             "exit_phase_offset": exit_phase_offset,
+            "pending_daily_risk_off_exits": dict(pending_daily_risk_off_exits),
             "final_equity": final_equity,
         }
         if approval_strict:
