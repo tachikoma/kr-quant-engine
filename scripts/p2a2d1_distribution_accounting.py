@@ -1,0 +1,799 @@
+"""P2-A-2d-1: 실제 분배금 이벤트로 전략 엔진의 지급일·미수금 회계를 검증한다.
+
+- P2-A-2a/2b에서 확보한 KODEX 4종 ledger(74건) 중 실제 이벤트를 사용한다.
+- strict 회계 경로를 연구 전용 seam(`allow_partial_ledger`)으로 실행하되,
+  공식 승인 경로는 BLOCKED로 유지한다.
+- 단일 실행과 분할 실행의 상태 연속성, 독립 현금·미수금 원장을 대조한다.
+- 동결 price 전략 성과는 별도 P0-B 기준 실행 산출물로 확인한다.
+
+운영 경로·캐시·동결 파일은 변경하지 않는다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import p2a2b_corporate_actions as ca
+
+from etf_corporate_actions import (
+    canonical_ledger_sha256,
+    load_corporate_action_ledger,
+)
+from run_etf_backtest import load_etf_price, run_etf_strategy
+
+OUTPUT_DIR = ROOT / "outputs_p2a2d1"
+LEDGER_COLUMNS = [
+    "event_id",
+    "ticker",
+    "event_type",
+    "event_date",
+    "record_date",
+    "ex_date",
+    "payment_date",
+    "settlement_date",
+    "ratio_num",
+    "ratio_den",
+    "cash_amount",
+    "currency",
+    "source_document_id",
+    "source_document",
+    "source_url",
+    "source_sha256",
+    "notes",
+]
+
+EXPECTED_FROZEN = {
+    "cagr": 0.245411377867,
+    "mdd": -0.5121244554,
+    "sharpe": 1.03913577,
+}
+
+
+def scenario_ledger(
+    full: pd.DataFrame, tickers: list[str], start: date, end: date, name: str
+) -> Any:
+    """시나리오 구간의 이벤트만 담은 부분 ledger/manifest를 만든다."""
+    rows = full[
+        full["ticker"].isin(tickers)
+        & (pd.to_datetime(full["event_date"]).dt.date >= start)
+        & (pd.to_datetime(full["event_date"]).dt.date <= end)
+    ].copy()
+    if rows.empty:
+        raise ValueError(f"시나리오 이벤트가 없습니다: {name}")
+    ledger_dir = OUTPUT_DIR / "scenario_ledgers"
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = ledger_dir / f"{name}.csv"
+    manifest_path = ledger_dir / f"{name}.json"
+    rows[LEDGER_COLUMNS].to_csv(ledger_path, index=False)
+    documents = [
+        {
+            "document_id": str(document_id),
+            "source_url": str(url),
+            "sha256": str(sha),
+        }
+        for document_id, url, sha in sorted(
+            {
+                (row.source_document_id, row.source_url, row.source_sha256)
+                for row in rows.itertuples()
+            }
+        )
+    ]
+    manifest = {
+        "manifest_version": 1,
+        "ledger_file": ledger_path.name,
+        "ledger_sha256": "0" * 64,
+        "verification_period": {
+            "start": rows["event_date"].min().date().isoformat(),
+            "end": rows["payment_date"].max().date().isoformat(),
+        },
+        "verification_tickers": sorted({str(t) for t in rows["ticker"]}),
+        "source_documents": documents,
+        "coverage_status": "PARTIAL",
+        "notes": f"P2-A-2d-1 연구 시나리오 subset: {name}",
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    provisional = load_corporate_action_ledger(ledger_path, manifest_path)
+    manifest["ledger_sha256"] = canonical_ledger_sha256(provisional.events)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return load_corporate_action_ledger(ledger_path, manifest_path)
+
+
+def synthetic_suspension_ledger(name: str) -> Any:
+    """합성 거래정지 이벤트로 restart 시 lifecycle 복원을 검증한다(연구 fixture)."""
+    ledger_dir = OUTPUT_DIR / "scenario_ledgers"
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = ledger_dir / f"{name}.csv"
+    manifest_path = ledger_dir / f"{name}.json"
+    pd.DataFrame(
+        [
+            {
+                "event_id": "SYNTH-SUSP-091170-20260824",
+                "ticker": "091170",
+                "event_type": "SUSPENSION_START",
+                "event_date": "2026-08-24",
+                "record_date": "",
+                "ex_date": "",
+                "payment_date": "",
+                "settlement_date": "",
+                "ratio_num": "",
+                "ratio_den": "",
+                "cash_amount": "",
+                "currency": "KRW",
+                "source_document_id": "synthetic_doc",
+                "source_document": "synthetic_doc",
+                "source_url": "https://example.test/synthetic-suspension",
+                "source_sha256": "a" * 64,
+                "notes": "합성 fixture: lifecycle 복원 검증",
+            }
+        ],
+        columns=LEDGER_COLUMNS,
+    ).to_csv(ledger_path, index=False)
+    manifest = {
+        "manifest_version": 1,
+        "ledger_file": ledger_path.name,
+        "ledger_sha256": "0" * 64,
+        "verification_period": {"start": "2026-08-24", "end": "2026-08-28"},
+        "verification_tickers": ["091170"],
+        "source_documents": [
+            {
+                "document_id": "synthetic_doc",
+                "source_url": "https://example.test/synthetic-suspension",
+                "sha256": "a" * 64,
+            }
+        ],
+        "coverage_status": "PARTIAL",
+        "notes": "synthetic suspension fixture",
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    provisional = load_corporate_action_ledger(ledger_path, manifest_path)
+    manifest["ledger_sha256"] = canonical_ledger_sha256(provisional.events)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return load_corporate_action_ledger(ledger_path, manifest_path)
+
+
+def engine_run(
+    *,
+    window: tuple[str, str],
+    initial_cash: float,
+    holdings: dict[str, int],
+    cost_basis: dict[str, float],
+    universe: list[str],
+    price: pd.DataFrame,
+    index_df: pd.DataFrame,
+    ledger: Any,
+    use_market_filter: bool,
+) -> dict[str, Any]:
+    start, end = (pd.Timestamp(value) for value in window)
+    dates = [d for d in index_df["date"] if start <= d <= end]
+    if len(dates) < 2:
+        raise ValueError(f"시나리오 기간이 너무 짧습니다: {window}")
+    init = {
+        "cash": float(initial_cash),
+        "holdings": dict(holdings),
+        "holding_cost_basis": dict(cost_basis),
+        "holding_peak_closes": {},
+        "portfolio_peak_equity": None,
+        "last_valid_closes": {},
+    }
+    result = run_etf_strategy(
+        0.0,
+        dates,
+        index_df[index_df["date"].isin(dates)].reset_index(drop=True),
+        use_market_filter=use_market_filter,
+        price_data=price,
+        universe_tickers=universe,
+        initial_state=init,
+        approval_strict=True,
+        corporate_action_ledger=ledger,
+        allow_partial_ledger=True,
+        return_final_state=True,
+    )
+    curve, trades = result[0], result[1]
+    final_state = result[-1]
+    if trades is None or trades.empty:
+        trades = pd.DataFrame(columns=["date", "ticker", "side", "qty", "price", "cash_flow"])
+    return {
+        "curve": curve.reset_index(drop=True),
+        "trades": trades.reset_index(drop=True),
+        "final": final_state,
+        "dates": dates,
+    }
+
+
+def holdings_timeline(
+    dates: list[pd.Timestamp], initial: dict[str, int], trades: pd.DataFrame
+) -> dict[pd.Timestamp, dict[str, int]]:
+    """체결 원장으로 날짜별 보유수량을 재구성한다(엔진 상태 미사용)."""
+    timeline: dict[pd.Timestamp, dict[str, int]] = {}
+    qty = {str(t): int(q) for t, q in initial.items() if int(q) != 0}
+    trade_by_date: dict[pd.Timestamp, list[tuple[str, int]]] = {}
+    if not trades.empty:
+        for row in trades.itertuples():
+            sign = 1 if str(row.side).upper() == "BUY" else -1
+            trade_by_date.setdefault(pd.Timestamp(row.date), []).append(
+                (str(row.ticker), sign * int(row.qty))
+            )
+    for day in dates:
+        for ticker, delta in trade_by_date.get(day, []):
+            qty[ticker] = qty.get(ticker, 0) + delta
+            if qty[ticker] == 0:
+                qty.pop(ticker)
+        timeline[day] = dict(qty)
+    return timeline
+
+
+def independent_receivables(
+    events: list[Any],
+    timeline: dict[pd.Timestamp, dict[str, int]],
+    initial: dict[str, int],
+) -> dict[pd.Timestamp, float]:
+    """배당락일 직전 보유 스냅샷과 이벤트로 미수금 잔액을 독립 계산한다."""
+    result: dict[pd.Timestamp, float] = {}
+    for day in sorted(timeline):
+        total = 0.0
+        for event in events:
+            ex_day = pd.Timestamp(event.ex_date)
+            pay_day = pd.Timestamp(event.payment_date)
+            if ex_day <= day < pay_day:
+                prior = [d for d in timeline if d < ex_day]
+                if prior:
+                    qty = timeline[max(prior)].get(event.ticker, 0)
+                else:
+                    # 배당락일이 실행 첫날이면 체결 전 초기 보유가 권리 경계다.
+                    qty = int(initial.get(event.ticker, 0))
+                if qty > 0:
+                    total += qty * float(event.cash_amount)
+        result[day] = total
+    return result
+
+
+def dividend_payment_timeline(
+    events: list[Any], timeline: dict[pd.Timestamp, dict[str, int]], initial: dict[str, int]
+) -> dict[pd.Timestamp, float]:
+    """지급일별 분배금 현금(독립 계산)."""
+    payments: dict[pd.Timestamp, float] = {}
+    for event in events:
+        ex_day = pd.Timestamp(event.ex_date)
+        prior = [d for d in timeline if d < ex_day]
+        qty = (
+            timeline[max(prior)].get(event.ticker, 0)
+            if prior
+            else int(initial.get(event.ticker, 0))
+        )
+        if qty > 0:
+            pay_day = pd.Timestamp(event.payment_date)
+            payments[pay_day] = payments.get(pay_day, 0.0) + qty * float(event.cash_amount)
+    return payments
+
+
+def reconcile(
+    run: dict[str, Any],
+    events: list[Any],
+    initial: dict[str, int],
+    label: str,
+    initial_cash: float,
+    price: pd.DataFrame,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    curve = run["curve"]
+    timeline = holdings_timeline(list(curve["date"]), initial, run["trades"])
+    receivables = independent_receivables(events, timeline, initial)
+    payments = dividend_payment_timeline(events, timeline, initial)
+    closes = {
+        (pd.Timestamp(row.date), str(row.ticker)): float(row.close)
+        for row in price.itertuples()
+    }
+    trade_cash: dict[pd.Timestamp, float] = {}
+    if not run["trades"].empty:
+        for row in run["trades"].itertuples():
+            day = pd.Timestamp(row.date)
+            trade_cash[day] = trade_cash.get(day, 0.0) + float(row.cash_flow)
+    rows = []
+    max_equity_diff = 0.0
+    max_cash_diff = 0.0
+    max_mv_diff = 0.0
+    for row in curve.itertuples():
+        day = pd.Timestamp(row.date)
+        independent_cash = initial_cash + sum(
+            value for key, value in trade_cash.items() if key <= day
+        ) + sum(value for key, value in payments.items() if key <= day)
+        independent_mv = sum(
+            qty * closes.get((day, ticker), 0.0) for ticker, qty in timeline[day].items()
+        )
+        expected_receivable = receivables.get(day, 0.0)
+        expected_equity = independent_cash + independent_mv + expected_receivable
+        equity_diff = abs(expected_equity - float(row.equity))
+        cash_diff = abs(independent_cash - float(row.cash))
+        mv_diff = abs(independent_mv - float(row.market_value))
+        max_equity_diff = max(max_equity_diff, equity_diff)
+        max_cash_diff = max(max_cash_diff, cash_diff)
+        max_mv_diff = max(max_mv_diff, mv_diff)
+        rows.append(
+            {
+                "scenario": label,
+                "date": day.date().isoformat(),
+                "cash": float(row.cash),
+                "independent_cash": independent_cash,
+                "market_value": float(row.market_value),
+                "independent_market_value": independent_mv,
+                "engine_receivables": float(getattr(row, "receivables", 0.0) or 0.0),
+                "independent_receivables": expected_receivable,
+                "engine_equity": float(row.equity),
+                "expected_equity": expected_equity,
+                "abs_diff": equity_diff,
+                "cash_diff": cash_diff,
+                "market_value_diff": mv_diff,
+                "holdings": str(row.holdings),
+            }
+        )
+    return rows, {
+        "max_abs_diff": max_equity_diff,
+        "max_cash_diff": max_cash_diff,
+        "max_mv_diff": max_mv_diff,
+        "rows": len(rows),
+    }
+
+
+def state_signature(state: dict[str, Any]) -> dict[str, Any]:
+    receivables = [
+        (item.event_id, item.ticker, int(item.quantity), float(item.amount), str(item.payment_date), item.paid)
+        for item in state.get("pending_receivables", ())
+    ]
+    return {
+        "cash": float(state.get("cash", 0.0)),
+        "holdings": {str(k): int(v) for k, v in dict(state.get("holdings", {})).items()},
+        "cost_basis": {str(k): float(v) for k, v in dict(state.get("holding_cost_basis", {})).items()},
+        "receivables": sorted(receivables),
+        "processed_action_ids": sorted(state.get("processed_action_ids", ())),
+        "lifecycles": {
+            str(ticker): getattr(item, "lifecycle", None).value
+            if getattr(item, "lifecycle", None) is not None
+            else None
+            for ticker, item in dict(state.get("corporate_action_states", {})).items()
+        },
+        "final_equity": float(state.get("final_equity", 0.0) or 0.0),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cache-dir", type=Path, default=ROOT / "data_cache")
+    parser.add_argument(
+        "--p2a2b-dir",
+        type=Path,
+        default=Path(
+            "/home/ubuntu/investment/worktrees/p2a2b-ca/outputs_p2a2b"
+        ),
+    )
+    args = parser.parse_args()
+
+    ca.dist.load_env_file(Path(os.environ.get("ETF_ENV_FILE", ROOT / ".env")))
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    run_id = ca.dist.utc_now()
+
+    ledger_src = args.p2a2b_dir / "corporate_action_ledger.csv"
+    manifest_src = args.p2a2b_dir / "corporate_action_manifest.json"
+    full = pd.read_csv(ledger_src, dtype={"ticker": str})
+    full["event_date"] = pd.to_datetime(full["event_date"])
+    full["payment_date"] = pd.to_datetime(full["payment_date"])
+
+    tickers = ["091170", "498400"]
+    price = load_etf_price(tickers)
+    index_df = pd.read_parquet(args.cache_dir / "index.parquet")
+    index_df["date"] = pd.to_datetime(index_df["date"])
+
+    # 시나리오 정의: (name, ticker, window, cash, holdings, universe, market_filter)
+    scen = {
+        "hold_before_ex": ("091170", ("2026-08-24", "2026-09-04"), 0.0, {"091170": 1000}, ["091170"], False),
+        "buy_on_ex": ("091170", ("2026-08-27", "2026-09-04"), 1_000_000.0, {}, ["091170"], True),
+        "sell_on_ex": ("498400", ("2026-09-11", "2026-09-18"), 0.0, {"498400": 1000}, ["498400"], True),
+        "sell_after_ex": ("091170", ("2026-08-28", "2026-09-04"), 0.0, {"091170": 1000}, ["091170"], True),
+        "receivable_not_spendable": (
+            "091170",
+            ("2026-01-30", "2026-02-02"),
+            12_000.0,
+            {"091170": 300},
+            ["091170", "498400"],
+            False,
+        ),
+        "end_before_payment": ("091170", ("2026-08-24", "2026-09-01"), 0.0, {"091170": 1000}, ["091170"], False),
+        "multi_event_hold": ("091170", ("2026-06-22", "2026-09-04"), 0.0, {"091170": 1000}, ["091170"], False),
+    }
+
+    daily_rows: list[dict[str, Any]] = []
+    scenario_rows: list[dict[str, Any]] = []
+    runs: dict[str, dict[str, Any]] = {}
+    cost_basis = {"091170": 16_000.0, "498400": 15_000.0}
+    for name, (ticker, window, cash, holdings, universe, market_filter) in scen.items():
+        ledger_start = date.fromisoformat(window[0]) - timedelta(days=10)
+        ledger_end = date.fromisoformat(window[1]) + timedelta(days=10)
+        events_ledger = scenario_ledger(
+            full, [ticker], ledger_start, ledger_end, name
+        )
+        run = engine_run(
+            window=window,
+            initial_cash=cash,
+            holdings=holdings,
+            cost_basis={t: cost_basis[t] for t in holdings},
+            universe=universe,
+            price=price[price["ticker"].isin(universe)],
+            index_df=index_df,
+            ledger=events_ledger,
+            use_market_filter=market_filter,
+        )
+        runs[name] = run
+        rows, summary = reconcile(
+            run,
+            list(events_ledger.events),
+            holdings,
+            name,
+            cash,
+            price[price["ticker"].isin(universe)],
+        )
+        daily_rows.extend(rows)
+        scenario_rows.append(
+            {
+                "scenario": name,
+                "ticker": ticker,
+                "window_start": window[0],
+                "window_end": window[1],
+                "events": len(events_ledger.events),
+                "trades": len(run["trades"]),
+                "reconciliation_max_abs_diff": summary["max_abs_diff"],
+                "reconciliation_max_cash_diff": summary["max_cash_diff"],
+                "reconciliation_max_mv_diff": summary["max_mv_diff"],
+                "reconciled": max(
+                    summary["max_abs_diff"], summary["max_cash_diff"], summary["max_mv_diff"]
+                )
+                < 1e-6,
+                "final_cash": float(run["final"]["cash"]),
+                "final_equity": float(run["final"]["final_equity"] or 0.0),
+                "final_receivables_unpaid": sum(
+                    1 for item in run["final"]["pending_receivables"] if not item.paid
+                ),
+            }
+        )
+
+    # 분할 실행 연속성
+    continuity_rows: list[dict[str, Any]] = []
+    single = runs["hold_before_ex"]
+    segments = [
+        ("split_before_payment", ("2026-08-24", "2026-08-31"), ("2026-09-01", "2026-09-04")),
+        ("split_after_payment", ("2026-08-24", "2026-09-02"), ("2026-09-03", "2026-09-04")),
+    ]
+    for label, first_window, second_window in segments:
+        first_ledger = scenario_ledger(
+            full, ["091170"], date(2026, 8, 1), date(2026, 9, 10), f"{label}_a"
+        )
+        second_ledger = scenario_ledger(
+            full, ["091170"], date(2026, 8, 1), date(2026, 9, 10), f"{label}_b"
+        )
+        part_a = engine_run(
+            window=first_window,
+            initial_cash=0.0,
+            holdings={"091170": 1000},
+            cost_basis={"091170": 16_000.0},
+            universe=["091170"],
+            price=price[price["ticker"] == "091170"],
+            index_df=index_df,
+            ledger=first_ledger,
+            use_market_filter=False,
+        )
+        restored = part_a["final"]
+        # part_a 상태에서 재시작한다(엔진 initial_state 경로).
+        init_state = {
+            "cash": float(restored["cash"]),
+            "holdings": dict(restored["holdings"]),
+            "holding_cost_basis": dict(restored["holding_cost_basis"]),
+            "holding_peak_closes": dict(restored["holding_peak_closes"]),
+            "portfolio_peak_equity": restored.get("portfolio_peak_equity"),
+            "last_valid_closes": dict(restored["last_valid_closes"]),
+            "pending_receivables": tuple(restored.get("pending_receivables", ())),
+            "processed_action_ids": tuple(restored.get("processed_action_ids", ())),
+            "corporate_action_states": dict(restored.get("corporate_action_states", {})),
+        }
+        dates_b = [d for d in index_df["date"] if pd.Timestamp(second_window[0]) <= d <= pd.Timestamp(second_window[1])]
+        resumed = run_etf_strategy(
+            0.0,
+            dates_b,
+            index_df[index_df["date"].isin(dates_b)].reset_index(drop=True),
+            use_market_filter=False,
+            price_data=price[price["ticker"] == "091170"],
+            universe_tickers=["091170"],
+            initial_state=init_state,
+            approval_strict=True,
+            corporate_action_ledger=second_ledger,
+            allow_partial_ledger=True,
+            return_final_state=True,
+        )
+        resumed_trades, resumed_final = resumed[1], resumed[-1]
+        single_sig = state_signature(single["final"])
+        resumed_sig = state_signature(resumed_final)
+        combined_trades = pd.concat([part_a["trades"], resumed_trades], ignore_index=True)
+        same_trades = combined_trades.sort_values(["date", "ticker", "side", "qty"]).reset_index(
+            drop=True
+        ).equals(
+            single["trades"].sort_values(["date", "ticker", "side", "qty"]).reset_index(drop=True)
+        )
+        continuity_rows.append(
+            {
+                "scenario": label,
+                "split_at": first_window[1],
+                "single_cash": single_sig["cash"],
+                "split_cash": resumed_sig["cash"],
+                "cash_match": abs(single_sig["cash"] - resumed_sig["cash"]) < 1e-9,
+                "holdings_match": single_sig["holdings"] == resumed_sig["holdings"],
+                "receivables_match": single_sig["receivables"] == resumed_sig["receivables"],
+                "processed_ids_match": single_sig["processed_action_ids"]
+                == resumed_sig["processed_action_ids"],
+                "lifecycle_match": single_sig["lifecycles"] == resumed_sig["lifecycles"],
+                "equity_match": abs(single_sig["final_equity"] - resumed_sig["final_equity"]) < 1e-6,
+                "trades_match": bool(same_trades),
+                "single_receivable_count": len(single_sig["receivables"]),
+                "split_receivable_count": len(resumed_sig["receivables"]),
+            }
+        )
+
+    # 합성 거래정지 restart: lifecycle 복원 검증
+    susp_ledger = synthetic_suspension_ledger("synthetic_suspension")
+    susp_a = engine_run(
+        window=("2026-08-24", "2026-08-26"),
+        initial_cash=0.0,
+        holdings={"091170": 1000},
+        cost_basis={"091170": 16_000.0},
+        universe=["091170"],
+        price=price[price["ticker"] == "091170"],
+        index_df=index_df,
+        ledger=susp_ledger,
+        use_market_filter=False,
+    )
+    susp_restored = susp_a["final"]
+    susp_init = {
+        "cash": float(susp_restored["cash"]),
+        "holdings": dict(susp_restored["holdings"]),
+        "holding_cost_basis": dict(susp_restored["holding_cost_basis"]),
+        "holding_peak_closes": dict(susp_restored["holding_peak_closes"]),
+        "portfolio_peak_equity": susp_restored.get("portfolio_peak_equity"),
+        "last_valid_closes": dict(susp_restored["last_valid_closes"]),
+        "pending_receivables": tuple(susp_restored.get("pending_receivables", ())),
+        "processed_action_ids": tuple(susp_restored.get("processed_action_ids", ())),
+        "corporate_action_states": dict(susp_restored.get("corporate_action_states", {})),
+    }
+    dates_b = [d for d in index_df["date"] if pd.Timestamp("2026-08-27") <= d <= pd.Timestamp("2026-08-28")]
+    susp_resumed = run_etf_strategy(
+        0.0,
+        dates_b,
+        index_df[index_df["date"].isin(dates_b)].reset_index(drop=True),
+        use_market_filter=False,
+        price_data=price[price["ticker"] == "091170"],
+        universe_tickers=["091170"],
+        initial_state=susp_init,
+        approval_strict=True,
+        corporate_action_ledger=susp_ledger,
+        allow_partial_ledger=True,
+        return_final_state=True,
+    )
+    susp_final = susp_resumed[-1]
+    susp_state = susp_final.get("corporate_action_states", {}).get("091170")
+    lifecycle_preserved = bool(
+        susp_state is not None and getattr(susp_state.lifecycle, "value", None) == "SUSPENDED"
+    )
+    research_reports = [
+        run["final"].get("approval_report") for run in runs.values()
+    ]
+    research_blocked = all(
+        report is not None
+        and report.status == "BLOCKED"
+        and any(blocker.code == "RESEARCH_PARTIAL_LEDGER" for blocker in report.blockers)
+        for report in research_reports
+    )
+
+    # 시나리오별 핵심 체크
+    checks: dict[str, Any] = {}
+    hold = runs["hold_before_ex"]
+    hold_curve = hold["curve"].set_index("date")
+    checks["receivable_on_ex_date"] = float(hold_curve.loc[pd.Timestamp("2026-08-28"), "receivables"]) == 59_000.0
+    checks["cash_before_payment_zero"] = float(hold_curve.loc[pd.Timestamp("2026-09-01"), "cash"]) == 0.0
+    checks["payment_on_payment_date"] = float(hold_curve.loc[pd.Timestamp("2026-09-02"), "cash"]) == 59_000.0
+    checks["no_double_count_on_payment"] = (
+        abs(
+            float(hold_curve.loc[pd.Timestamp("2026-09-02"), "equity"])
+            - (
+                float(hold_curve.loc[pd.Timestamp("2026-09-02"), "cash"])
+                + float(hold_curve.loc[pd.Timestamp("2026-09-02"), "market_value"])
+            )
+        )
+        < 1e-9
+    )
+    buy = runs["buy_on_ex"]
+    checks["buy_on_ex_has_trade"] = bool(
+        (buy["trades"]["date"] == pd.Timestamp("2026-08-28")).any()
+    )
+    checks["buy_on_ex_no_receivable"] = all(
+        value == 0.0 for value in buy["curve"]["receivables"].fillna(0.0)
+    )
+    sell = runs["sell_on_ex"]
+    checks["sell_on_ex_has_trade"] = bool(
+        (sell["trades"]["date"] == pd.Timestamp("2026-09-14")).any()
+    )
+    checks["sell_on_ex_keeps_receivable"] = float(
+        sell["curve"].set_index("date").loc[pd.Timestamp("2026-09-14"), "receivables"]
+    ) == 300_000.0
+    after = runs["sell_after_ex"]
+    after_curve = after["curve"].set_index("date")
+    checks["sell_after_ex_pays_after_sale"] = (
+        abs(
+            float(after_curve.loc[pd.Timestamp("2026-09-02"), "cash"])
+            - float(after_curve.loc[pd.Timestamp("2026-09-01"), "cash"])
+            - 59_000.0
+        )
+        < 1e-9
+    )
+    spend = runs["receivable_not_spendable"]
+    spend_curve = spend["curve"].set_index("date")
+    checks["receivable_not_spent"] = (
+        bool(spend["trades"].empty)
+        and float(spend["final"]["cash"]) == 12_000.0
+        and float(spend_curve.loc[pd.Timestamp("2026-02-02"), "receivables"]) == 13_500.0
+    )
+    end = runs["end_before_payment"]
+    checks["end_receivable_preserved"] = sum(
+        1 for item in end["final"]["pending_receivables"] if not item.paid
+    ) == 1
+    multi = runs["multi_event_hold"]
+    checks["multi_event_all_paid"] = float(multi["final"]["cash"]) == 174_000.0 and all(
+        item.paid for item in multi["final"]["pending_receivables"]
+    )
+    checks["lifecycle_preserved_across_restart"] = lifecycle_preserved
+    checks["research_report_forced_blocked"] = research_blocked
+
+    accounting = pd.DataFrame(scenario_rows)
+    daily = pd.DataFrame(daily_rows)
+    continuity = pd.DataFrame(continuity_rows)
+    accounting.to_csv(OUTPUT_DIR / "accounting_scenarios.csv", index=False)
+    daily.to_csv(OUTPUT_DIR / "daily_accounting_ledger.csv", index=False)
+    continuity.to_csv(OUTPUT_DIR / "state_continuity_comparison.csv", index=False)
+    # 이벤트별 미수금/지급 대사
+    recon_rows = []
+    for name, run in runs.items():
+        for item in run["final"]["pending_receivables"]:
+            recon_rows.append(
+                {
+                    "scenario": name,
+                    "event_id": item.event_id,
+                    "ticker": item.ticker,
+                    "quantity": int(item.quantity),
+                    "amount": float(item.amount),
+                    "payment_date": str(item.payment_date),
+                    "paid": bool(item.paid),
+                }
+            )
+    pd.DataFrame(recon_rows).to_csv(OUTPUT_DIR / "receivable_reconciliation.csv", index=False)
+
+    preflight = ca.run_preflight(ledger_src, manifest_src, output_root=OUTPUT_DIR)
+    preflight_blocked = bool(
+        preflight.get("report_written_this_run")
+        and preflight.get("status") == "BLOCKED"
+        and any(item["code"] == "INCOMPLETE_COVERAGE" for item in preflight.get("blockers", []))
+    )
+    frozen_summary = OUTPUT_DIR / "frozen_baseline" / "p0b_summary.json"
+    frozen = {"status": "not_run"}
+    if frozen_summary.exists():
+        summary = json.loads(frozen_summary.read_text(encoding="utf-8"))
+        base = summary["cost"]["base"]
+        diffs = {
+            key: abs(float(base[key]) - EXPECTED_FROZEN[key]) for key in EXPECTED_FROZEN
+        }
+        frozen = {
+            "status": "ok",
+            "cagr": float(base["cagr"]),
+            "mdd": float(base["mdd"]),
+            "sharpe": float(base["sharpe"]),
+            "abs_diff": diffs,
+            "matches_within_1e9": all(value < 1e-9 for value in diffs.values()),
+            # 제시된 기대값은 샤프 8자리 반올림 값이라 1e-9 비교가 불가능하다.
+            "matches_reported_precision": f"{float(base['sharpe']):.8f}"
+            == f"{EXPECTED_FROZEN['sharpe']:.8f}"
+            and diffs["cagr"] < 1e-9
+            and diffs["mdd"] < 1e-9,
+        }
+
+    result = {
+        "generated_at": run_id,
+        "ledger_source": str(ledger_src),
+        "ledger_sha256": ca.dist.sha256_file(ledger_src),
+        "manifest_sha256": ca.dist.sha256_file(manifest_src),
+        "research_only": True,
+        "strict_approval": "BLOCKED (PARTIAL coverage, 승인 경로 미사용)",
+        "scenarios": accounting.to_dict(orient="records"),
+        "checks": checks,
+        "strict_preflight": {
+            "status": preflight.get("status"),
+            "report_written_this_run": preflight.get("report_written_this_run"),
+            "blockers": preflight.get("blockers"),
+            "blocked_with_incomplete_coverage": preflight_blocked,
+        },
+        "continuity": continuity.to_dict(orient="records"),
+        "frozen_baseline": frozen,
+        "limits": [
+            "배당락일은 파생값이며 세전 회계만 검증",
+            "실데이터 E2E는 091170/498400 두 종목의 2026년 이벤트에 한정",
+            "전체 전략 엔진 E2E는 연구 seam(allow_partial_ledger) 사용, 승인 결과 아님",
+        ],
+    }
+    (OUTPUT_DIR / "pilot_validation.json").write_text(
+        json.dumps(ca.dist.sanitize_json(result), ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    provenance = {
+        "run_id": run_id,
+        "git_commit": ca.dist.git_commit(),
+        "code_sha256": ca.dist.sha256_file(Path(__file__)),
+        "engine_sha256": ca.dist.sha256_file(ROOT / "run_etf_backtest.py"),
+        "ledger_sha256": ca.dist.sha256_file(ledger_src),
+        "artifacts": {
+            name: {
+                "sha256": ca.dist.sha256_file(OUTPUT_DIR / name),
+                "bytes": (OUTPUT_DIR / name).stat().st_size,
+            }
+            for name in [
+                "accounting_scenarios.csv",
+                "daily_accounting_ledger.csv",
+                "receivable_reconciliation.csv",
+                "state_continuity_comparison.csv",
+                "pilot_validation.json",
+            ]
+            if (OUTPUT_DIR / name).exists()
+        },
+    }
+    (OUTPUT_DIR / "provenance.json").write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    failed = [key for key, value in checks.items() if not value]
+    recon_failed = accounting.loc[
+        ~accounting["reconciled"].astype(bool), "scenario"
+    ].tolist()
+    continuity_failed = continuity.loc[
+        ~continuity[
+            [
+                "cash_match",
+                "holdings_match",
+                "receivables_match",
+                "processed_ids_match",
+                "lifecycle_match",
+                "equity_match",
+                "trades_match",
+            ]
+        ].all(axis=1),
+        "scenario",
+    ].tolist()
+    if recon_failed:
+        failed.append(f"reconciliation:{recon_failed}")
+    if continuity_failed:
+        failed.append(f"continuity:{continuity_failed}")
+    if not preflight_blocked:
+        failed.append("strict_preflight_not_blocked")
+    if not frozen.get("matches_reported_precision"):
+        failed.append("frozen_baseline_mismatch")
+    print(
+        f"[p2a2d1] 완료: {OUTPUT_DIR} checks={len(checks)-len(failed)}/{len(checks)} "
+        f"continuity={int(continuity[['cash_match','holdings_match','receivables_match','processed_ids_match','equity_match','trades_match']].all(axis=1).sum())}/{len(continuity)} "
+        f"frozen={frozen.get('matches_reported_precision')}"
+    )
+    if failed:
+        raise SystemExit(f"[p2a2d1] 실패 체크: {failed}")
+
+
+if __name__ == "__main__":
+    main()
