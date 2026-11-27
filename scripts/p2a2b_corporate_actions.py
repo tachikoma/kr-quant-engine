@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import p2a1_data_evidence as p2a1
 import p2a2a_etf_distributions as dist
 
 from etf_corporate_actions import (
@@ -185,11 +186,26 @@ NAME_OBSERVATIONS: list[dict[str, Any]] = [
 ANOMALY_DATES = ["2026-03-05", "2026-07-31", "2026-08-03"]
 
 
-def load_events(p2a2a_dir: Path) -> pd.DataFrame:
-    path = p2a2a_dir / "distribution_events.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"P2-A-2a 이벤트가 없습니다: {path}")
-    events = pd.read_csv(path, dtype={"ticker": str})
+class InputValidationError(ValueError):
+    """P2-A-2a 입력이 provenance/스키마/날짜/중복 검증을 통과하지 못했다."""
+
+
+def _parse_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int,)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def validate_events(events: pd.DataFrame, universe: list[str]) -> list[str]:
+    """필수 열·ticker·날짜·금액·중복·in_backtest_window를 검증한다."""
+    issues: list[str] = []
     required = {
         "ticker",
         "isin",
@@ -198,14 +214,90 @@ def load_events(p2a2a_dir: Path) -> pd.DataFrame:
         "payment_date",
         "amount_per_share",
         "ex_date",
+        "in_backtest_window",
         "source_url",
         "source_sha256",
         "retrieved_at",
     }
     missing = required - set(events.columns)
     if missing:
-        raise ValueError(f"이벤트 컬럼 누락: {sorted(missing)}")
-    return events[events["in_backtest_window"].astype(bool)].reset_index(drop=True)
+        return [f"missing_columns:{sorted(missing)}"]
+    if events.empty:
+        return ["empty_events"]
+    frame = events.copy()
+    frame["ticker"] = frame["ticker"].astype(str)
+    bad_ticker = frame[~frame["ticker"].str.fullmatch(r"[0-9A-Z]{6}")]
+    if not bad_ticker.empty:
+        issues.append(f"bad_ticker:{bad_ticker['ticker'].head(3).tolist()}")
+    unknown = sorted(set(frame["ticker"]) - set(universe))
+    if unknown:
+        issues.append(f"ticker_outside_universe:{unknown[:5]}")
+    dates = {}
+    for column in ["record_date", "payment_date"]:
+        parsed = pd.to_datetime(
+            frame[column].astype(str), errors="coerce", format="%Y-%m-%d"
+        )
+        if parsed.isna().any():
+            issues.append(f"bad_date:{column}:{int(parsed.isna().sum())}")
+        dates[column] = parsed
+    dates["ex_date"] = pd.to_datetime(
+        frame["ex_date"].astype(str), errors="coerce", format="%Y-%m-%d"
+    )
+    amounts = pd.to_numeric(frame["amount_per_share"], errors="coerce")
+    if amounts.isna().any() or (amounts <= 0).any():
+        issues.append("bad_amount")
+    if not dates["record_date"].isna().any() and (dates["payment_date"] < dates["record_date"]).any():
+        issues.append("payment_before_record")
+    if (
+        not dates["record_date"].isna().any()
+        and not dates["ex_date"].isna().all()
+        and (dates["ex_date"] > dates["record_date"]).any()
+    ):
+        issues.append("ex_after_record")
+    duplicated = frame.duplicated(subset=["ticker", "record_date"], keep=False)
+    if duplicated.any():
+        issues.append(f"duplicate_ticker_record:{int(duplicated.sum())}")
+    parsed_flags = frame["in_backtest_window"].map(_parse_bool)
+    if parsed_flags.isna().any():
+        issues.append("non_boolean_in_backtest_window")
+    recomputed = (
+        (dates["record_date"].dt.date >= BACKTEST_START)
+        & (dates["record_date"].dt.date <= BACKTEST_END)
+    )
+    flags_bool = parsed_flags.astype("boolean").fillna(False).astype(bool)
+    mismatch = (flags_bool != recomputed).sum()
+    if mismatch:
+        issues.append(f"in_backtest_window_mismatch:{int(mismatch)}")
+    in_window_missing_ex = int((recomputed & dates["ex_date"].isna()).sum())
+    if in_window_missing_ex:
+        issues.append(f"missing_ex_date_in_window:{in_window_missing_ex}")
+    return issues
+
+
+def load_events(p2a2a_dir: Path, universe: list[str]) -> pd.DataFrame:
+    path = p2a2a_dir / "distribution_events.csv"
+    provenance_path = p2a2a_dir / "provenance.json"
+    if not path.exists():
+        raise InputValidationError(f"P2-A-2a 이벤트가 없습니다: {path}")
+    if not provenance_path.exists():
+        raise InputValidationError(f"P2-A-2a provenance가 없습니다: {provenance_path}")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    expected = (
+        provenance.get("artifacts", {}).get("distribution_events.csv", {}).get("sha256")
+    )
+    if not expected:
+        raise InputValidationError("provenance에 distribution_events.csv SHA256이 없습니다")
+    actual = dist.sha256_file(path)
+    if expected != actual:
+        raise InputValidationError(
+            f"distribution_events.csv SHA256 불일치: expected={expected} actual={actual}"
+        )
+    events = pd.read_csv(path, dtype={"ticker": str})
+    issues = validate_events(events, universe)
+    if issues:
+        raise InputValidationError("; ".join(issues))
+    flags = events["in_backtest_window"].map(_parse_bool)
+    return events[flags == True].reset_index(drop=True)
 
 
 def ledger_rows(events: pd.DataFrame) -> list[dict[str, Any]]:
@@ -352,6 +444,7 @@ def metadata_rows(tickers: list[str]) -> tuple[dict[str, dict[str, Any]], str]:
 def coverage_rows(
     tickers: list[str],
     metadata: dict[str, dict[str, Any]],
+    metadata_status: str,
     event_counts: dict[str, int],
     continuity: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -376,8 +469,15 @@ def coverage_rows(
                     else "가격 단절 탐지 — 공식 공시 미확인"
                 )
             elif event_type == "DELISTING":
-                status = "PARTIAL"
-                reason = "KRX 현재 상장 상태만 확인(전 기간 공식 부재 문서 없음)"
+                if ticker in metadata:
+                    status = "PARTIAL"
+                    reason = "KRX 현재 상장 상태만 확인(전 기간 공식 부재 문서 없음)"
+                elif metadata_status.startswith("ok"):
+                    status = "UNVERIFIED"
+                    reason = "KRX 메타데이터에 종목이 없어 상장 상태 미확인"
+                else:
+                    status = "UNAVAILABLE"
+                    reason = "KRX 메타데이터 조회 실패로 상장 상태 미확인"
             elif event_type in {"SUSPENSION_START", "SUSPENSION_END"}:
                 status = "UNAVAILABLE"
                 reason = "KIND 403으로 거래정지 공시 확인 불가"
@@ -432,6 +532,9 @@ def real_e2e(ledger: Any) -> dict[str, Any]:
         )
         after = process_pending_receivables([receivable], event.payment_date)
         paid_amount = float(after[1])
+        second_payment = process_pending_receivables(
+            list(after[0]), event.payment_date + timedelta(days=1)
+        )
         checks = {
             "receivable_matches_ledger": bool(
                 receivable is not None and abs(float(receivable.amount) - expected) < 1e-6
@@ -440,6 +543,7 @@ def real_e2e(ledger: Any) -> dict[str, Any]:
             "paid_before_payment_date_zero": float(before[1]) == 0.0,
             "paid_on_payment_date_matches": abs(paid_amount - expected) < 1e-6,
             "post_sale_still_payable": paid_amount > 0,
+            "duplicate_payment_zero": float(second_payment[1]) == 0.0,
         }
         results[ticker] = {
             "status": "ok" if all(checks.values()) else "blocked",
@@ -451,6 +555,9 @@ def real_e2e(ledger: Any) -> dict[str, Any]:
             "quantity": quantity,
             "expected_amount": round(expected, 4),
             "paid_amount": round(paid_amount, 4),
+            "scope": "ledger_loader_receivable_unit",
+            "full_engine_e2e": False,
+            "sold_state_continuity": False,
             "payment_lag_days": (
                 event.payment_date - event.ex_date
             ).days if event.ex_date else None,
@@ -459,11 +566,30 @@ def real_e2e(ledger: Any) -> dict[str, Any]:
     return results
 
 
-def run_preflight() -> dict[str, Any]:
-    import subprocess
+def gate_report_file(report_path: Path, started: str) -> tuple[dict[str, Any], bool, str]:
+    """이번 실행에서 생성된 보고서만 유효 처리한다(손상/이전 파일 무시)."""
+    if not report_path.exists():
+        return {}, False, "missing"
+    mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc).isoformat()
+    if mtime < started:
+        return {}, False, "stale"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, False, "invalid_json"
+    if not isinstance(report, dict):
+        return {}, False, "invalid_shape"
+    return report, True, "ok"
 
-    output_dir = OUTPUT_DIR / "approval_preflight"
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+def run_preflight(ledger_path: Path, manifest_path: Path) -> dict[str, Any]:
+    """실행별 고유 디렉터리에서 preflight를 돌리고 이번 실행 보고서만 유효 처리한다."""
+    import subprocess
+    import uuid
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+    output_dir = OUTPUT_DIR / "approval_preflight" / f"run_{run_id}"
+    output_dir.mkdir(parents=True, exist_ok=False)
     command = [
         sys.executable,
         str(ROOT / "run_etf_backtest.py"),
@@ -471,29 +597,31 @@ def run_preflight() -> dict[str, Any]:
         "--mode",
         "single",
         "--corporate-actions-ledger",
-        str(OUTPUT_DIR / "corporate_action_ledger.csv"),
+        str(ledger_path),
         "--corporate-actions-manifest",
-        str(OUTPUT_DIR / "corporate_action_manifest.json"),
+        str(manifest_path),
         "--approval-output-dir",
         str(output_dir),
     ]
+    started = datetime.now(timezone.utc).isoformat()
     completed = subprocess.run(
         command, cwd=ROOT, capture_output=True, text=True, timeout=900, check=False
     )
     report_path = output_dir / "approval_report.json"
-    report = {}
-    if report_path.exists():
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+    report, report_written, report_reason = gate_report_file(report_path, started)
+    gated = p2a1.gate_preflight_report(report, report_written)
     return {
-        "exit_code": completed.returncode,
-        "status": report.get("status"),
-        "approval_valid": report.get("approval_valid"),
-        "blockers": [
-            {"code": item.get("code"), "message": item.get("message")}
-            for item in report.get("blockers", [])
-        ],
+        "run_id": run_id,
+        "command": " ".join(command),
+        "started_at": started,
+        "returncode": completed.returncode,
+        "report_path": str(report_path.relative_to(ROOT)),
+        "report_sha256": dist.sha256_file(report_path) if report_written else None,
+        "report_written_this_run": report_written,
+        "report_gate": report_reason,
         "stdout_tail": completed.stdout.strip().splitlines()[-3:],
         "stderr_tail": completed.stderr.strip().splitlines()[-3:],
+        **gated,
     }
 
 
@@ -518,18 +646,30 @@ def main() -> None:
     run_id = dist.utc_now()
 
     tickers = dist.freeze_universe()
-    events = load_events(args.p2a2a_dir)
+    events = load_events(args.p2a2a_dir, tickers)
     event_counts = events.groupby("ticker").size().to_dict()
     metadata, metadata_status = metadata_rows(tickers)
     continuity_rows = price_continuity(args.cache_dir, tickers)
     continuity = {row["ticker"]: row for row in continuity_rows}
 
     ledger_summary, ledger = write_ledger(events)
-    coverage = coverage_rows(tickers, metadata, event_counts, continuity)
+    coverage = coverage_rows(
+        tickers, metadata, metadata_status, event_counts, continuity
+    )
     e2e = real_e2e(ledger)
-    preflight = {"status": "skipped"} if args.skip_preflight else run_preflight()
+    preflight = (
+        {"status": "skipped", "report_written_this_run": False}
+        if args.skip_preflight
+        else run_preflight(
+            OUTPUT_DIR / "corporate_action_ledger.csv",
+            OUTPUT_DIR / "corporate_action_manifest.json",
+        )
+    )
 
-    pd.DataFrame(SOURCE_SURVEY).to_csv(OUTPUT_DIR / "corporate_action_source_inventory.csv", index=False)
+    source_frame = pd.DataFrame(SOURCE_SURVEY)
+    # 이 인벤토리는 이전 조사 결과를 재사용한 정적 기록이다(이번 실행 재조회 아님).
+    source_frame["basis"] = "static_reused_2026-11-27"
+    source_frame.to_csv(OUTPUT_DIR / "corporate_action_source_inventory.csv", index=False)
     pd.DataFrame(NAME_OBSERVATIONS).to_csv(
         OUTPUT_DIR / "corporate_action_events.csv", index=False
     )
@@ -538,12 +678,22 @@ def main() -> None:
         OUTPUT_DIR / "corporate_action_crosscheck.csv", index=False
     )
 
+    preflight_ok = bool(
+        preflight.get("report_written_this_run")
+        and preflight.get("status") in {"BLOCKED", "APPROVED"}
+    )
     result = {
         "generated_at": run_id,
         "universe": tickers,
         "distribution_events": len(events),
         "distribution_tickers": sorted(event_counts),
         "metadata_status": metadata_status,
+        "measured_this_run": {
+            "krx_metadata": bool(metadata),
+            "price_continuity_tickers": len(continuity_rows),
+            "preflight_run_id": preflight.get("run_id"),
+            "source_inventory_basis": "static_reused_2026-11-27",
+        },
         "metadata_matched": sorted(metadata),
         "ledger": ledger_summary,
         "coverage_counts": pd.DataFrame(coverage)["status"].value_counts().to_dict(),
@@ -554,6 +704,7 @@ def main() -> None:
         .to_dict(orient="records"),
         "e2e": e2e,
         "preflight": preflight,
+        "preflight_ok": preflight_ok,
         "name_observations": NAME_OBSERVATIONS,
         "price_continuity": continuity_rows,
         "anomaly_dates": ANOMALY_DATES,
@@ -563,6 +714,22 @@ def main() -> None:
         ),
         "total_return_approvable": False,
         "blockers": [
+            *(
+                []
+                if preflight_ok
+                else [
+                    {
+                        "code": "PREFLIGHT_NO_REPORT",
+                        "status": "open",
+                        "message": "이번 실행에서 생성된 preflight 보고서가 없어 결과를 유효 처리하지 않음",
+                    }
+                ]
+            ),
+            {
+                "code": "INCOMPLETE_COVERAGE",
+                "status": "open",
+                "message": "ledger manifest coverage_status=PARTIAL, strict preflight BLOCKED",
+            },
             {
                 "code": "CA-COVERAGE",
                 "status": "open",
@@ -580,6 +747,31 @@ def main() -> None:
                 "code": "CA-SUSPENSION",
                 "status": "open",
                 "message": "거래정지 공시 원천(KIND) 403",
+            },
+            {
+                "code": "EX-DATE-DERIVED",
+                "status": "open",
+                "message": "배당락일은 기준일 직전 거래일 파생값(공식 확정 아님)",
+            },
+            {
+                "code": "PAYMENT-TIMING",
+                "status": "open",
+                "message": "백테스트는 배당락일 현금 반영, 지급일 지연 미모형화",
+            },
+            {
+                "code": "TAX-BASE",
+                "status": "open",
+                "message": "과세표준액은 있으나 세율 미확정",
+            },
+            {
+                "code": "INDEPENDENT-SOURCE",
+                "status": "open",
+                "message": "가격·분배금 원천 독립성 미확보",
+            },
+            {
+                "code": "PRICE-BASIS",
+                "status": "watch",
+                "message": "캐시 원주가 확인, 엔진/CSV 입력 기준 고정 필요",
             },
         ],
         "limits": [

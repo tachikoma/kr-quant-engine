@@ -25,6 +25,9 @@
 - DART 펀드공시는 운용사별 12,312~32,072건이다. 2016-2026 전체를 나열하는 것은 범위 밖으로
   두고, 명칭 변경이 의심되는 좁은 구간만 표본 확인했다.
 - KIND·TIGER·PLUS·RISE·ACE 접근 실패는 **조회 실패**이지 "기업행위 없음"이 아니다.
+- 위 인벤토리는 **이전 조사 결과를 재사용한 정적 기록**(`basis=static_reused_2026-11-27`)이다.
+  이번 실행에서 실제로 조회한 것은 KRX 메타데이터, 가격 연속성, strict preflight뿐이며
+  `pilot_validation.json`의 `measured_this_run`에 분리했다.
 
 ## 2. 확보 이벤트
 
@@ -61,14 +64,24 @@
 - manifest: `coverage_status=PARTIAL`, 검증 기간 2022-01-27~2026-09-17, 4종, 문서 4개
   (KODEX API URL + 응답 SHA256). canonical ledger hash를 loader 정규화 결과로 고정했다.
 - loader approval report: **BLOCKED**, blocker는 `INCOMPLETE_COVERAGE` 1건.
-- strict preflight 실제 실행(`--approval-strict`, 전용 출력 디렉터리): **BLOCKED**,
-  `INCOMPLETE_COVERAGE` 1건. 이벤트 자체는 유효하고 **coverage만 부족**하다.
+- strict preflight 실제 실행: `approval_preflight/run_<UTC>_<uuid>/` **실행별 고유
+  디렉터리**(`mkdir(exist_ok=False)`)에 기록하고, 보고서 mtime이 실행 시작 시각 이후이고
+  JSON이 유효할 때만 유효 처리한다. missing/stale/손상 보고서는 모두 `no_report`로
+  처리한다(`gate_report_file`).
+  이번 실행 결과는 **BLOCKED**, `INCOMPLETE_COVERAGE` 1건. 이벤트 자체는 유효하고
+  **coverage만 부족**하다.
 - 기존 `data/etf_corporate_actions.csv` template은 header-only 그대로 두었다.
 
 ## 4. 실데이터 E2E
 
 확보된 유형(분배금)에만 수행했다. **생성된 ledger 이벤트를 다시 로드해** 금액·지급일·
-적격성·매도 후 지급을 검증하며, 기대값과 다르면 `blocked`로 실패한다. 합성 fixture와 분리한다.
+적격성·매도 후 지급·중복 지급 방지를 검증하며, 기대값과 다르면 `blocked`로 실패한다.
+합성 fixture와 분리한다.
+
+**검증 범위**: 이 E2E는 `etf_corporate_actions`의 ledger loader와
+`create_distribution_receivable`/`process_pending_receivables` **함수 수준**이다.
+전체 전략 엔진 E2E, 실제 매도 이후 보유·현금 상태 연속성, 브로커 정산 연계는
+수행하지 않았다(각각 `full_engine_e2e=false`, `sold_state_continuity=false`).
 
 | 티커 | 기준일 | 100좌 수취액 | 지급일 전 | 지급일 | 매도 후 지급 | 지급 지연 |
 |---|---|---:|---:|---:|---|---:|
@@ -96,7 +109,7 @@
 |---|---|---:|---|
 | CASH_DISTRIBUTION | PARTIAL / UNAVAILABLE | 4 / 12 | KODEX 4종 2022년 이후 / 나머지 원천 미확보 |
 | SPLIT, REVERSE_SPLIT | UNVERIFIED | 16 / 16 | 가격 단절 없음(보조)이나 공식 부재 문서 없음 |
-| DELISTING | PARTIAL | 16 | 현재 상장 상태만 확인 |
+| DELISTING | PARTIAL / UNVERIFIED / UNAVAILABLE | 16 | 메타데이터 조회 성공 종목만 PARTIAL, 실패는 미확인 |
 | SUSPENSION_START/END | UNAVAILABLE | 16 / 16 | KIND 403 |
 | CASH_SETTLEMENT, REDEMPTION | UNVERIFIED | 16 / 16 | 공식 정산·해지 문서 미확보 |
 
@@ -125,13 +138,17 @@
 
 ## 9. 테스트·리뷰
 
-- `scripts/test_p2a2b_corporate_actions.py` 6개 PASS: ledger 매핑, coverage 상태,
+- `scripts/test_p2a2b_corporate_actions.py` 12개 PASS: ledger 매핑, coverage 상태,
   가격 연속성(분할 후보 탐지), **분할 후보가 이벤트/VERIFIED로 승격되지 않음**,
-  명칭 관측 비승격, 원천 인벤토리.
+  명칭 관측 비승격, 원천 인벤토리, **입력 SHA/스키마/날짜/중복/in_window 검증**,
+  **메타데이터 실패 시 PARTIAL 금지**, **stale/손상 preflight 게이트**, **중복 지급 0**.
+- 입력 정합성: `distribution_events.csv`를 P2-A-2a `provenance.json`의 SHA256과 대조하고,
+  필수 열·ticker·날짜·금액·중복·`in_backtest_window` 재계산을 통과해야 실행된다.
+  불일치·누락 시 `InputValidationError`로 차단한다.
 - 회귀 PASS: corporate_actions, approval_outputs, backtest_integrity, total_return,
   pit_universe, p2a2a fixtures 2종, p2a1 fixture.
-- Codex 독립 리뷰 3회: P2 4건(ledger 경유 E2E, 분할 오확정 fixture, 수집·공지 시각 구분,
-  지급일 당일 검증) → 전부 수정 후 **최종 APPROVE(P0/P1/P2 없음)**.
+- Codex 독립 리뷰 5회: P2 4건 + 최종 보완(입력 SHA/플래그 검증, preflight stale 게이트,
+  coverage 메타데이터 의존, E2E 범위 표기) → 전부 수정 후 **최종 APPROVE(P0/P1/P2 없음)**.
 - 실행: `uv run python scripts/p2a2b_corporate_actions.py`
   (`--p2a2a-dir`로 P2-A-2a 산출물 경로 지정, `--skip-preflight`로 게이트 생략 가능).
 
