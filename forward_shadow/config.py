@@ -29,6 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_NAME = "manifest.json"
 SCHEMA_VERSION = 2
 RUNTIME_KINDS = ("TEST", "FORWARD")
+APPROVED = "APPROVED"
+UNAPPROVED = "UNAPPROVED_TEST_VALUES"
+UNAPPROVED_FIELD = "UNAPPROVED_TEST_VALUE"
+APPROVAL_FIELDS = ("status", "approved_at", "approver", "decision_ref")
 # A day's data counts as confirmed from this KST time (after-hours trading has
 # ended and closing NAV is published).  Not an approved operational value.
 CONFIRM_CUTOFF_KST = "18:00"
@@ -285,6 +289,41 @@ def effective_parameters_from_freeze(frozen: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def approval_settings(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Operational fields bound to the approval record and manifest hash."""
+    anchor = manifest.get("rebalance_anchor", {})
+    window = manifest.get("observation_window", {})
+    return {
+        "runtime_kind": manifest.get("runtime_kind"),
+        "initial_capital": manifest.get("initial_capital"),
+        "observation_start_date": manifest.get("observation_start_date"),
+        "anchor_date": anchor.get("anchor_date"),
+        "interval_trading_days": anchor.get("interval_trading_days"),
+        "decision_offset_days": anchor.get("decision_offset_days"),
+        "phase_offset": anchor.get("phase_offset"),
+        "confirm_cutoff_kst": window.get("confirm_cutoff_kst"),
+        "window_close_kst_next_trading_day": window.get("window_close_kst_next_trading_day"),
+    }
+
+
+def approval_problems(manifest: dict[str, Any]) -> list[str]:
+    """Validate the approval record against the operational settings."""
+    problems: list[str] = []
+    approval = manifest.get("approval")
+    if not isinstance(approval, dict):
+        return ["approval record missing"]
+    for field in APPROVAL_FIELDS:
+        if not isinstance(approval.get(field), str) or not approval[field].strip():
+            problems.append(f"approval.{field} missing or empty")
+    if approval.get("status") != APPROVED:
+        problems.append(f"approval.status must be {APPROVED!r}")
+    if approval.get("settings") != approval_settings(manifest):
+        problems.append("approval.settings do not match the manifest operational settings")
+    if manifest.get("test_only_forward"):
+        problems.append("an approved runtime cannot carry the test-only flag")
+    return problems
+
+
 def build_manifest(
     *,
     initial_capital: float,
@@ -293,6 +332,8 @@ def build_manifest(
     warmup: dict[str, Any] | None = None,
     anchor_date: str | None = None,
     decision_offset_days: int = 0,
+    approval: dict[str, Any] | None = None,
+    test_only_forward: bool = False,
     root: Path = ROOT,
 ) -> dict[str, Any]:
     """Create a manifest from the current freeze, code and effective config."""
@@ -377,7 +418,25 @@ def build_manifest(
             "OOS: 46-day freeze monitoring is not an independent OOS track",
         ],
         "strategy_env_snapshot": strategy_env_snapshot(),
+        "test_only_forward": bool(test_only_forward),
+        "approval": None,
     }
+    if approval is not None:
+        if runtime_kind != "FORWARD":
+            raise ValueError("an approval record is only valid for a FORWARD runtime")
+        if approval.get("status") != APPROVED:
+            raise ValueError(f"approval.status must be {APPROVED!r}")
+        missing = [
+            field
+            for field in APPROVAL_FIELDS
+            if not isinstance(approval.get(field), str) or not approval[field].strip()
+        ]
+        if missing:
+            raise ValueError(f"approval record missing fields: {', '.join(missing)}")
+        manifest["approval_status"] = APPROVED
+        manifest["rebalance_anchor"]["status"] = APPROVED
+        manifest["observation_window"]["status"] = APPROVED
+        manifest["approval"] = {**approval, "settings": approval_settings(manifest)}
     manifest["manifest_sha256"] = manifest_digest(manifest)
     return manifest
 
@@ -432,10 +491,27 @@ def verify_manifest(manifest: dict[str, Any], root: Path = ROOT) -> list[str]:
         problems.append("code_sha256 does not match current code fingerprint")
 
     anchor = manifest.get("rebalance_anchor", {})
+    window = manifest.get("observation_window", {})
     if anchor.get("phase_offset") != 0:
         problems.append("non-zero rebalance phase_offset is research-only and not approved")
-    if anchor.get("status") != "UNAPPROVED_TEST_VALUE":
-        problems.append("rebalance anchor must remain explicitly unapproved")
+
+    if manifest.get("approval_status") == APPROVED:
+        problems.extend(approval_problems(manifest))
+        if manifest.get("runtime_kind") != "FORWARD":
+            problems.append("an approved manifest requires runtime_kind=FORWARD")
+        if anchor.get("status") != APPROVED:
+            problems.append("approved manifest requires an APPROVED rebalance anchor")
+        if window.get("status") != APPROVED:
+            problems.append("approved manifest requires an APPROVED observation window")
+    else:
+        if manifest.get("approval_status") != UNAPPROVED:
+            problems.append("approval_status must be UNAPPROVED_TEST_VALUES or APPROVED")
+        if anchor.get("status") != UNAPPROVED_FIELD:
+            problems.append("rebalance anchor must remain explicitly unapproved")
+        if window.get("status") != UNAPPROVED_FIELD:
+            problems.append("observation window must remain explicitly unapproved")
+        if manifest.get("runtime_kind") == "FORWARD" and not manifest.get("test_only_forward"):
+            problems.append("FORWARD runtime requires an approved manifest")
     return problems
 
 

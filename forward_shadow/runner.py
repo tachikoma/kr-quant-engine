@@ -115,6 +115,8 @@ def initialize_runtime(
     provider: Any = None,
     anchor_date: str | None = None,
     decision_offset_days: int = 0,
+    approval: dict[str, Any] | None = None,
+    test_only_forward: bool = False,
     clock: Clock = system_clock,
 ) -> dict[str, Any]:
     """Create an independent runtime root with a pinned warm-up bundle.
@@ -137,10 +139,16 @@ def initialize_runtime(
                 "fail-closed: a FORWARD runtime fetches its own warm-up from the live provider"
             )
         _require_live_provider(provider)
-        if clock() >= observation_window(start)[1]:
+        now = clock()
+        if now >= observation_window(start)[1]:
+            if calendar.is_trading_day(now.date()) and now.time() < dt.time(18, 0):
+                proposed = now.date()
+            else:
+                proposed = calendar.next_trading_day(now.date())
             raise RuntimeError(
                 f"fail-closed: observation window of {start} already closed; "
-                "a FORWARD track cannot start retroactively"
+                "a FORWARD track cannot start retroactively. "
+                f"Next feasible trading day: {proposed}"
             )
 
     frozen = load_frozen_strategy()
@@ -165,6 +173,11 @@ def initialize_runtime(
             )
         if warmup is None:
             raise ValueError("a TEST runtime requires a warm-up input")
+        if runtime_kind == "FORWARD" and approval is None and not test_only_forward:
+            raise RuntimeError(
+                "fail-closed: a FORWARD runtime requires an approved manifest; "
+                "unapproved settings cannot start normal Forward observation"
+            )
         bundle = build_bundle(
             warmup,
             universe=universe,
@@ -179,6 +192,8 @@ def initialize_runtime(
             warmup=bundle_summary(bundle, now_utc_iso(clock())),
             anchor_date=str(anchor),
             decision_offset_days=decision_offset_days,
+            approval=approval,
+            test_only_forward=test_only_forward,
         )
         if paths.manifest.exists():
             raise FileExistsError(f"Runtime already initialized: {paths.root}")

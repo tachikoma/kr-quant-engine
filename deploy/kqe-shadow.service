@@ -1,0 +1,16 @@
+# TEMPLATE ONLY — not installed, not enabled.
+# Shadow 전용. 실전 etf_daily_runner 와 다른 runtime root 를 사용한다.
+[Unit]
+Description=Forward Shadow daily run (P2-B-2, inactive template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kr-quant-engine-forward
+Environment=SHADOW_RUNTIME_ROOT=shadow_runtime/v001
+ExecStart=/bin/bash -c '/home/ubuntu/.local/bin/uv run python run_forward_shadow.py \
+  --runtime-root shadow_runtime/v001 \
+  --date "$(TZ=Asia/Seoul date +%F)" \
+  --krx-env-file /home/ubuntu/investment/kr-quant-engine/.env'
