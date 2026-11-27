@@ -1,7 +1,7 @@
 """Real-data E2E for the Forward Shadow MVP.
 
 Uses cached KRX OHLCV (read-only) from an existing checkout and runs in a
-separate temporary runtime.  These are HISTORICAL observations for pipeline
+separate temporary TEST runtime.  These are HISTORICAL observations for pipeline
 verification only; they are never registered as Forward performance.
 
 Run with::
@@ -11,142 +11,111 @@ Run with::
 
 from __future__ import annotations
 
+import datetime as dt
+import logging
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-import pandas as pd
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from forward_shadow.engine import prepare_snapshot
-from forward_shadow.market import FixtureProvider, PykrxProvider
+from forward_shadow.engine import build_history_frame, prepare_snapshot
+from forward_shadow.market import FixtureProvider, PykrxProvider, load_snapshot
 from forward_shadow.report import CapturingSink
-from forward_shadow.runner import initialize_runtime, process_date
+from forward_shadow.runner import initialize_runtime, process_date, runtime_status
 from forward_shadow.store import RuntimePaths, read_json, read_jsonl
-from strategy_freeze import load_frozen_strategy
-
-UNIVERSE = [str(t) for t in load_frozen_strategy()["universe"]]
-CACHE = Path(os.environ.get("SHADOW_REAL_CACHE", "/home/ubuntu/investment/kr-quant-engine/data_cache"))
-
-
-def load_cached() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    frames: dict[str, pd.DataFrame] = {}
-    for ticker in UNIVERSE:
-        path = CACHE / f"{ticker}.parquet"
-        if not path.exists():
-            raise FileNotFoundError(path)
-        frame = pd.read_parquet(path)
-        frame["date"] = pd.to_datetime(frame["date"])
-        frames[ticker] = frame
-    index = pd.read_parquet(CACHE / "index.parquet")
-    index["date"] = pd.to_datetime(index["date"])
-    return frames, index
+from forward_shadow.warmup import WarmupInput
+from tests.shadow_compare import real_market
+from tests.shadow_fixtures import UNIVERSE
 
 
 class RealDataE2ETest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        if not CACHE.exists():
-            raise unittest.SkipTest(f"real cache not available: {CACHE}")
-        cls.etf, cls.index = load_cached()
-        cls.common = sorted(
-            set(cls.index["date"]).intersection(*(set(f["date"]) for f in cls.etf.values()))
-        )
-        if len(cls.common) < 170:
-            raise unittest.SkipTest("cached history too short for warm-up")
+        market = real_market()
+        if market is None:
+            raise unittest.SkipTest("real cache not available")
+        cls.etf, cls.index, cls.listing = market
+        dates = [d for d in cls.index["date"] if d.date() >= dt.date(2026, 6, 1)]
+        if len(dates) < 15:
+            raise unittest.SkipTest("cached history too short")
+        cls.days = [str(d.date()) for d in dates]
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="kqe-shadow-real-")
-        self.root = Path(self.tmp.name) / "runtime"
-        self.warmup = 150
-        self.seed_etf = pd.concat(
-            [f[f["date"] <= self.common[self.warmup - 1]] for f in self.etf.values()],
-            ignore_index=True,
-        )
-        self.seed_index = self.index[self.index["date"] <= self.common[self.warmup - 1]]
-        self.provider = FixtureProvider(self.etf, self.index, name="cached-krx")
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        tmp = tempfile.TemporaryDirectory(prefix="kqe-shadow-real-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.root = self.tmp / "runtime"
+        start = self.index[self.index.date >= self.days[0]].index[0]
+        first = self.index.date.iloc[start - 150]
         initialize_runtime(
             self.root,
             initial_capital=100_000_000.0,
-            observation_start_date=str(self.common[self.warmup].date()),
+            observation_start_date=self.days[0],
+            warmup=WarmupInput(
+                {t: f[f.date >= first] for t, f in self.etf.items()},
+                self.index[self.index.date >= first],
+                self.listing,
+                "cached KRX parquet",
+            ),
         )
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
+        self.provider = FixtureProvider(self.etf, self.index, name="cached-krx")
 
     def test_real_data_pipeline_and_idempotency(self) -> None:
         sink = CapturingSink()
-        results = []
-        for day in self.common[self.warmup:self.warmup + 12]:
-            results.append(
-                process_date(
-                    str(day.date()), self.provider, self.root,
-                    seed_etf=self.seed_etf, seed_index=self.seed_index, sink=sink,
-                )
-            )
+        results = [
+            process_date(day, self.provider, self.root, sink=sink) for day in self.days[:12]
+        ]
         self.assertTrue(all(r["status"] == "DONE" for r in results), results)
         paths = RuntimePaths(self.root)
-        snapshots = sorted(paths.snapshots.glob("*.json"))
-        self.assertEqual(len(snapshots), 12)
-        for snap in snapshots:
-            payload = read_json(snap)
-            self.assertTrue(payload["validation"]["ok"])
-            self.assertEqual(len(payload["bars"]), 16)
-            self.assertGreater(payload["index_close"], 0)
         state = read_json(paths.state)
+        self.assertEqual(len(state["snapshot_hashes"]), 12)
+        for date, sha in state["snapshot_hashes"].items():
+            snapshot = load_snapshot(paths, date, sha)
+            self.assertTrue(snapshot.ok)
+            self.assertEqual(len(snapshot.bars), 16)
         self.assertEqual(len(state["equity_curve"]), 12)
         signals = [e for e in read_jsonl(paths.ledger) if e["type"] == "SIGNAL"]
         self.assertEqual(len(signals), 1)
         self.assertTrue(signals[0]["payload"]["signal"]["targets"])
-        self.assertTrue(state["equity_curve"][-1]["equity"] > 0)
-        # Same input replayed on the same date must not create a second event.
         before = len(read_jsonl(paths.ledger))
-        again = process_date(
-            str(self.common[self.warmup + 11].date()), self.provider, self.root,
-            seed_etf=self.seed_etf, seed_index=self.seed_index, sink=sink,
-        )
+        again = process_date(self.days[11], self.provider, self.root, sink=sink)
         self.assertEqual(again["status"], "ALREADY_PROCESSED")
         self.assertEqual(len(read_jsonl(paths.ledger)), before)
-        report = read_json(paths.reports / f"{self.common[self.warmup + 11].date()}.json")
+        report = read_json(paths.reports / f"{self.days[11]}.json")
         self.assertEqual(report["data"]["source"], "cached-krx")
-        self.assertFalse(report["data"]["ok"] is False)
-        self.assertTrue(sink.messages)
+        self.assertTrue(report["data"]["ok"])
+        self.assertEqual(len(sink.messages), 12)
+        self.assertTrue(runtime_status(self.root)["consistent"])
 
     def test_ranking_matches_shared_strategy(self) -> None:
-        day = self.common[self.warmup]
-        manifest = read_json(RuntimePaths(self.root).manifest)
+        result = process_date(self.days[0], self.provider, self.root)
+        self.assertEqual(result["status"], "DONE")
+        paths = RuntimePaths(self.root)
         from forward_shadow.config import EffectiveConfig
-        config = EffectiveConfig(manifest)
-        history = pd.concat(
-            [self.seed_etf] + [f[f["date"] == day] for f in self.etf.values()],
-            ignore_index=True,
+
+        bundle = read_json(paths.warmup)
+        history = build_history_frame(bundle, [load_snapshot(paths, self.days[0])])
+        snapshot = prepare_snapshot(
+            history, self.days[0], EffectiveConfig(read_json(paths.manifest)),
+            bundle["listing_dates"],
         )
-        snapshot = prepare_snapshot(history, str(day.date()), config)
-        self.assertEqual(len(snapshot), 16)
-        self.assertTrue(snapshot["ret_120"].notna().all())
+        self.assertEqual(len(snapshot), len(UNIVERSE))
         import etf_shared
 
-        ranked_shared = etf_shared.rank_etfs(snapshot)
-        ranked_from_shared = [str(t) for t in ranked_shared["ticker"]]
-        result = process_date(
-            str(day.date()), self.provider, self.root,
-            seed_etf=self.seed_etf, seed_index=self.seed_index,
-        )
-        self.assertEqual(result["status"], "DONE")
-        signal = read_json(RuntimePaths(self.root).state)["pending_signal"]
-        self.assertEqual([r["ticker"] for r in signal["ranked"]], ranked_from_shared)
-        self.assertEqual(signal["targets"][:2], ranked_from_shared[:2])
+        ranked = [str(t) for t in etf_shared.rank_etfs(snapshot)["ticker"]]
+        signal = read_json(paths.state)["pending_signal"]
+        self.assertEqual(signal["ranked_tickers"], ranked)
 
-    def test_live_index_failure_never_defaults_to_risk_on(self) -> None:
-        """pykrx KOSPI fetch without KRX credentials must fail closed."""
-        day = self.common[-1]
-        provider = PykrxProvider(Path(self.tmp.name) / "live-cache")
-        result = process_date(str(day.date()), provider, self.root)
+    def test_live_provider_without_credentials_never_defaults_to_risk_on(self) -> None:
+        """A pykrx KOSPI fetch without KRX credentials must fail closed."""
+        env = {k: v for k, v in os.environ.items() if k not in ("KRX_ID", "KRX_PW")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = process_date(
+                self.days[0], PykrxProvider(self.tmp / "live"), self.root
+            )
         self.assertEqual(result["status"], "BLOCKED_DATA")
         self.assertIn("KOSPI", " ".join(result["errors"]))
         state = read_json(RuntimePaths(self.root).state)

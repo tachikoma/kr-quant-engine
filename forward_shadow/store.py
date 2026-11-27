@@ -5,11 +5,13 @@ The ledger is the source of truth.  Every business event carries a
 results from replaying all patches up to that point.  A crash between the
 COMMIT append and the state write is therefore recoverable by replay, and any
 uncommitted tail events are explicitly marked ``ABORT`` without being applied.
+The GENESIS event binds the manifest and initial state to the chain.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -24,8 +26,9 @@ MANIFEST_NAME = "manifest.json"
 STATE_NAME = "state.json"
 LEDGER_NAME = "events.jsonl"
 GENESIS_NAME = "genesis.json"
+WARMUP_NAME = "warmup.json"
 LOCK_NAME = ".shadow.lock"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ZERO_HASH = "0" * 64
 
 
@@ -52,6 +55,10 @@ class RuntimePaths:
     @property
     def genesis(self) -> Path:
         return self.root / GENESIS_NAME
+
+    @property
+    def warmup(self) -> Path:
+        return self.root / WARMUP_NAME
 
     @property
     def lock(self) -> Path:
@@ -100,18 +107,15 @@ def _canonical(obj: Any) -> bytes:
 
 
 def state_digest(state: dict[str, Any]) -> str:
-    import hashlib
-
     return hashlib.sha256(_canonical(state)).hexdigest()
 
 
-def atomic_write_json(path: Path, payload: Any) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
-            handle.write("\n")
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
@@ -126,24 +130,33 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         raise
 
 
+def atomic_write_json(path: Path, payload: Any) -> None:
+    atomic_write_text(
+        path, json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    )
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Parse the ledger, ignoring a torn (newline-less) final write.
+
+    An event is durable only once its terminating newline is on disk, so a torn
+    final line is by definition uncommitted.  Any other parse error fails closed.
+    """
     if not path.exists():
         return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        rows.append(json.loads(line))
-    return rows
+    text = path.read_text(encoding="utf-8", errors="replace")
+    complete = text[: text.rfind("\n") + 1]
+    try:
+        return [json.loads(line) for line in complete.split("\n") if line.strip()]
+    except ValueError as exc:
+        raise IntegrityError(f"ledger line unreadable: {exc}") from exc
 
 
 def _event_hash(event: dict[str, Any]) -> str:
-    import hashlib
-
     body = {key: value for key, value in event.items() if key != "hash"}
     return hashlib.sha256(_canonical(body)).hexdigest()
 
@@ -153,10 +166,12 @@ def initial_state(manifest: dict[str, Any]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "last_processed_date": None,
         "processed_dates": [],
-        "forward_day_index": -1,
+        "observations": {},
+        "snapshot_hashes": {},
+        "extra_holidays": [],
         "cash": float(manifest["initial_capital"]),
         "initial_equity": float(manifest["initial_capital"]),
-        "holdings": {str(k): int(v) for k, v in manifest["initial_holdings"].items()},
+        "holdings": {},
         "cost_basis": {},
         "peak_equity": float(manifest["initial_capital"]),
         "pending_signal": None,
@@ -173,39 +188,54 @@ class ShadowStore:
 
     def __init__(self, paths: RuntimePaths) -> None:
         self.paths = paths
-        self._events: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
     def initialize(self, manifest: dict[str, Any]) -> dict[str, Any]:
         self.paths.ensure()
-        if self.paths.manifest.exists():
-            raise FileExistsError(f"Manifest already exists: {self.paths.manifest}")
+        if self.paths.manifest.exists() or self.paths.ledger.exists():
+            raise FileExistsError(f"Runtime already initialized: {self.paths.root}")
         atomic_write_json(self.paths.manifest, manifest)
         state = initial_state(manifest)
         atomic_write_json(self.paths.genesis, state)
         atomic_write_json(self.paths.state, state)
-        self._events = []
+        self.events = []
         self.append_event(
             date="",
             event_type="GENESIS",
-            payload={"initial_state_digest": state_digest(state)},
-            state_patch={},
+            payload={
+                "initial_state_digest": state_digest(state),
+                "manifest_sha256": manifest["manifest_sha256"],
+            },
         )
         self.commit(date="", state=state, status="INITIALIZED")
         return state
 
-    def load(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Load and reconcile state; raises IntegrityError on any inconsistency."""
+    def load(self, *, repair: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Replay and reconcile; raises IntegrityError on any inconsistency.
+
+        With ``repair=False`` nothing on disk is modified.
+        """
         if not self.paths.manifest.exists():
             raise FileNotFoundError(f"Shadow runtime not initialized: {self.paths.manifest}")
-        read_json(self.paths.manifest)  # existence/JSON validity check
-        genesis = read_json(self.paths.genesis)
+        try:
+            manifest = read_json(self.paths.manifest)
+            genesis = read_json(self.paths.genesis)
+        except (OSError, ValueError) as exc:
+            raise IntegrityError(f"manifest/genesis unreadable: {exc}") from exc
         events = read_jsonl(self.paths.ledger)
-        self._events = events
+        self.events = events
         integrity = self.verify_chain(events)
         if not integrity["ok"]:
             raise IntegrityError(f"ledger hash chain broken: {integrity}")
+        if not events or events[0]["type"] != "GENESIS":
+            raise IntegrityError("ledger does not start with GENESIS")
+        bound = events[0]["payload"]
+        if bound.get("manifest_sha256") != manifest.get("manifest_sha256"):
+            raise IntegrityError("manifest is not the one bound at genesis")
+        if bound.get("initial_state_digest") != state_digest(genesis):
+            raise IntegrityError("genesis state differs from the one bound at genesis")
 
         commit_events = [e for e in events if e["type"] == "COMMIT"]
         if not commit_events:
@@ -213,21 +243,10 @@ class ShadowStore:
         last_commit = commit_events[-1]
         commit_seq = int(last_commit["seq"])
 
-        aborted_ranges = [
-            (
-                int(e.get("payload", {}).get("orphan_from_seq", e["seq"])),
-                int(e.get("payload", {}).get("orphan_through_seq", e["seq"])),
-            )
-            for e in events
-            if e["type"] == "ABORT"
-        ]
-
+        aborted = self.aborted_seqs(events)
         replayed = json.loads(json.dumps(genesis))
-        for event in events:
-            seq = int(event["seq"])
-            if seq > commit_seq:
-                continue
-            if any(lo <= seq <= hi for lo, hi in aborted_ranges):
+        for event in events[: commit_seq + 1]:
+            if int(event["seq"]) in aborted:
                 continue
             replayed.update(event.get("state_patch", {}))
         replayed["last_event_seq"] = commit_seq
@@ -239,42 +258,70 @@ class ShadowStore:
                 f"expected={expected_digest}, replayed={state_digest(replayed)}"
             )
 
-        on_disk = read_json(self.paths.state)
-        if on_disk != replayed:
-            # Crash after COMMIT but before the atomic state write: repair by
-            # rewriting the replayed state.  This is the only safe recovery.
-            atomic_write_json(self.paths.state, replayed)
-
-        orphans = [e for e in events if int(e["seq"]) > commit_seq]
-        if orphans:
-            max_orphan = max(int(e["seq"]) for e in orphans)
-            already_aborted = any(
-                e["type"] == "ABORT"
-                and int(e["seq"]) > commit_seq
-                and int(e.get("payload", {}).get("orphan_through_seq", -1)) >= max_orphan
-                for e in events
-            )
-            if not already_aborted:
-                self.append_event(
+        try:
+            on_disk = read_json(self.paths.state)
+        except (OSError, ValueError):
+            on_disk = None
+        state_matches = on_disk == replayed
+        orphans = [
+            int(e["seq"])
+            for e in events[commit_seq + 1 :]
+            if e["type"] != "ABORT" and int(e["seq"]) not in aborted
+        ]
+        torn = self._has_torn_tail()
+        if repair:
+            if torn:
+                self._truncate_torn_tail()
+            if not state_matches:
+                # Crash after COMMIT but before the atomic state write: rewriting
+                # the replayed state is the only safe recovery.
+                atomic_write_json(self.paths.state, replayed)
+            if orphans:
+                self.abort(
+                    min(orphans),
+                    "uncommitted tail events discarded by recovery",
                     date=str(last_commit.get("date", "")),
-                    event_type="ABORT",
-                    payload={
-                        "reason": "uncommitted tail events discarded by recovery",
-                        "orphan_from_seq": min(int(e["seq"]) for e in orphans),
-                        "orphan_through_seq": max_orphan,
-                        "orphan_count": len(orphans),
-                    },
-                    state_patch={},
                 )
         return replayed, {
             **integrity,
             "commit_seq": commit_seq,
             "last_commit_seq": commit_seq,
             "orphan_count": len(orphans),
+            "torn_tail": torn,
+            "state_file_matches": state_matches,
             "state_digest": expected_digest,
         }
 
     # ── ledger ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def aborted_seqs(events: list[dict[str, Any]]) -> set[int]:
+        result: set[int] = set()
+        for event in events:
+            if event["type"] == "ABORT":
+                payload = event["payload"]
+                result.update(
+                    range(
+                        int(payload["orphan_from_seq"]),
+                        int(payload["orphan_through_seq"]) + 1,
+                    )
+                )
+        return result
+
+    def committed_events(self) -> list[dict[str, Any]]:
+        commits = [int(e["seq"]) for e in self.events if e["type"] == "COMMIT"]
+        if not commits:
+            return []
+        aborted = self.aborted_seqs(self.events)
+        return [e for e in self.events[: commits[-1] + 1] if int(e["seq"]) not in aborted]
+
+    def _has_torn_tail(self) -> bool:
+        data = self.paths.ledger.read_bytes()
+        return bool(data) and not data.endswith(b"\n")
+
+    def _truncate_torn_tail(self) -> None:
+        data = self.paths.ledger.read_bytes()
+        os.truncate(self.paths.ledger, data.rfind(b"\n") + 1)
 
     @staticmethod
     def verify_chain(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -297,8 +344,8 @@ class ShadowStore:
         payload: dict[str, Any],
         state_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        seq = len(self._events)
-        prev_hash = self._events[-1]["hash"] if self._events else ZERO_HASH
+        seq = len(self.events)
+        prev_hash = self.events[-1]["hash"] if self.events else ZERO_HASH
         event: dict[str, Any] = {
             "seq": seq,
             "event_id": f"{date}:{event_type}:{seq}",
@@ -309,50 +356,48 @@ class ShadowStore:
             "state_patch": state_patch or {},
             "prev_hash": prev_hash,
         }
+        # Detach from caller-owned objects so later mutation cannot alter history,
+        # with the same key order a reload from disk will produce.
+        event = json.loads(
+            json.dumps(event, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        )
         event["hash"] = _event_hash(event)
         line = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        data = line.encode("utf-8")
         fd = os.open(self.paths.ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(fd, line.encode("utf-8"))
+            while data:
+                data = data[os.write(fd, data) :]
             os.fsync(fd)
         finally:
             os.close(fd)
-        self._events.append(event)
+        self.events.append(event)
         return event
 
+    def abort(self, from_seq: int, reason: str, *, date: str = "") -> None:
+        """Mark every event from ``from_seq`` to the tail as never applied."""
+        through = len(self.events) - 1
+        self.append_event(
+            date=date,
+            event_type="ABORT",
+            payload={
+                "reason": reason,
+                "orphan_from_seq": from_seq,
+                "orphan_through_seq": through,
+                "orphan_count": through - from_seq + 1,
+            },
+        )
+
     def commit(self, *, date: str, state: dict[str, Any], status: str) -> dict[str, Any]:
-        next_seq = len(self._events)
-        state = dict(state)
-        state["last_event_seq"] = next_seq
-        state["last_processed_date"] = date
-        state["status"] = status
-        digest = state_digest(state)
+        next_seq = len(self.events)
+        patch = {"last_event_seq": next_seq, "status": status}
+        state = {**state, **patch}
+        digest = state_digest(json.loads(json.dumps(state)))
         event = self.append_event(
             date=date,
             event_type="COMMIT",
             payload={"state_digest": digest, "status": status},
-            state_patch={
-                "last_event_seq": next_seq,
-                "last_processed_date": date,
-                "status": status,
-            },
+            state_patch=patch,
         )
         atomic_write_json(self.paths.state, state)
         return event
-
-    def is_processed(self, date: str) -> bool:
-        state = read_json(self.paths.state)
-        return date in state.get("processed_dates", [])
-
-    def verify_integrity(self) -> dict[str, Any]:
-        events = read_jsonl(self.paths.ledger)
-        chain = self.verify_chain(events)
-        state = read_json(self.paths.state)
-        commits = [e for e in events if e["type"] == "COMMIT"]
-        last_seq = commits[-1]["seq"] if commits else 0
-        return {
-            **chain,
-            "state_seq": state.get("last_event_seq"),
-            "last_commit_seq": last_seq,
-            "consistent": bool(chain["ok"] and state.get("last_event_seq") == last_seq),
-        }

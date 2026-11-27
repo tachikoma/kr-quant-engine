@@ -1,119 +1,61 @@
-"""Signal and virtual-execution engine built entirely on frozen helpers.
+"""Signal and virtual-execution engine built on the frozen helpers.
 
-No new ranking, gating, sizing or cost logic is introduced here.  The only new
-code is orchestration: strict data gating, D-close signal / D+1-open execution
-separation, capacity decisions, and deterministic state accounting.
+Ranking, gating, order building, capacity and cost functions are the frozen
+``etf_shared`` / ``etf_execution`` helpers.  The orchestration around them
+mirrors the ``execution_mode="ohlcv_capacity"`` path of
+``run_etf_backtest.run_etf_strategy``, whose helpers are closures and cannot be
+imported.  ``tests/test_forward_shadow_compare.py`` requires both paths to agree
+order by order and day by day; no execution policy is defined here.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 import etf_shared
-from etf_execution import OHLCVBar, OrderRequest, decide_execution
-from forward_shadow.config import EffectiveConfig
+from etf_execution import DecisionType, OHLCVBar, OrderRequest, decide_execution
+from forward_shadow.config import EffectiveConfig, effective_config_problems
 from forward_shadow.market import MarketDay
 
-
-def _assert_frozen_constants(config: EffectiveConfig) -> None:
-    params = config.params
-    checks = {
-        "MIN_AVG_TRADING_VALUE": etf_shared.MIN_AVG_TRADING_VALUE,
-        "MIN_LISTING_DAYS": etf_shared.MIN_LISTING_DAYS,
-        "MARKET_MA_DAYS": etf_shared.MARKET_MA_DAYS,
-        "MARKET_SLOPE_DAYS": etf_shared.MARKET_SLOPE_DAYS,
-        "ETF_MAX_POSITIONS": etf_shared.ETF_MAX_POSITIONS,
-        "ETF_SELL_RANK_BUFFER": etf_shared.ETF_SELL_RANK_BUFFER,
-        "BUY_FEE_PCT": etf_shared.BUY_FEE_PCT,
-        "SELL_FEE_PCT": etf_shared.SELL_FEE_PCT,
-    }
-    expected = {
-        "MIN_AVG_TRADING_VALUE": params["min_avg_trading_value"],
-        "MIN_LISTING_DAYS": params["min_listing_days"],
-        "MARKET_MA_DAYS": params["market_ma_days"],
-        "MARKET_SLOPE_DAYS": params["market_slope_days"],
-        "ETF_MAX_POSITIONS": params["max_positions"],
-        "ETF_SELL_RANK_BUFFER": params["sell_rank_buffer"],
-        "BUY_FEE_PCT": params["buy_fee_pct"],
-        "SELL_FEE_PCT": params["sell_fee_pct"],
-    }
-    drift = [f"{key}: code={checks[key]} freeze={expected[key]}" for key in checks if checks[key] != expected[key]]
-    raw_weight = os.environ.get("ETF_MOMENTUM_WEIGHT_60")
-    if raw_weight is not None:
-        try:
-            if float(raw_weight) != float(params["momentum_weight_60"]):
-                drift.append(
-                    f"ETF_MOMENTUM_WEIGHT_60: env={raw_weight} "
-                    f"freeze={params['momentum_weight_60']}"
-                )
-        except ValueError:
-            drift.append(f"ETF_MOMENTUM_WEIGHT_60: invalid env value {raw_weight!r}")
-    if drift:
-        raise RuntimeError("frozen constant drift: " + "; ".join(drift))
+HISTORY_COLUMNS = (
+    "date", "ticker", "open", "high", "low", "close", "volume", "trading_value", "nav",
+)
 
 
 def build_history_frame(
-    snapshots_dir: Path,
-    tickers: list[str],
-    up_to_date: str,
-    seed: pd.DataFrame | None = None,
+    warmup: dict[str, Any], days: list[MarketDay]
 ) -> pd.DataFrame:
-    """Build a long OHLCV frame from audit snapshots (plus optional warm-up seed)."""
-    frames: list[pd.DataFrame] = []
-    if seed is not None and not seed.empty:
-        frames.append(seed.copy())
-    if snapshots_dir.exists():
-        for path in sorted(snapshots_dir.glob("*.json")):
-            if path.stem > up_to_date:
-                continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not payload.get("validation", {}).get("ok"):
-                continue
-            rows = []
-            for ticker, bar in payload.get("bars", {}).items():
-                rows.append(
-                    {
-                        "date": pd.Timestamp(payload["date"]),
-                        "ticker": str(ticker),
-                        "open": bar.get("open"),
-                        "high": bar.get("high"),
-                        "low": bar.get("low"),
-                        "close": bar.get("close"),
-                        "volume": bar.get("volume"),
-                        "trading_value": bar.get("trading_value"),
-                        "nav": bar.get("nav"),
-                    }
-                )
-            if rows:
-                frames.append(pd.DataFrame(rows))
-    if not frames:
-        return pd.DataFrame(
-            columns=[
-                "date", "ticker", "open", "high", "low", "close",
-                "volume", "trading_value", "nav",
-            ]
-        )
-    frame = pd.concat(frames, ignore_index=True)
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    """Long OHLCV frame from the pinned warm-up and the committed snapshots."""
+    rows = [
+        {**row, "ticker": ticker}
+        for ticker, series in warmup["etf"].items()
+        for row in series
+    ]
+    rows += [
+        {**bar, "date": day.date, "ticker": ticker}
+        for day in days
+        for ticker, bar in day.bars.items()
+    ]
+    frame = pd.DataFrame(rows, columns=list(HISTORY_COLUMNS))
+    frame["date"] = pd.to_datetime(frame["date"])
     frame["ticker"] = frame["ticker"].astype(str)
-    frame = frame[frame["ticker"].isin({str(t) for t in tickers})]
-    frame = frame.dropna(subset=["date"]).sort_values(["ticker", "date"])
-    return frame.drop_duplicates(subset=["ticker", "date"], keep="last").reset_index(drop=True)
+    if frame.duplicated(subset=["ticker", "date"]).any():
+        raise ValueError("duplicate (ticker, date) rows in history")
+    return frame.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 def prepare_snapshot(
     history: pd.DataFrame,
     date: str,
     config: EffectiveConfig,
-    listing_dates: dict[str, str] | None = None,
+    listing_dates: dict[str, str],
 ) -> pd.DataFrame:
     """Reproduce the frozen preprocessing pipeline for a single decision date."""
-    _assert_frozen_constants(config)
+    problems = effective_config_problems()
+    if problems:
+        raise RuntimeError("frozen config drift: " + "; ".join(problems))
     if history.empty:
         return pd.DataFrame()
     frame = history[history["date"] <= pd.Timestamp(date)].copy()
@@ -122,7 +64,7 @@ def prepare_snapshot(
     frame = etf_shared.add_liquidity_flag(frame)
     frame = etf_shared.add_listing_flag(frame, listing_dates)
     frame = etf_shared.add_deviation_flag(frame)
-    frame["close_adj"] = frame["close"]
+    frame["close_adj"] = frame["close"]  # freeze: return_basis="price"
     grouped = frame.groupby("ticker")
     frame["ret_60"] = grouped["close_adj"].pct_change(60)
     frame["ret_120"] = grouped["close_adj"].pct_change(120)
@@ -133,38 +75,64 @@ def prepare_snapshot(
     return snapshot.reset_index(drop=True)
 
 
+def _gating(
+    ranked_tickers: list[str],
+    holdings: dict[str, int],
+    kospi_risk_on: bool,
+    config: EffectiveConfig,
+) -> tuple[Any, list[str], bool]:
+    """Gate, target list and empty-target policy exactly as the backtest derives them."""
+    params = config.params
+    liquidate = bool(params["liquidate_on_risk_off"])
+    multi_index = bool(params["enable_multi_index_risk"])
+    mode = str(params["multi_index_gating_mode"])
+    gating = etf_shared.build_gating_decision(
+        ranked_tickers,
+        holdings,
+        kospi_risk_on=kospi_risk_on,
+        us_risk_on=True,  # freeze: enable_multi_index_risk=false
+        enable_multi_index_risk=multi_index,
+        gating_mode=mode,
+        liquidate_on_risk_off=liquidate,
+    )
+    if not kospi_risk_on and not liquidate:
+        targets: list[str] = []
+    else:
+        limit = int(params["max_positions"]) + int(params["sell_rank_buffer"])
+        targets = gating.eligible_ranked[:limit]
+    selective_empty_protection = multi_index and mode == "split"
+    allow_empty_target_sell = (
+        (not kospi_risk_on) and liquidate and not selective_empty_protection
+    )
+    return gating, targets, allow_empty_target_sell
+
+
 def compute_signal(
     *,
     history: pd.DataFrame,
     date: str,
+    execution_date: str,
     index_signal: dict[str, Any],
     holdings: dict[str, int],
     config: EffectiveConfig,
-    listing_dates: dict[str, str] | None = None,
+    listing_dates: dict[str, str],
 ) -> dict[str, Any]:
-    """Compute the D-close target list using only frozen strategy helpers."""
+    """D-close decision bound to exactly one execution date (the next trading day)."""
     if index_signal is None:
         raise ValueError("index signal unavailable: signal must be held, not defaulted")
     snapshot = prepare_snapshot(history, date, config, listing_dates)
     ranked = etf_shared.rank_etfs(snapshot)
     ranked_tickers = [str(t) for t in ranked.get("ticker", [])]
-    params = config.params
-    gating = etf_shared.build_gating_decision(
-        ranked_tickers,
-        holdings,
-        kospi_risk_on=bool(index_signal["risk_on"]),
-        us_risk_on=True,  # freeze: enable_multi_index_risk=false
-        enable_multi_index_risk=False,
-        gating_mode="split",  # freeze: multi_index_gating_mode=split
-        liquidate_on_risk_off=bool(params["liquidate_on_risk_off"]),
-    )
-    targets = gating.eligible_ranked[: int(params["max_positions"]) + int(params["sell_rank_buffer"])]
+    risk_on = bool(index_signal["risk_on"])
+    gating, targets, allow_empty = _gating(ranked_tickers, holdings, risk_on, config)
     return {
         "decision_date": date,
+        "execution_date": execution_date,
         "targets": targets,
         "allowed_groups": sorted(gating.allowed_groups),
-        "kospi_risk_on": bool(index_signal["risk_on"]),
+        "kospi_risk_on": risk_on,
         "us_risk_on": True,
+        "ranked_tickers": ranked_tickers,
         "ranked": [
             {
                 "ticker": str(row["ticker"]),
@@ -174,265 +142,394 @@ def compute_signal(
             }
             for _, row in ranked.iterrows()
         ],
+        # Forced exits and the empty-target policy are re-derived at execution
+        # from the then-current holdings; these are the D-close view.
         "forced_exit_tickers": sorted(str(t) for t in gating.forced_exit_tickers),
+        "allow_empty_target_sell": allow_empty,
         "snapshot_rows": len(snapshot),
     }
 
 
-def _order_price_maps(
-    day: MarketDay, spread_half: float
-) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
-    latest: dict[str, float] = {}
-    buys: dict[str, float] = {}
-    sells: dict[str, float] = {}
-    for ticker, bar in day.bars.items():
-        op = bar.get("open")
-        if op is None or not (float(op) > 0):
-            continue
-        price = float(op)
-        latest[ticker] = price
-        buys[ticker] = price * (1 + spread_half)
-        sells[ticker] = price * (1 - spread_half)
-    return latest, buys, sells
+class _Book:
+    """Cash/holding/cost-basis mutation shared by carry and rebalance fills."""
 
+    def __init__(self, state: dict[str, Any], day: MarketDay, config: EffectiveConfig) -> None:
+        self.cash = float(state["cash"])
+        self.holdings = {str(t): int(q) for t, q in state["holdings"].items()}
+        self.cost_basis = {str(t): float(b) for t, b in state["cost_basis"].items()}
+        self.day = day
+        self.config = config
+        self.slippage = float(config.params["slippage"])
+        self.spread_half = float(config.params["spread_half_pct"])
+        self.fills: list[dict[str, Any]] = []
 
-def _reprice(order: dict[str, Any], filled_qty: int, slippage: float, cost_basis: float | None,
-             tax_rate: float) -> dict[str, Any]:
-    adjusted = dict(order)
-    reference = float(order.get("reference_price") or 0.0)
-    adjusted["qty"] = int(filled_qty)
-    if order.get("side") == "BUY":
-        adjusted["estimated_value"] = float(
-            filled_qty * etf_shared.apply_buy_cost(reference, slippage)
+    def reference_price(self, ticker: str, side: str) -> float:
+        open_price = float(self.day.bars[ticker]["open"])
+        return open_price * (1 + self.spread_half if side == "BUY" else 1 - self.spread_half)
+
+    def decide(self, ticker: str, side: str, qty: int, carry_age: int) -> Any:
+        bar = self.day.bars[ticker]
+        params = self.config.params
+        return decide_execution(
+            OrderRequest(
+                self.day.date,
+                ticker,
+                side,
+                int(qty),
+                float(params["capacity_participation_rate"]),
+                carry_age,
+                int(params["capacity_max_carry_days"]),
+                False,
+            ),
+            OHLCVBar(
+                self.day.date,
+                ticker,
+                bar["open"],
+                bar["high"],
+                bar["low"],
+                bar["close"],
+                bar["volume"],
+                bar.get("trading_value"),
+            ),
         )
-        adjusted["estimated_tax"] = 0.0
+
+    def reprice(self, order: dict[str, Any], qty: int) -> dict[str, Any]:
+        """Mirror of the backtest ``_reprice_execution_order``."""
+        adjusted = dict(order)
+        ticker = str(order["ticker"])
+        reference = float(order["reference_price"])
+        adjusted["qty"] = int(qty)
+        if order["side"] == "BUY":
+            adjusted["estimated_value"] = float(
+                int(qty) * etf_shared.apply_buy_cost(reference, self.slippage)
+            )
+            adjusted["estimated_tax"] = 0.0
+            return adjusted
+        basis = self.cost_basis.get(ticker)
+        tax_rate = (
+            float(self.config.params["sell_tax_pct"])
+            if ticker in self.config.taxable_tickers
+            else 0.0
+        )
+        value = etf_shared.apply_sell_value(
+            reference, int(qty), tax_rate, self.slippage, cost_basis_per_share=basis
+        )
+        sell_price = reference * (1 - self.slippage)
+        gain = max(0.0, int(qty) * (sell_price - basis)) if basis is not None else 0.0
+        adjusted["estimated_value"] = float(value)
+        adjusted["estimated_tax"] = float(gain * tax_rate)
         return adjusted
-    net = etf_shared.apply_sell_value(
-        reference,
-        int(filled_qty),
-        tax_rate,
-        slippage,
-        cost_basis_per_share=cost_basis,
-    )
-    sell_price = reference * (1 - slippage)
-    gain = (
-        max(0.0, int(filled_qty) * (sell_price - float(cost_basis)))
-        if cost_basis is not None
-        else 0.0
-    )
-    adjusted["estimated_value"] = float(net)
-    adjusted["estimated_tax"] = float(gain * tax_rate)
-    return adjusted
+
+    def apply(self, order: dict[str, Any], source: str) -> int:
+        """Mirror of the backtest ``_apply_filled_order``."""
+        ticker = str(order["ticker"])
+        side = str(order["side"])
+        qty = int(order["qty"])
+        if qty <= 0:
+            return 0
+        value = float(order["estimated_value"])
+        if side == "SELL":
+            qty = min(qty, self.holdings.get(ticker, 0))
+            if qty <= 0:
+                return 0
+            remaining = self.holdings[ticker] - qty
+            if remaining > 0:
+                self.holdings[ticker] = remaining
+            else:
+                self.holdings.pop(ticker, None)
+                self.cost_basis.pop(ticker, None)
+            self.cash += value
+        else:
+            previous = self.holdings.get(ticker, 0)
+            self.holdings[ticker] = previous + qty
+            if ticker in self.cost_basis and previous > 0:
+                self.cost_basis[ticker] = (
+                    self.cost_basis[ticker] * previous + value
+                ) / self.holdings[ticker]
+            else:
+                self.cost_basis[ticker] = value / qty
+            self.cash = max(0.0, self.cash - value)
+        reference = float(order["reference_price"])
+        self.fills.append(
+            {
+                "date": self.day.date,
+                "ticker": ticker,
+                "side": side,
+                "source": source,
+                "reason": order.get("reason"),
+                "filled_qty": qty,
+                "reference_price": reference,
+                "open_price": float(self.day.bars[ticker]["open"]),
+                "net_value": value,
+                "estimated_tax": float(order.get("estimated_tax", 0.0)),
+                "fee": float(
+                    qty
+                    * reference
+                    * (
+                        (1 + self.slippage) * etf_shared.BUY_FEE_PCT
+                        if side == "BUY"
+                        else (1 - self.slippage) * etf_shared.SELL_FEE_PCT
+                    )
+                ),
+                "cash_after": self.cash,
+            }
+        )
+        return qty
+
+    def affordable(self, qty: int, unit_cost: float) -> int:
+        return min(qty, max(0, int(self.cash // unit_cost))) if unit_cost > 0 else 0
 
 
-def execute_pending(
+def _diagnostic(
+    decision: Any, *, source: str, origin_date: str, filled_qty: int | None = None,
+    label: str | None = None, reason: str | None = None,
+) -> dict[str, Any]:
+    filled = decision.filled_qty if filled_qty is None else filled_qty
+    return {
+        "ticker": decision.ticker,
+        "side": decision.side,
+        "source": source,
+        "origin_date": origin_date,
+        "decision": label or decision.decision.value,
+        "capacity_decision": decision.decision.value,
+        "requested_qty": decision.requested_qty,
+        "capacity_filled_qty": decision.filled_qty,
+        "filled_qty": filled,
+        "remaining_qty": max(decision.requested_qty - filled, 0),
+        "capacity_qty": decision.capacity_qty,
+        "bar_volume": decision.bar_volume,
+        "reason": reason or decision.reason,
+    }
+
+
+def execute_day(
     *,
     state: dict[str, Any],
     day: MarketDay,
     config: EffectiveConfig,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Apply the previous decision day's signal using today's OHLCV."""
+    next_trading_date: str,
+) -> dict[str, Any]:
+    """Apply due carries, then the previous decision, at today's open.
+
+    Returns ``{"patch", "fills", "diagnostics", "orders", "execution"}``.  Every
+    order attempt leaves a diagnostic, including zero fills and cash limits.
+    """
+    book = _Book(state, day, config)
+    diagnostics: list[dict[str, Any]] = []
+    carry_out: list[dict[str, Any]] = []
+    excluded_buys: set[str] = set()
+
+    # 1. Carried remainders: exactly one retry on their due date.
+    for item in state.get("carry", []):
+        if item["due_date"] != day.date:
+            raise RuntimeError(
+                f"carry due {item['due_date']} cannot execute on {day.date}: "
+                "trading-day continuity violated"
+            )
+        ticker, side = str(item["ticker"]), str(item["side"])
+        order = {
+            "ticker": ticker,
+            "side": side,
+            "qty": int(item["remaining_qty"]),
+            "reference_price": book.reference_price(ticker, side),
+            "reason": "ETF_EXECUTION_CARRY",
+        }
+        decision = book.decide(ticker, side, order["qty"], carry_age=1)
+        excluded_buys.add(ticker)
+        fill_qty = decision.filled_qty
+        label = reason = None
+        if side == "BUY" and fill_qty > 0:
+            unit = etf_shared.apply_buy_cost(order["reference_price"], book.slippage)
+            affordable = book.affordable(fill_qty, unit)
+            if affordable < fill_qty:
+                label = "CARRY_CANCELLED"
+                reason = "repriced carry BUY remainder cancelled by current cash"
+            fill_qty = affordable
+        diagnostics.append(
+            _diagnostic(
+                decision, source="CARRY", origin_date=item["origin_date"],
+                filled_qty=fill_qty, label=label, reason=reason,
+            )
+        )
+        if fill_qty > 0:
+            book.apply(book.reprice(order, fill_qty), "CARRY")
+
+    # 2. The pending decision, bound to this date.
+    orders: list[dict[str, Any]] = []
+    execution: dict[str, Any] | None = None
     pending = state.get("pending_signal")
-    carry_in = list(state.get("carry", []))
-    if not pending and not carry_in:
-        return [], {}
-    params = config.params
-    slippage = float(params["slippage"])
-    latest, buys, sells = _order_price_maps(day, float(params["spread_half_pct"]))
     if pending:
+        if pending["execution_date"] != day.date:
+            raise RuntimeError(
+                f"signal of {pending['decision_date']} is bound to "
+                f"{pending['execution_date']}, refusing to execute on {day.date}"
+            )
+        params = config.params
+        gating, targets, allow_empty = _gating(
+            list(pending["ranked_tickers"]),
+            book.holdings,
+            bool(pending["kospi_risk_on"]),
+            config,
+        )
+        buy_prices = {t: book.reference_price(t, "BUY") for t in day.bars}
+        sell_prices = {t: book.reference_price(t, "SELL") for t in day.bars}
         orders = etf_shared.build_rebalance_orders(
-            state["holdings"],
-            list(pending["targets"]),
-            latest,
-            float(state["cash"]),
-            latest_buy_prices=buys,
-            latest_sell_prices=sells,
-            current_cost_basis=state["cost_basis"],
+            current_holdings=book.holdings,
+            target_tickers=targets,
+            latest_prices={t: float(bar["open"]) for t, bar in day.bars.items()},
+            available_cash=book.cash,
+            latest_buy_prices=buy_prices,
+            latest_sell_prices=sell_prices,
+            current_cost_basis=book.cost_basis,
             max_positions=int(params["max_positions"]),
             sell_rank_buffer=int(params["sell_rank_buffer"]),
-            slippage=slippage,
+            slippage=book.slippage,
             sell_tax_pct=float(params["sell_tax_pct"]),
             taxable_tickers=config.taxable_tickers,
-            allow_empty_target_sell=False,
-            forced_exit_tickers=set(pending.get("forced_exit_tickers", [])),
+            allow_empty_target_sell=allow_empty,
+            forced_exit_tickers=set(gating.forced_exit_tickers),
+            generate_orders=True,
             max_asset_pct=float(params["max_asset_pct"]),
             target_weight_rebalance=bool(params["target_weight_rebalance"]),
             rebalance_band_pct=float(params["rebalance_band_pct"]),
+            trim_overweight_positions=bool(params["trim_overweight_positions"]),
         )
-    else:
-        orders = []
-    # Carry retries happen on the next eligible trading date even when no
-    # periodic decision is due (same rule as the frozen backtest).  Entries
-    # whose ticker/side is not covered by a fresh order are retried here.
-    order_keys = {(str(o.get("ticker")), str(o.get("side"))) for o in orders}
-    for item in carry_in:
-        ticker = str(item["ticker"])
-        side = str(item["side"])
-        if (ticker, side) in order_keys:
-            continue
-        price = buys.get(ticker) if side == "BUY" else sells.get(ticker)
-        if price is None:
-            continue
-        orders.append(
-            {
-                "ticker": ticker,
-                "side": side,
-                "qty": int(item["remaining_qty"]),
-                "reference_price": price,
-                "reason": "CARRY_RETRY",
-            }
-        )
-        order_keys.add((ticker, side))
+        origin = pending["decision_date"]
+        skipped = [
+            o for o in orders if o["side"] == "BUY" and str(o["ticker"]) in excluded_buys
+        ]
+        orders = [o for o in orders if o not in skipped]
+        for order in skipped:
+            diagnostics.append(
+                _no_order(order["ticker"], "BUY", origin, "EXCLUDED_BY_CARRY",
+                          "buy excluded: a carry for this ticker was processed today",
+                          int(order["qty"]))
+            )
+        for ticker in targets[: int(params["max_positions"])]:
+            if not any(o["ticker"] == ticker and o["side"] == "BUY" for o in orders + skipped):
+                diagnostics.append(
+                    _no_order(
+                        ticker, "BUY", origin, "NO_ORDER",
+                        "target produced no buy order (already held at/over budget, "
+                        "asset cap, or less than one share affordable); "
+                        f"cash={book.cash:.2f}, open={day.bars[ticker]['open']}",
+                        0,
+                    )
+                )
 
-    cash = float(state["cash"])
-    holdings = dict(state["holdings"])
-    cost_basis = dict(state["cost_basis"])
-    carry = list(state.get("carry", []))
-    fills: list[dict[str, Any]] = []
+        # Decide (and reprice against the pre-trade cost basis) every order first.
+        approved: list[tuple[dict[str, Any], Any, int]] = []
+        for order in orders:
+            ticker, side = str(order["ticker"]), str(order["side"])
+            decision = book.decide(ticker, side, int(order["qty"]), carry_age=0)
+            diagnostics.append(_diagnostic(decision, source="REBALANCE", origin_date=origin))
+            position = len(diagnostics) - 1
+            if decision.decision is DecisionType.PARTIAL_CARRY:
+                carry_out.append(
+                    {
+                        "ticker": ticker,
+                        "side": side,
+                        "remaining_qty": decision.remaining_qty,
+                        "origin_date": origin,
+                        "due_date": next_trading_date,
+                        "age": 1,
+                    }
+                )
+            if decision.filled_qty > 0:
+                approved.append((book.reprice(order, decision.filled_qty), decision, position))
 
-    for order in orders:
-        ticker = str(order.get("ticker"))
-        side = str(order.get("side"))
-        requested = int(order.get("qty", 0) or 0)
-        if requested <= 0 or ticker not in day.bars:
-            continue
-        existing = next(
-            (c for c in carry if c["ticker"] == ticker and c["side"] == side), None
-        )
-        carry_age = int(existing["age"]) if existing else 0
-        if existing:
-            carry = [c for c in carry if c is not existing]
-        bar_data = day.bars[ticker]
-        bar = OHLCVBar(
-            date=day.date,
-            ticker=ticker,
-            open=bar_data.get("open"),
-            high=bar_data.get("high"),
-            low=bar_data.get("low"),
-            close=bar_data.get("close"),
-            volume=bar_data.get("volume"),
-        )
-        requested_eff = requested
-        if side == "BUY":
-            # Sales may have been only partially filled by the capacity model,
-            # so the order builder's cash budget can overstate available funds.
-            unit_cost = etf_shared.apply_buy_cost(
-                float(order.get("reference_price") or 0.0), slippage
-            )
-            affordable = int(cash / unit_cost) if unit_cost > 0 else 0
-            requested_eff = min(requested, max(affordable, 0))
-        if requested_eff <= 0:
-            continue
-        decision = decide_execution(
-            OrderRequest(
-                date=day.date,
-                ticker=ticker,
-                side=side,
-                requested_qty=requested_eff,
-                participation_rate=float(params["capacity_participation_rate"]),
-                carry_age=carry_age,
-                max_carry_days=int(params["capacity_max_carry_days"]),
-                explicit_suspension=False,
-            ),
-            bar,
-        )
-        filled = int(decision.filled_qty)
-        if filled > 0:
-            basis = cost_basis.get(ticker)
-            tax_rate = (
-                float(params["sell_tax_pct"])
-                if side == "SELL" and ticker in config.taxable_tickers
-                else 0.0
-            )
-            priced = _reprice(order, filled, slippage, basis, tax_rate)
-            value = float(priced["estimated_value"])
-            if side == "SELL":
-                qty = min(filled, int(holdings.get(ticker, 0) or 0))
-                if qty <= 0:
-                    continue
-                remaining = int(holdings.get(ticker, 0) or 0) - qty
-                if remaining > 0:
-                    holdings[ticker] = remaining
-                else:
-                    holdings.pop(ticker, None)
-                    cost_basis.pop(ticker, None)
-                cash += value
-            else:
-                previous = int(holdings.get(ticker, 0) or 0)
-                holdings[ticker] = previous + filled
-                unit = value / filled
-                if ticker in cost_basis and previous > 0:
-                    cost_basis[ticker] = (
-                        float(cost_basis[ticker]) * previous + value
-                    ) / holdings[ticker]
-                else:
-                    cost_basis[ticker] = unit
-                cash -= value  # affordable cap guarantees cash never goes negative
-            fills.append(
-                {
-                    "date": day.date,
-                    "ticker": ticker,
-                    "side": side,
-                    "requested_qty": requested,
-                    "filled_qty": filled,
-                    "remaining_qty": requested - filled,
-                    "decision": decision.decision.value,
-                    "reason": decision.reason,
-                    "reference_price": order.get("reference_price"),
-                    "net_value": value,
-                    "estimated_tax": float(priced["estimated_tax"]),
-                    "capacity_qty": int(decision.capacity_qty),
-                    "carry_age": carry_age,
-                }
-            )
-        unfilled = requested - filled
-        if unfilled > 0 and carry_age < int(params["capacity_max_carry_days"]):
-            carry.append(
-                {
-                    "ticker": ticker,
-                    "side": side,
-                    "remaining_qty": unfilled,
-                    "age": carry_age + 1,
-                    "origin_date": day.date,
-                    "due_date": day.date,
-                }
-            )
-    patch = {
-        "cash": cash,
-        "holdings": holdings,
-        "cost_basis": cost_basis,
-        "carry": carry,
+        for order, decision, position in approved:
+            if order["side"] == "BUY":
+                qty = int(order["qty"])
+                unit = float(order["estimated_value"]) / qty
+                affordable = book.affordable(qty, unit)
+                if affordable < qty:
+                    diagnostics[position] = _diagnostic(
+                        decision, source="REBALANCE", origin_date=origin,
+                        filled_qty=affordable, label="CASH_LIMITED",
+                        reason="capacity BUY exceeds current cash; remainder cancelled",
+                    )
+                    if affordable <= 0:
+                        continue
+                    order = book.reprice(order, affordable)
+            book.apply(order, "REBALANCE")
+        execution = {
+            "decision_date": origin,
+            "targets": targets,
+            "forced_exit_tickers": sorted(gating.forced_exit_tickers),
+            "allow_empty_target_sell": allow_empty,
+        }
+
+    return {
+        "patch": {
+            "cash": book.cash,
+            "holdings": book.holdings,
+            "cost_basis": book.cost_basis,
+            "carry": carry_out,
+            "pending_signal": None,
+        },
+        "fills": book.fills,
+        "diagnostics": diagnostics,
+        "orders": [
+            {key: o.get(key) for key in ("ticker", "side", "qty", "reference_price", "reason")}
+            for o in orders
+        ],
+        "execution": execution,
     }
-    return fills, patch
+
+
+def _no_order(
+    ticker: str, side: str, origin: str, label: str, reason: str, requested: int
+) -> dict[str, Any]:
+    return {
+        "ticker": str(ticker),
+        "side": side,
+        "source": "REBALANCE",
+        "origin_date": origin,
+        "decision": label,
+        "capacity_decision": None,
+        "requested_qty": requested,
+        "capacity_filled_qty": 0,
+        "filled_qty": 0,
+        "remaining_qty": requested,
+        "capacity_qty": 0,
+        "bar_volume": None,
+        "reason": reason,
+    }
 
 
 def evaluate_equity(
-    *,
-    state: dict[str, Any],
-    day: MarketDay,
+    *, state: dict[str, Any], day: MarketDay, config: EffectiveConfig
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Mark holdings to market, explicitly flagging stale fallback prices."""
-    current_prices = {
-        ticker: bar.get("close")
-        for ticker, bar in day.bars.items()
-        if bar.get("close") is not None
-    }
+    current_prices = {t: bar["close"] for t, bar in day.bars.items()}
     last_valid = dict(state.get("last_valid_prices", {}))
-    market_value = 0.0
+    etf_shared.update_last_valid_prices(last_valid, current_prices)
+    values: dict[str, float] = {}
     stale: list[str] = []
     for ticker, qty in state["holdings"].items():
         price = etf_shared.get_valuation_price(ticker, current_prices, last_valid)
-        if price is None:
+        if ticker not in current_prices or price is None:
             stale.append(ticker)
-            continue
-        if ticker not in current_prices:
-            stale.append(ticker)
-        market_value += int(qty) * float(price)
+        if price is not None:
+            values[ticker] = int(qty) * float(price)
+    market_value = sum(values.values())
     equity = float(state["cash"]) + market_value
     curve = list(state.get("equity_curve", []))
-    previous = float(curve[-1]["equity"]) if curve else float(state["peak_equity"])
+    previous = float(curve[-1]["equity"]) if curve else float(state["initial_equity"])
     daily_return = equity / previous - 1.0 if previous else 0.0
     peak = max(float(state.get("peak_equity", equity)), equity)
+    # Partial sells can leave the portfolio over the position count or asset cap,
+    # exactly as in the backtest.  Surface it; do not invent a correction.
+    flags = []
+    max_positions = int(config.params["max_positions"])
+    if len(state["holdings"]) > max_positions:
+        flags.append(f"positions {len(state['holdings'])} > {max_positions}")
+    cap = float(config.params["max_asset_pct"])
+    for ticker, value in sorted(values.items()):
+        if cap > 0 and equity > 0 and value / equity > cap:
+            flags.append(f"{ticker} weight {value / equity:.1%} > {cap:.0%}")
+    mdd = float(equity / peak - 1.0)
     row = {
         "date": day.date,
         "equity": equity,
@@ -440,17 +537,15 @@ def evaluate_equity(
         "market_value": market_value,
         "daily_return": daily_return,
         "peak_equity": peak,
-        "mdd": float(equity / peak - 1.0),
+        "mdd": mdd,
+        "max_drawdown": min(mdd, float(curve[-1]["max_drawdown"]) if curve else 0.0),
         "stale_tickers": sorted(set(stale)),
         "holdings": dict(state["holdings"]),
+        "cost_basis": dict(state["cost_basis"]),
+        "limit_flags": flags,
     }
     curve.append(row)
     # Each row's drawdown stays relative to the peak known *at that time*.
     # Recomputing past rows against a later high would inject look-ahead and
     # rewrite reports that were already committed.
-    patch = {
-        "equity_curve": curve,
-        "peak_equity": peak,
-        "last_valid_prices": last_valid,
-    }
-    return row, patch
+    return row, {"equity_curve": curve, "peak_equity": peak, "last_valid_prices": last_valid}
