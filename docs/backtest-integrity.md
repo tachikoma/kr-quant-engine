@@ -137,6 +137,10 @@ trailing/portfolio stop 오버레이(`exit_check_days=0`으로 비활성), 실�
 
 1. `data/etf_distributions.csv`는 빈 template이다. 장기 검증 원천 전에는
    `total_return` 및 분배금 포함 성과를 승인 근거로 사용하지 않는다.
+   P2-A-2a에서 KODEX 4종(069500/091160/091170/498400)의 2022년 이후 이벤트만
+   확보했다(동결 16종 중 4종, PARTIAL). 배당락일은 기준일 직전 거래일로 파생했고,
+   지급일 현금 타이밍·과세표준 세율·독립 원천은 미해결이다
+   → [p2a2a_etf_distributions.md](p2a2a_etf_distributions.md).
 2. 공식 과거 기업행위, effective-dated tax/classification, 상장폐지·정산 원천과
    manifest coverage가 없다. strict corporate-action/PIT은 이를 대체 추정하지 않는다.
 3. WFA boundary return 교정과 frozen-policy/adaptive-policy 분리는 구현·게이트

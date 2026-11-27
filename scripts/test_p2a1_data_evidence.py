@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -329,6 +330,58 @@ def check_pilot_coverage() -> None:
             raise AssertionError(f"{ticker} window 누락")
 
 
+def check_pilot_completeness() -> None:
+    expected = {"069500", "360750"}
+    good_meta = [{"ticker": "069500", "status": "ok"}, {"ticker": "360750", "status": "ok"}]
+    good_cmp = pd.DataFrame({"ticker": ["069500", "360750"], "status": ["compared", "compared"]})
+    result = evidence.pilot_completeness(good_meta, good_cmp, expected)
+    if not result["all_expected_queried_and_compared"]:
+        raise AssertionError(f"정상 파일럿이 실패로 판정됨: {result}")
+
+    missing_meta = [{"ticker": "069500", "status": "ok"}]
+    result = evidence.pilot_completeness(missing_meta, good_cmp, expected)
+    if result["all_expected_queried_and_compared"]:
+        raise AssertionError("조회 누락이 성공으로 판정됨")
+
+    failed_meta = [{"ticker": "069500", "status": "ok"}, {"ticker": "360750", "status": "error"}]
+    result = evidence.pilot_completeness(failed_meta, good_cmp, expected)
+    if result["all_expected_queried_and_compared"]:
+        raise AssertionError("조회 실패가 성공으로 판정됨")
+
+    dup_cmp = pd.DataFrame({"ticker": ["069500", "360750", "360750"], "status": ["compared"] * 3})
+    result = evidence.pilot_completeness(good_meta, dup_cmp, expected)
+    if result["all_expected_queried_and_compared"]:
+        raise AssertionError("중복 비교 행이 성공으로 판정됨")
+
+    extra_cmp = pd.DataFrame({"ticker": ["069500", "360750", "411060"], "status": ["compared"] * 3})
+    result = evidence.pilot_completeness(good_meta, extra_cmp, expected)
+    if result["all_expected_queried_and_compared"]:
+        raise AssertionError("예상 밖 티커가 성공으로 판정됨")
+
+
+def check_cross_check_invalid_cache_date() -> None:
+    prices = pd.DataFrame(
+        {"ticker": ["069500", "069500"], "date": pd.to_datetime(["2026-01-02", "2026-01-05"])}
+    )
+    for column in ["open", "high", "low", "close", "volume", "trading_value"]:
+        prices[column] = [1.0, 2.0]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "data_cache").mkdir()
+        cache = prices.copy()
+        cache["date"] = ["2026-01-02", "not-a-date"]
+        cache.to_parquet(root / "data_cache" / "069500.parquet", index=False)
+        original_root = evidence.ROOT
+        evidence.ROOT = root
+        try:
+            rows = evidence.cross_check_cache(prices)
+        finally:
+            evidence.ROOT = original_root
+    status = rows.iloc[0]["status"]
+    if status != "invalid_dates":
+        raise AssertionError(f"잘못된 캐시 날짜가 상태로 반환되지 않음: {status}")
+
+
 def check_artifacts_if_present() -> None:
     output_dir = ROOT / "outputs_p2a1"
     if not output_dir.exists():
@@ -393,6 +446,8 @@ def main() -> int:
         ("distribution and preflight", check_distribution_and_preflight),
         ("independent source", check_independent_source),
         ("pilot coverage", check_pilot_coverage),
+        ("pilot completeness", check_pilot_completeness),
+        ("invalid cache date", check_cross_check_invalid_cache_date),
         ("artifacts schema", check_artifacts_if_present),
     ]
     failures = 0

@@ -146,11 +146,12 @@ KRX(pykrx 1.2.8)로 과거 거래일 전종목 시세를 실제 조회했습니�
 
 ## 10. 테스트·리뷰
 
-- `scripts/test_p2a1_data_evidence.py` (fixture 14/14): 정규화 SHA256 순서 독립성·값 민감성,
+- `scripts/test_p2a1_data_evidence.py` (fixture 16/16): 정규화 SHA256 순서 독립성·값 민감성,
   env boolean만 노출, 파일럿 카테고리, 가격 경로 상태 계산(실패/부분/검증), JSON NaN→null,
   독립 원천 판정, snapshot/KRX/DART 상태 계산, 분배금 승인 가능성·stale preflight 차단,
   시크릿 리다크션, 빈 비교 CSV schema 유지, **가격 비교의 no_overlap·중복/NaT/Inf·날짜 집합 불일치·
-  필드 누락·티커 누락 검출**, membership 집합 비교, provenance artifact 완전성, 산출물 schema.
+  필드 누락·티커 누락 검출**, membership 집합 비교, provenance artifact 완전성,
+  **파일럿 조회/비교 집합·중복 판정**, **캐시 날짜 변환 예외**, 산출물 schema.
 - 분배금은 필드가 채워져도 **기간·티커 coverage와 공식 출처 검증 전에는 `total_return_approvable=False`**로
   고정되며, 경로 상태도 `blocked`입니다.
 - E2E 상태는 상수로 두지 않고 실제 조회·대조 결과에서 계산하며, `--approval-strict`는 실행별
