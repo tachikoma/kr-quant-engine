@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import date
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import p2a1_data_evidence as p2a1
 import p2a2a_etf_distributions as evidence
 
 OUTPUT_DIR = ROOT / "outputs_p2a2a" / "price_anomaly"
@@ -71,7 +73,17 @@ def krx_snapshot(session, trade_date: date) -> pd.DataFrame:
         cache_path.write_bytes(payload)
     rows = json.loads(payload.decode("utf-8")).get("output", [])
     frame = pd.DataFrame(rows)
-    for column in ["TDD_CLSPRC", "NAV", "ACC_TRDVOL", "ACC_TRDVAL", "LIST_SHRS", "FLUC_RT"]:
+    for column in [
+        "TDD_CLSPRC",
+        "TDD_OPNPRC",
+        "TDD_HGPRC",
+        "TDD_LWPRC",
+        "NAV",
+        "ACC_TRDVOL",
+        "ACC_TRDVAL",
+        "LIST_SHRS",
+        "FLUC_RT",
+    ]:
         if column in frame.columns:
             frame[column] = pd.to_numeric(
                 frame[column].astype(str).str.replace(",", ""), errors="coerce"
@@ -101,55 +113,43 @@ def cache_window(cache_dir: Path, ticker: str, start: date, end: date) -> pd.Dat
     return frame.sort_values("date").reset_index(drop=True)
 
 
-def krx_refetch(ticker: str, start: date, end: date) -> pd.DataFrame:
-    from pykrx import stock
-
-    try:
-        raw = stock.get_etf_ohlcv_by_date(
-            start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker
-        )
-    except (RuntimeError, ValueError, KeyError):
-        return pd.DataFrame()
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    frame = raw.reset_index().rename(
-        columns={
-            "날짜": "date",
-            "NAV": "nav",
-            "시가": "open",
-            "고가": "high",
-            "저가": "low",
-            "종가": "close",
-            "거래량": "volume",
-            "거래대금": "trading_value",
-        }
-    )
-    frame["date"] = pd.to_datetime(frame["date"])
-    return frame.sort_values("date").reset_index(drop=True)
-
-
-def compare_frames(cache: pd.DataFrame, fresh: pd.DataFrame) -> dict[str, Any]:
-    if cache.empty or fresh.empty:
-        return {"status": "insufficient"}
-    merged = cache.merge(fresh, on="date", suffixes=("_cache", "_krx"), how="inner")
-    if merged.empty:
-        return {"status": "no_overlap"}
-    diffs = {}
-    for column in ["open", "high", "low", "close", "volume", "trading_value", "nav"]:
-        left = f"{column}_cache"
-        right = f"{column}_krx"
-        if left not in merged.columns or right not in merged.columns:
-            continue
-        delta = (merged[left] - merged[right]).abs().max()
-        diffs[column] = None if pd.isna(delta) else float(delta)
+def missing_snapshot_row(ticker: str) -> dict[str, Any]:
+    """스냅샷에 없는 종목도 미확보 행으로 남겨 집계에서 빠지지 않게 한다."""
     return {
-        "status": "compared",
-        "rows": len(merged),
-        "max_abs_diff": diffs,
-        "identical": bool(
-            diffs and all(value is not None and value == 0 for value in diffs.values())
-        ),
+        "ticker": ticker,
+        "name": "",
+        "cache_return_pct": None,
+        "kis_flag1_raw_return_pct": None,
+        "kis_flag0_adjusted_return_pct": None,
+        "krx_snapshot_return_pct": None,
+        "cache_vs_krx_day": {"status": "missing_snapshot", "identical": False},
+        "cache_vs_kis": {"raw_abs_diff": None, "adjusted_abs_diff": None},
+        "list_shares_prev": None,
+        "list_shares_today": None,
+        "list_shares_changed": None,
+        "list_shares_ratio": None,
+        "split_like": None,
+        "snapshot_missing": True,
     }
+
+
+def snapshot_day_frame(snapshot_row: pd.Series, day: date) -> pd.DataFrame:
+    """저장된 KRX 스냅샷에서 당일 6개 필드+NAV를 꺼내 비교 프레임으로 만든다."""
+    mapping = {
+        "open": "TDD_OPNPRC",
+        "high": "TDD_HGPRC",
+        "low": "TDD_LWPRC",
+        "close": "TDD_CLSPRC",
+        "volume": "ACC_TRDVOL",
+        "trading_value": "ACC_TRDVAL",
+        "nav": "NAV",
+    }
+    row: dict[str, Any] = {"date": pd.Timestamp(day)}
+    for target, source in mapping.items():
+        value = snapshot_row.get(source)
+        number = pd.to_numeric(str(value).replace(",", ""), errors="coerce")
+        row[target] = float(number) if pd.notna(number) else float("nan")
+    return pd.DataFrame([row])
 
 
 KIS_BLOCK: list[str] = []
@@ -230,21 +230,136 @@ def impact(research_outputs: Path, cache_dir: Path, dates: list[date]) -> list[d
     return rows
 
 
+def _finite(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def strict_krx_comparison(cache: pd.DataFrame, fresh: pd.DataFrame) -> dict[str, Any]:
+    """PR #15의 날짜·필드·결측 검증을 재사용해 전 필드/전 날짜 일치만 통과시킨다."""
+    if cache.empty or fresh.empty:
+        return {"status": "insufficient", "identical": False}
+    comparison = p2a1.compare_price_frames(cache, fresh)
+    expected_rows = len(cache)
+    diffs = comparison.get("diffs") or {}
+    fields_complete = bool(diffs) and all(value is not None for value in diffs.values())
+    all_zero = fields_complete and all(float(value) == 0 for value in diffs.values())
+    # 비교 범위 밖 날짜까지 포함해 양쪽 전체 날짜 집합이 같아야 한다.
+    full_date_match = bool(
+        set(pd.to_datetime(cache["date"])) == set(pd.to_datetime(fresh["date"]))
+    )
+    nav_ok = False
+    if "nav" in cache.columns and "nav" in fresh.columns:
+        merged = cache[["date", "nav"]].merge(fresh[["date", "nav"]], on="date", suffixes=("_c", "_f"))
+        nav_ok = bool(
+            len(merged) == expected_rows == len(fresh)
+            and merged["nav_c"].notna().all()
+            and merged["nav_f"].notna().all()
+            and (merged["nav_c"] - merged["nav_f"]).abs().max() == 0
+        )
+    identical = bool(
+        comparison.get("status") == "compared"
+        and comparison.get("date_set_match")
+        and full_date_match
+        and comparison.get("overlap_rows") == expected_rows
+        and not comparison.get("validation_errors")
+        and all_zero
+        and nav_ok
+    )
+    return {
+        "status": comparison.get("status"),
+        "identical": identical,
+        "expected_rows": expected_rows,
+        "overlap_rows": comparison.get("overlap_rows"),
+        "date_set_match": comparison.get("date_set_match"),
+        "full_date_set_match": full_date_match,
+        "validation_errors": comparison.get("validation_errors"),
+        "max_abs_diff": diffs,
+        "nav_ok": nav_ok,
+    }
+
+
+def evaluate_confirmation(
+    rows: list[dict[str, Any]],
+    expected_tickers: list[str] | set[str] | None = None,
+    tolerance: float = 0.05,
+) -> dict[str, Any]:
+    """검증 대상 전체의 유효한 비교가 있을 때만 확인 완료로 판정한다."""
+    expected = sorted(
+        {str(ticker) for ticker in (expected_tickers or [item.get("ticker") for item in rows])}
+    )
+    by_ticker = {
+        str(item.get("ticker")): item for item in rows if str(item.get("ticker")) in expected
+    }
+    missing: list[str] = [ticker for ticker in expected if ticker not in by_ticker]
+    mismatched: list[dict[str, Any]] = []
+    checked = 0
+    for ticker in expected:
+        item = by_ticker.get(ticker)
+        if item is None:
+            continue
+        cache_return = _finite(item.get("cache_return_pct"))
+        kis_return = _finite(item.get("kis_flag1_raw_return_pct"))
+        if cache_return is None or kis_return is None:
+            missing.append(ticker)
+            continue
+        checked += 1
+        diff = abs(cache_return - kis_return)
+        if diff > tolerance:
+            mismatched.append({"ticker": ticker, "abs_diff": round(diff, 6)})
+    missing = sorted(set(missing))
+    confirmed = bool(expected) and not missing and not mismatched and checked == len(expected)
+    return {
+        "kis_confirmed": confirmed,
+        "kis_checked": checked,
+        "kis_missing_tickers": missing,
+        "expected_tickers": len(expected),
+        "kis_mismatch_tickers": mismatched,
+        "kis_max_abs_return_diff": round(
+            max(
+                (
+                    abs(
+                        _finite(item.get("cache_return_pct"))
+                        - _finite(item.get("kis_flag1_raw_return_pct"))
+                    )
+                    for item in rows
+                    if _finite(item.get("cache_return_pct")) is not None
+                    and _finite(item.get("kis_flag1_raw_return_pct")) is not None
+                ),
+                default=0.0,
+            ),
+            6,
+        ),
+    }
+
+
 def classify(date_result: dict[str, Any]) -> str:
+    # 원천 간 불일치를 먼저 본다. 불일치는 데이터 오류 확정이 아니라 원천 불일치다.
+    if date_result.get("source_mismatch"):
+        return "source_mismatch"
+    if not date_result.get("kis_confirmed") or not date_result.get("evidence_complete"):
+        return "unconfirmed"
     index_moves = [
-        abs(value["return_pct"])
-        for value in date_result.get("index", {}).values()
-        if isinstance(value, dict) and value.get("return_pct") is not None
+        abs(move)
+        for move in (
+            _finite(value.get("return_pct"))
+            for value in date_result.get("index", {}).values()
+            if isinstance(value, dict)
+        )
+        if move is not None
     ]
     breadth = date_result.get("breadth", {})
-    if date_result.get("kis_confirmed") and (
+    share_gt_10 = _finite(breadth.get("share_gt_10pct")) or 0.0
+    median_return = _finite(breadth.get("median_return_pct")) or 0.0
+    if (
         (index_moves and max(index_moves) >= 5)
-        or breadth.get("share_gt_10pct", 0) >= 0.15
-        or abs(breadth.get("median_return_pct", 0)) >= 2
+        or share_gt_10 >= 0.15
+        or abs(median_return) >= 2
     ):
         return "market_move_confirmed_by_independent_feed"
-    if date_result.get("kis_contradicted"):
-        return "data_error_confirmed"
     return "unconfirmed"
 
 
@@ -326,11 +441,15 @@ def main() -> None:
         for ticker in tickers:
             row = snapshot[snapshot["ISU_SRT_CD"] == ticker]
             if row.empty:
+                day_result["tickers"].append(missing_snapshot_row(ticker))
                 continue
             snapshot_row = row.iloc[0]
             cache = cache_window(args.cache_dir, ticker, day - pd.Timedelta(days=8), day + pd.Timedelta(days=8))
-            fresh = krx_refetch(ticker, day - pd.Timedelta(days=8), day + pd.Timedelta(days=8))
-            comparison = compare_frames(cache, fresh)
+            # 저장된 KRX 스냅샷(공식 원천)과 당일 행을 전 필드·NAV까지 대조한다.
+            fresh = snapshot_day_frame(snapshot_row, day)
+            cache_day = cache[cache["date"] == pd.Timestamp(day)]
+            comparison = strict_krx_comparison(cache_day, fresh)
+            comparison["source"] = "krx_snapshot_saved"
             kis = kis_window(ticker, day - pd.Timedelta(days=8), day + pd.Timedelta(days=8), api)
             cache_ret = None
             raw_ret = None
@@ -368,7 +487,7 @@ def main() -> None:
                     "kis_flag1_raw_return_pct": raw_ret,
                     "kis_flag0_adjusted_return_pct": adj_ret,
                     "krx_snapshot_return_pct": round(float(snapshot_row["FLUC_RT"]), 4),
-                    "cache_vs_krx_refetch": comparison,
+                    "cache_vs_krx_day": comparison,
                     "cache_vs_kis": {
                         "raw_abs_diff": None
                         if raw_ret is None or cache_ret is None
@@ -412,26 +531,33 @@ def main() -> None:
                 }
             )
 
-        big = [
+        confirmation = evaluate_confirmation(day_result["tickers"], tickers)
+        day_result.update(confirmation)
+        krx_compared = [
             item
             for item in day_result["tickers"]
-            if abs(item["cache_return_pct"] or 0) >= 5
+            if item["cache_vs_krx_day"].get("status") == "compared"
         ]
-        diffs = [
-            abs(item["kis_flag1_raw_return_pct"] - item["cache_return_pct"])
-            for item in big
-            if item["kis_flag1_raw_return_pct"] is not None
+        krx_mismatch = [
+            item["ticker"]
+            for item in krx_compared
+            if item["cache_vs_krx_day"].get("identical") is not True
         ]
-        day_result["kis_confirmed"] = bool(big and diffs and max(diffs) < 0.05)
-        day_result["kis_max_abs_return_diff"] = round(max(diffs), 6) if diffs else None
-        day_result["kis_missing"] = sum(
-            1 for item in big if item["kis_flag1_raw_return_pct"] is None
-        )
-        day_result["kis_contradicted"] = any(
-            item["kis_flag1_raw_return_pct"] is not None
-            and abs(item["kis_flag1_raw_return_pct"] - item["cache_return_pct"]) > 1.0
+        krx_incomplete = [
+            item["ticker"]
             for item in day_result["tickers"]
+            if item["cache_vs_krx_day"].get("status") != "compared"
+        ]
+        day_result["krx_compared"] = len(krx_compared)
+        day_result["krx_mismatch_tickers"] = krx_mismatch
+        day_result["krx_incomplete_tickers"] = krx_incomplete
+        day_result["source_mismatch"] = bool(
+            confirmation["kis_mismatch_tickers"] or krx_mismatch
         )
+        day_result["evidence_complete"] = bool(
+            not krx_incomplete and not krx_mismatch and not confirmation["kis_missing_tickers"]
+        )
+        day_result["kis_contradicted"] = bool(confirmation["kis_mismatch_tickers"])
         day_result["shares_changed_tickers"] = [
             item["ticker"]
             for item in day_result["tickers"]
