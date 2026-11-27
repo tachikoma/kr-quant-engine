@@ -66,6 +66,28 @@ def load_krx_credentials(path: Path) -> list[str]:
     return loaded
 
 
+def silence_krx_login_output() -> None:
+    """pykrx prints the login id on auth; suppress it so credentials never leak."""
+    import contextlib
+    import io
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            from pykrx.website.comm import auth
+
+        auth.print = lambda *args, **kwargs: None
+    except Exception as exc:  # noqa: BLE001 - pykrx internals may change
+        print(f"KRX output suppression unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+def load_approval(path: Path) -> dict:
+    """Load an operational approval record (no credentials involved)."""
+    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("approval file must contain a JSON object")
+    return payload
+
+
 def _load_frame(path: Path) -> pd.DataFrame:
     if path.suffix == ".parquet":
         return pd.read_parquet(path)
@@ -110,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observation-start", help="required for --init")
     parser.add_argument("--anchor-date", help="rebalance anchor (default: observation start)")
     parser.add_argument("--decision-offset", type=int, default=0)
+    parser.add_argument(
+        "--approval-file", type=Path,
+        help="FORWARD --init: JSON approval record bound into the manifest hash",
+    )
     parser.add_argument("--seed-etf", type=Path, help="TEST --init: warm-up ETF parquet/csv")
     parser.add_argument("--seed-index", type=Path, help="TEST --init: warm-up KOSPI parquet/csv")
     parser.add_argument("--listing-dates", type=Path, help="TEST --init: {ticker: YYYYMMDD} JSON")
@@ -154,6 +180,7 @@ def _run(argv: list[str] | None) -> int:
     if args.krx_env_file:
         # Must precede any pykrx import: pykrx reads the credentials at import.
         loaded = load_krx_credentials(args.krx_env_file)
+        silence_krx_login_output()
         print(f"KRX credential keys loaded: {', '.join(loaded) or 'none'}", file=sys.stderr)
 
     if args.init:
@@ -179,6 +206,7 @@ def _run(argv: list[str] | None) -> int:
             decision_offset_days=args.decision_offset,
             warmup=warmup,
             provider=provider,
+            approval=load_approval(args.approval_file) if args.approval_file else None,
         )
         print(json.dumps(
             {"initialized": True, "runtime_kind": args.runtime_kind, "cash": state["cash"]},

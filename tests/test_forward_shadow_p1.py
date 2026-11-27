@@ -218,7 +218,7 @@ class ForwardRuntimeTest(ShadowCase):
         provider = FakeLive(self.tmp / "work", self.etf, self.index)
         initialize_runtime(
             root, initial_capital=CAPITAL, observation_start_date=str(OBSERVATION_START),
-            runtime_kind="FORWARD", provider=provider,
+            runtime_kind="FORWARD", provider=provider, test_only_forward=True,
             clock=lambda: kst(OBSERVATION_START, "10:00"),
         )
         return root, provider

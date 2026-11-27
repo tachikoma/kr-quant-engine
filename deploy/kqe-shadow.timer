@@ -1,0 +1,12 @@
+# TEMPLATE ONLY — not installed, not enabled.
+# 18:10 KST: after the 18:00 confirmation cutoff, away from 09:05/17:10 timers.
+[Unit]
+Description=Forward Shadow daily timer (P2-B-2, inactive template)
+
+[Timer]
+OnCalendar=Mon..Fri 18:10:00
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
