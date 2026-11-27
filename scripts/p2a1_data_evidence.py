@@ -540,6 +540,41 @@ def compare_price_frames(krx: pd.DataFrame, cache: pd.DataFrame) -> dict[str, An
     }
 
 
+def pilot_completeness(
+    pilot_meta: list[dict[str, Any]],
+    comparison: pd.DataFrame,
+    expected_tickers: set[str] | list[str],
+) -> dict[str, Any]:
+    """파일럿 조회·비교 완료 여부를 집합·중복 기준으로 판정한다."""
+    expected = sorted(str(ticker) for ticker in expected_tickers)
+    statuses = [(str(item.get("ticker")), item.get("status")) for item in pilot_meta]
+    queried_tickers = [ticker for ticker, _ in statuses]
+    queried_ok = sorted(ticker for ticker, status in statuses if status == "ok")
+    compared = (
+        sorted(str(ticker) for ticker in comparison["ticker"].astype(str).tolist())
+        if not comparison.empty and "ticker" in comparison.columns
+        else []
+    )
+    reasons: list[str] = []
+    if sorted(set(queried_tickers)) != expected:
+        reasons.append("queried ticker set differs from expected")
+    if len(queried_tickers) != len(expected):
+        reasons.append("duplicate or missing pilot queries")
+    if any(status != "ok" for _, status in statuses):
+        reasons.append("some pilot queries failed")
+    if compared != expected:
+        reasons.append("compared ticker set differs from expected")
+    if len(compared) != len(expected):
+        reasons.append("duplicate comparison rows")
+    return {
+        "expected_tickers": expected,
+        "queried_ok": queried_ok,
+        "compared_tickers": compared,
+        "all_expected_queried_and_compared": not reasons,
+        "reasons": reasons,
+    }
+
+
 def pit_membership_probe(snapshot_probe: list[dict[str, Any]]) -> dict[str, Any]:
     """스냅샷 캐시가 있으면 ticker 집합을 비교하고, 없으면 부분 검증으로 기록한다."""
     snapshot_path = ROOT / "data_cache" / "pit_universe" / "pit_universe_snapshots.parquet"
@@ -604,7 +639,9 @@ def cross_check_cache(prices: pd.DataFrame) -> pd.DataFrame:
             rows.append({"ticker": ticker, "status": "cache_missing"})
             continue
         cache = pd.read_parquet(cache_path)
-        cache["date"] = pd.to_datetime(cache["date"])
+        if "date" in cache.columns:
+            # 변환 예외가 비교 이전에 터지지 않도록 coerce 후 검증에 맡긴다.
+            cache["date"] = pd.to_datetime(cache["date"], errors="coerce")
         comparison = compare_price_frames(group, cache)
         diffs = comparison["diffs"]
         rows.append(
@@ -1221,19 +1258,7 @@ def main() -> int:
         "krx_snapshot_probe": snapshot_output,
         "krx_snapshot_status": snapshot_status,
         "pit_membership": membership,
-        "pilot_completeness": {
-            "expected_tickers": sorted(expected_tickers),
-            "queried_ok": sorted(item["ticker"] for item in pilot_meta if item.get("status") == "ok"),
-            "compared_tickers": sorted(comparison["ticker"].astype(str).tolist())
-            if not comparison.empty
-            else [],
-            "all_expected_queried_and_compared": bool(
-                not comparison.empty
-                and set(comparison["ticker"].astype(str)) == expected_tickers
-                and all(item.get("status") == "ok" for item in pilot_meta)
-                and len(pilot_meta) == len(PILOT_TICKERS)
-            ),
-        },
+        "pilot_completeness": pilot_completeness(pilot_meta, comparison, expected_tickers),
         "dart_probe": dart,
         "sources": sources.to_dict(orient="records"),
         "blockers": blockers.to_dict(orient="records"),
