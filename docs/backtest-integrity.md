@@ -141,6 +141,9 @@ trailing/portfolio stop 오버레이(`exit_check_days=0`으로 비활성), 실�
    확보했다(동결 16종 중 4종, PARTIAL). 배당락일은 기준일 직전 거래일로 파생했고,
    지급일 현금 타이밍·과세표준 세율·독립 원천은 미해결이다
    → [p2a2a_etf_distributions.md](p2a2a_etf_distributions.md).
+   가격 캐시는 KIS 조회 전용 시세 대조로 **원주가**임을 확인했고(분배금 이중 계상 없음),
+   2026-03-05/07-31/08-03 급등락은 독립 피드로 확인된 시장 변동이다
+   → [p2a2a_price_anomaly.md](p2a2a_price_anomaly.md).
 2. 공식 과거 기업행위, effective-dated tax/classification, 상장폐지·정산 원천과
    manifest coverage가 없다. strict corporate-action/PIT은 이를 대체 추정하지 않는다.
 3. WFA boundary return 교정과 frozen-policy/adaptive-policy 분리는 구현·게이트

@@ -19,7 +19,8 @@ import json
 import os
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -373,6 +374,236 @@ def pykrx_version() -> str:
     return str(__version__)
 
 
+# --------------------------------------------------------------------------- #
+# KIS 조회 전용(주문 없음) — 비수정/수정 종가 대조
+# --------------------------------------------------------------------------- #
+KIS_RAW_DIR = OUTPUT_DIR / "raw" / "kis"
+KIS_ERRORS: tuple[type[BaseException], ...] = (RuntimeError, OSError, ValueError)
+try:  # 조회 오류도 종목별로 격리한다.
+    from live_trading.kis._kis_api_client import KisApiError
+
+    KIS_ERRORS = (*KIS_ERRORS, KisApiError)
+except ImportError:
+    pass
+
+
+def kis_api():
+    """KIS 조회 전용 클라이언트. 주문·잔고 API는 호출하지 않는다."""
+    if not (os.environ.get("KIS_APP_KEY") and os.environ.get("KIS_APP_SECRET")):
+        return None
+    try:
+        from live_trading.kis._kis_api_client import KisApiClient
+        from live_trading.kis._kis_auth_manager import KisAuthManager
+    except ImportError:
+        return None
+    auth = KisAuthManager()
+    auth.init()
+    mode = (
+        os.environ.get("MODE")
+        or os.environ.get("BROKER_MODE")
+        or os.environ.get("ENV_MODE")
+        or "real"
+    ).lower()
+    return KisApiClient(auth, "demo" if mode in {"demo", "virtual", "moapi"} else "real")
+
+
+def is_rate_limit_error(exc: BaseException) -> bool:
+    """KIS rate limit(EGW00201/EGW00215, HTTP 429)을 문자열이 아니라 코드로 판정한다."""
+    msg_cd = str(getattr(exc, "msg_cd", "") or "")
+    http_status = int(getattr(exc, "http_status", 0) or 0)
+    text = str(exc)
+    return (
+        http_status == 429
+        or msg_cd in {"EGW00201", "EGW00215"}
+        or "EGW00201" in text
+        or "EGW00215" in text
+        or "Rate-limit" in text
+    )
+
+
+def _kis_date(value: Any) -> date:
+    text = str(value).strip()
+    return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+
+
+def kis_daily_series(
+    ticker: str,
+    start: date,
+    end: date,
+    *,
+    org_adj_prc: str,
+    api: Any | None = None,
+) -> pd.DataFrame:
+    """KIS 기간별 시세를 100건 단위로 나눠 조회하고 원본을 보존한다.
+
+    `org_adj_prc`는 KIS 요청 파라미터 그대로다("0" 또는 "1"). 문서 라벨과 실제
+    동작이 반대로 관측되어(0=분배조정 계열, 1=원주가) 라벨로 해석하지 않는다.
+    파일명은 기존 캐시 재사용을 위해 0→raw, 1→adj로 고정한다.
+    """
+    if org_adj_prc not in {"0", "1"}:
+        raise ValueError(f"invalid org_adj_prc: {org_adj_prc}")
+    KIS_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    label = "raw" if org_adj_prc == "0" else "adj"
+    cache_path = KIS_RAW_DIR / f"{ticker}_{label}_{start.isoformat()}_{end.isoformat()}.csv"
+    if cache_path.exists():
+        return pd.read_csv(cache_path, parse_dates=["date"])
+    api = api or kis_api()
+    if api is None:
+        raise RuntimeError("KIS credentials unavailable")
+    rows: list[dict[str, Any]] = []
+    cursor = end
+    complete = False
+    while cursor >= start:
+        chunk_start = max(start, cursor - timedelta(days=120))
+        body = api._get(
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            "FHKST03010100",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": ticker,
+                "FID_INPUT_DATE_1": chunk_start.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": cursor.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": org_adj_prc,
+            },
+        )
+        output = body.get("output2") or []
+        if not output:
+            break
+        rows.extend(output)
+        earliest = min(str(item.get("stck_bsop_date")) for item in output)
+        earliest_date = parse_yyyymmdd(earliest)
+        if earliest_date is None or earliest_date >= cursor:
+            break
+        if earliest_date <= start:
+            complete = True
+            break
+        cursor = earliest_date - timedelta(days=1)
+    else:
+        complete = True
+    if not rows:
+        raise RuntimeError(f"KIS empty series: {ticker}")
+    if not complete:
+        raise RuntimeError(f"KIS incomplete series: {ticker} {start}..{end}")
+    frame = pd.DataFrame(
+        {
+            "date": [_kis_date(item["stck_bsop_date"]) for item in rows],
+            "close": [float(str(item["stck_clpr"]).replace(",", "")) for item in rows],
+            "volume": [float(str(item.get("acml_vol", 0)).replace(",", "")) for item in rows],
+            "trading_value": [
+                float(str(item.get("acml_tr_pbmn", 0)).replace(",", "")) for item in rows
+            ],
+        }
+    )
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    frame.to_csv(cache_path, index=False)
+    return frame
+
+
+def decide_price_basis(
+    equal_flag0: int,
+    equal_flag1: int,
+    total: int,
+    ex_mean: float | None,
+    non_ex_mean: float | None,
+) -> tuple[str, str]:
+    """캐시 일치도와 배당락 수익률 차이로 가격 기준과 조정 동작을 판정한다."""
+    if total > 0 and equal_flag1 == total and equal_flag0 == 0:
+        basis = "raw"
+    elif total > 0 and equal_flag0 == total and equal_flag1 == 0:
+        basis = "adjusted"
+    else:
+        basis = "mixed_or_unknown"
+    behavior = (
+        "adjusted_series_removes_ex_date_drop"
+        if ex_mean is not None
+        and non_ex_mean is not None
+        and ex_mean < -0.05
+        and abs(non_ex_mean) < 0.01
+        else "not_observed"
+    )
+    return basis, behavior
+
+
+def price_basis_probe(
+    cache_dir: Path,
+    events: list[dict[str, Any]],
+    ticker: str = "069500",
+    start: date = date(2026, 6, 1),
+    end: date = BACKTEST_END,
+) -> dict[str, Any]:
+    """가격 캐시가 원주가인지 분배조정 계열인지 KIS 두 파라미터와 대조한다.
+
+    KIS `FID_ORG_ADJ_PRC` 라벨(0=원주가, 1=수정주가)은 실측과 반대로 관측됐다.
+    따라서 라벨이 아니라 (a) 캐시와의 일치, (b) 배당락일 수익률 차이로 판정한다.
+    """
+    cache = load_price(cache_dir, ticker)
+    cache_rows = {
+        row.date.date(): float(row.close) for row in cache.itertuples() if start <= row.date.date() <= end
+    }
+    try:
+        flag0 = kis_daily_series(ticker, start, end, org_adj_prc="0")
+        flag1 = kis_daily_series(ticker, start, end, org_adj_prc="1")
+    except KIS_ERRORS as exc:
+        reason = str(exc)[:160]
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "rate_limited": is_rate_limit_error(exc),
+        }
+    flag0_by_date = dict(zip(flag0["date"].dt.date, flag0["close"], strict=True))
+    flag1_by_date = dict(zip(flag1["date"].dt.date, flag1["close"], strict=True))
+    common = sorted(set(cache_rows) & set(flag0_by_date) & set(flag1_by_date))
+    if len(common) < 2:
+        return {"status": "insufficient", "reason": "no overlapping dates"}
+    equal_flag0 = sum(1 for day in common if abs(cache_rows[day] - flag0_by_date[day]) < 1e-6)
+    equal_flag1 = sum(1 for day in common if abs(cache_rows[day] - flag1_by_date[day]) < 1e-6)
+
+    ex_dates = {
+        date.fromisoformat(row["ex_date"])
+        for row in events
+        if row.get("ex_date") and row.get("ticker") == ticker
+    }
+    ex_diffs: list[float] = []
+    non_ex_diffs: list[float] = []
+    for previous, current in pairwise(common):
+        previous_flag0 = flag0_by_date[previous]
+        if previous_flag0 <= 0:
+            continue
+        cache_ret = cache_rows[current] / cache_rows[previous] - 1
+        flag0_ret = flag0_by_date[current] / previous_flag0 - 1
+        diff = (cache_ret - flag0_ret) * 100
+        if current in ex_dates:
+            ex_diffs.append(diff)
+        else:
+            non_ex_diffs.append(diff)
+    ex_mean = round(float(np.mean(ex_diffs)), 5) if ex_diffs else None
+    non_ex_mean = round(float(np.mean(non_ex_diffs)), 5) if non_ex_diffs else None
+    basis, behavior = decide_price_basis(
+        equal_flag0, equal_flag1, len(common), ex_mean, non_ex_mean
+    )
+    return {
+        "status": "ok",
+        "ticker": ticker,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "overlap_days": len(common),
+        "cache_matches_flag1": equal_flag1,
+        "cache_matches_flag0": equal_flag0,
+        "price_basis": basis,
+        "ex_date_events": len(ex_diffs),
+        "ex_date_mean_return_diff_pct": ex_mean,
+        "non_ex_date_mean_return_diff_pct": non_ex_mean,
+        "ex_date_behavior": behavior,
+        "parameter_semantics": (
+            "실측: FID_ORG_ADJ_PRC=1(문서상 수정주가)이 캐시/원주가와 일치하고, "
+            "0(문서상 원주가)이 배당락 하락을 제거한 조정 계열"
+        ),
+        "double_count_risk": "not_detected" if basis == "raw" else "unverified",
+        "source": "KIS inquire-daily-itemchartprice (FID_ORG_ADJ_PRC 0/1)",
+    }
+
+
 def env_presence() -> dict[str, bool]:
     return {
         "KRX_ID": bool(os.environ.get("KRX_ID")),
@@ -569,19 +800,56 @@ def attach_ex_dates(
     return rows, errors
 
 
+def _archive_failed(raw_path: Path, payload: bytes) -> None:
+    failed_dir = raw_path.parent / "failed"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    failed_path = failed_dir / f"{raw_path.stem}_{utc_now().replace(':', '')}.bin"
+    failed_path.write_bytes(payload)
+
+
+def _valid_payload(payload: Any, required_keys: tuple[str, ...]) -> bool:
+    return isinstance(payload, dict) and all(key in payload for key in required_keys)
+
+
 def cached_json(
-    url: str, raw_path: Path, *, referer: str | None, refresh: bool
-) -> tuple[Any, str, str]:
-    """원본 응답 바이트를 그대로 보존하고 재실행 시 재사용한다(WAF 차단 대비)."""
+    url: str,
+    raw_path: Path,
+    *,
+    referer: str | None,
+    refresh: bool,
+    required_keys: tuple[str, ...] = ("dividList",),
+) -> tuple[Any, str, str, str]:
+    """원본 응답 바이트를 그대로 보존하고 최초 수집 시점을 함께 돌려준다.
+
+    기대 필드가 없는 응답(빈 `{}`, 오류 객체, 잘린 JSON)은 정상 원본을 대체하지 않는다.
+    """
     if raw_path.exists() and not refresh:
         payload = raw_path.read_bytes()
-        return json.loads(payload.decode("utf-8")), sha256_bytes(payload), "cache"
+        parsed = json.loads(payload.decode("utf-8"))
+        if not _valid_payload(parsed, required_keys):
+            raise RuntimeError(f"invalid cached payload: {raw_path.name}")
+        collected = datetime.fromtimestamp(raw_path.stat().st_mtime, tz=timezone.utc)
+        return (
+            parsed,
+            sha256_bytes(payload),
+            "cache",
+            collected.replace(microsecond=0).isoformat(),
+        )
     payload, status = http_get(url, referer=referer)
     if status != 200:
+        _archive_failed(raw_path, payload)
         raise RuntimeError(f"HTTP {status}: {url}")
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _archive_failed(raw_path, payload)
+        raise RuntimeError(f"invalid JSON response: {exc}") from exc
+    if not _valid_payload(parsed, required_keys):
+        _archive_failed(raw_path, payload)
+        raise RuntimeError("unexpected JSON shape")
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_bytes(payload)
-    return json.loads(payload.decode("utf-8")), sha256_bytes(payload), "network"
+    return parsed, sha256_bytes(payload), "network", utc_now()
 
 
 def in_window(record_date: str, start: date, end: date) -> bool:
@@ -752,8 +1020,42 @@ def slice_from_prior_trading_day(price: pd.DataFrame, first_ex_date: date) -> pd
     return price.iloc[start_index:].reset_index(drop=True)
 
 
+def reinvesting_ledger_check(
+    price: pd.DataFrame, distributions: pd.DataFrame, quantity: int = 100
+) -> dict[str, Any]:
+    """주식수·현금 원장을 직접 굴려 TR 지수와 독립적으로 대조한다(분배금 재투자)."""
+    amounts = {
+        pd.Timestamp(row.ex_date): float(row.amount_per_share)
+        for row in distributions.itertuples()
+    }
+    shares = float(quantity)
+    cash = 0.0
+    first_close = float(price["close"].iloc[0])
+    for row in price.itertuples():
+        day = pd.Timestamp(row.date)
+        if day in amounts:
+            cash += shares * amounts[day]
+        if cash > 0 and row.close > 0:
+            shares += cash / float(row.close)
+            cash = 0.0
+    final_close = float(price["close"].iloc[-1])
+    final_equity = shares * final_close + cash
+    return {
+        "ledger_type": "reinvesting_share_ledger",
+        "start_shares": quantity,
+        "final_shares": round(shares, 8),
+        "final_equity": round(final_equity, 2),
+        "equity_over_start": final_equity / (quantity * first_close),
+        "unreinvested_cash": round(cash, 6),
+    }
+
+
 def total_return_e2e(
-    price: pd.DataFrame, events: list[dict[str, Any]], output_dir: Path | None = None
+    price: pd.DataFrame,
+    events: list[dict[str, Any]],
+    output_dir: Path | None = None,
+    *,
+    price_basis: str = "unknown",
 ) -> dict[str, Any]:
     """기존 loader/merge/total-return 경로로 평가액을 검산한다."""
     base_dir = output_dir or OUTPUT_DIR
@@ -796,6 +1098,10 @@ def total_return_e2e(
         str(value.date()) for value in enriched.loc[anomaly_mask.fillna(False), "date"].tolist()
     ]
 
+    ledger = reinvesting_ledger_check(enriched[["date", "close"]], distributions, quantity)
+    ledger["tr_index_ratio"] = index_ratio
+    ledger["abs_diff_vs_tr_index"] = abs(ledger["equity_over_start"] - index_ratio)
+
     return {
         "ticker": price["ticker"].iloc[0],
         "start": price["date"].iloc[0].date().isoformat(),
@@ -803,6 +1109,7 @@ def total_return_e2e(
         "trading_days": len(price),
         "event_count": len(distributions),
         "distribution_sum_per_share": float(distributions["amount_per_share"].sum()),
+        "price_basis": price_basis,
         "price_return_pct": round((price_ratio - 1) * 100, 4),
         "total_return_pct": round((index_ratio - 1) * 100, 4),
         "distribution_contribution_pct": round(((index_ratio - price_ratio) * 100), 4),
@@ -813,10 +1120,13 @@ def total_return_e2e(
             "cash_dividends": round(dividends, 2),
             "equity_change": round(equity_with_cash, 2),
             "identity_abs_diff": round(abs(equity_with_cash - (price_pnl + dividends)), 6),
+            "scope": "loader/회계 함수 단위 검증(엔진 전체 실행 아님)",
+            "independent_ledger": ledger,
         },
         "max_abs_daily_return_pct": round(shock * 100, 4),
         "split_suspicion": bool(shock > 0.15),
-        "anomaly_dates": sorted(set(anomaly_dates)),
+        "anomaly_detected": sorted(set(anomaly_dates)),
+        "anomaly_confirmed": [],
         "anomaly_threshold_pct": 15.0,
         "ex_dates_all_in_price": bool(
             set(pd.to_datetime(distributions["ex_date"])) <= set(price["date"])
@@ -1043,54 +1353,27 @@ def write_ledger(events: list[dict[str, Any]], coverage_rows: list[dict[str, Any
     }
 
 
-def krx_adjustment_probe(ticker: str) -> dict[str, Any]:
-    """KRX ETF 시세 API가 수정주가 파라미터를 적용하는지 확인한다."""
+def krx_field_evidence() -> dict[str, Any]:
+    """KRX ETF 시세 화면의 필드 정의를 확인한다(수정주가 파라미터 존재 여부)."""
+    url = "https://data.krx.co.kr/contents/MDC/STAT/standard/MDCSTAT045.jsp"
     try:
-        from pykrx.website.comm.auth import build_krx_session
-    except ImportError as exc:  # pragma: no cover - 환경 의존
-        return {"status": "unavailable", "reason": str(exc)[:120]}
-    if not (os.environ.get("KRX_ID") and os.environ.get("KRX_PW")):
-        return {"status": "skipped", "reason": "KRX credentials absent"}
-    session = build_krx_session()
-    if session is None:
-        return {"status": "skipped", "reason": "login failed"}
-    ticker_isin = {
-        "069500": "KR7069500007",
-        "498400": "KR7498400001",
-    }.get(ticker)
-    if not ticker_isin:
-        return {"status": "skipped", "reason": "isin unknown"}
-    payload = {
-        "bld": "dbms/MDC/STAT/standard/MDCSTAT04501",
-        "locale": "ko_KR",
-        "isuCd": ticker_isin,
-        "strtDd": "20260601",
-        "endDd": "20260630",
-        "csvxls_isNo": "false",
-    }
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201030104",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    results: dict[str, list[str]] = {}
-    for label, extra in (("default", {}), ("adj1", {"adjStkPrc": "1"}), ("adj2", {"adjStkPrc": "2"})):
-        body = dict(payload)
-        body.update(extra)
-        response = session.session.post(
-            "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
-            data=body,
-            headers=headers,
-            timeout=25,
-        )
-        rows = response.json().get("output", [])
-        results[label] = [str(row.get("TDD_CLSPRC")) for row in rows]
+        payload, status = http_get(url, timeout=20)
+    except OSError as exc:
+        return {"status": "unavailable", "reason": str(exc)[:120], "url": url}
+    if status != 200 or not payload:
+        return {"status": "unavailable", "http_status": status, "url": url}
+    html = payload.decode("utf-8", errors="replace")
     return {
         "status": "ok",
-        "ticker": ticker,
-        "rows": len(results["default"]),
-        "adj_param_ignored": results["default"] == results["adj1"] == results["adj2"],
-        "note": "ETF 시세(MDCSTAT04501)는 TDD_CLSPRC(비수정 종가)를 반환",
+        "url": url,
+        "http_status": status,
+        "sha256": sha256_bytes(payload),
+        "close_field": "TDD_CLSPRC(종가)" if 'name="TDD_CLSPRC"' in html else "unknown",
+        "has_adjustment_parameter": "adjStkPrc" in html,
+        "note": (
+            "ETF 시세 화면에는 수정주가 선택 파라미터가 없고, 종가 필드는 TDD_CLSPRC다. "
+            "실제 수정 여부는 KIS 비수정/수정 종가 대조로 판정한다."
+        ),
     }
 
 
@@ -1209,13 +1492,37 @@ def run(
     all_events: list[dict[str, Any]] = []
     coverage_rows: list[dict[str, Any]] = []
     fetch_origins: dict[str, str] = {}
+    fetch_status: dict[str, dict[str, Any]] = {}
     parse_errors: list[str] = []
     per_ticker_payload: dict[str, dict[str, Any]] = {}
+    blocked_reason: str | None = None
 
     for ticker in universe:
         meta = metadata.get(ticker, {})
         fund_id = KODEX_FUND_IDS.get(ticker)
         if fund_id is None:
+            fetch_status[ticker] = {
+                "status": "not_available",
+                "reason": "공식 원천 접근 실패(이 환경) — 이벤트 없음이 아니라 미확보",
+            }
+            coverage_rows.append(
+                build_coverage(
+                    ticker=ticker,
+                    issuer=_issuer(ticker),
+                    name=str(meta.get("name") or ""),
+                    listed_date=_to_date(meta.get("listed_date")),
+                    rows=[],
+                    months=set(),
+                    conflicts=False,
+                    source_available=False,
+                )
+            )
+            continue
+        if blocked_reason is not None:
+            fetch_status[ticker] = {
+                "status": "skipped_blocked",
+                "reason": blocked_reason,
+            }
             coverage_rows.append(
                 build_coverage(
                     ticker=ticker,
@@ -1230,13 +1537,40 @@ def run(
             )
             continue
         url = KODEX_DIVID_URL.format(fid=fund_id)
-        payload, digest, origin = cached_json(
-            url,
-            OUTPUT_DIR / "raw" / f"kodex_{ticker}.json",
-            referer=KODEX_BASE + "/etf/product/distribution.do",
-            refresh=refresh_raw,
-        )
+        try:
+            payload, digest, origin, collected_at = cached_json(
+                url,
+                OUTPUT_DIR / "raw" / f"kodex_{ticker}.json",
+                referer=KODEX_BASE + "/etf/product/distribution.do",
+                refresh=refresh_raw,
+            )
+        except (RuntimeError, OSError, ValueError) as exc:
+            reason = str(exc)[:200]
+            fetch_status[ticker] = {"status": "failed", "reason": reason}
+            parse_errors.append(f"{ticker}:fetch_failed:{reason}")
+            coverage_rows.append(
+                build_coverage(
+                    ticker=ticker,
+                    issuer=_issuer(ticker),
+                    name=str(meta.get("name") or ""),
+                    listed_date=_to_date(meta.get("listed_date")),
+                    rows=[],
+                    months=set(),
+                    conflicts=False,
+                    source_available=False,
+                )
+            )
+            # 429/403은 더 호출하지 않고 남은 종목을 미확보로 둔다.
+            if "429" in reason or "403" in reason:
+                blocked_reason = f"rate_limited_or_blocked: {reason}"
+            continue
         fetch_origins[ticker] = origin
+        fetch_status[ticker] = {
+            "status": "ok",
+            "origin": origin,
+            "first_collected_at": collected_at,
+            "sha256": digest,
+        }
         if not payload or not payload.get("dividList"):
             parse_errors.append(f"{ticker}:empty_payload")
             coverage_rows.append(
@@ -1264,7 +1598,7 @@ def run(
             payload=payload,
             source_url=url,
             source_sha256=digest,
-            retrieved_at=retrieved_at,
+            retrieved_at=collected_at,
         )
         parse_errors.extend(errors)
         all_events.extend(rows)
@@ -1307,9 +1641,16 @@ def run(
     for ticker, payload in per_ticker_payload.items():
         rows = [row for row in all_events if row["ticker"] == ticker]
         checks.extend(annual_sum_checks(ticker, rows, payload.get("annualTrend") or {}))
-    notice_rows, notice_meta = notice_checks(notice_no, all_events, cycle_month)
-    checks.extend(notice_rows)
-    adjustment = krx_adjustment_probe("069500")
+    if blocked_reason is None:
+        notice_rows, notice_meta = notice_checks(notice_no, all_events, cycle_month)
+        checks.extend(notice_rows)
+    else:
+        notice_rows, notice_meta = [], {
+            "status": "skipped_blocked",
+            "reason": blocked_reason,
+        }
+    field_evidence = krx_field_evidence()
+    price_basis = price_basis_probe(cache_dir, all_events)
     pd.DataFrame(
         checks,
         columns=[
@@ -1327,7 +1668,14 @@ def run(
     ).to_csv(OUTPUT_DIR / "distribution_crosscheck.csv", index=False)
 
     # E2E는 요구 기간 내 이벤트가 있는 종목만 수행한다.
+    # 캐시가 원주가로 확인되면 분배금 가산이 정상이고, 조정 계열이면 이중 계상이다.
     e2e: dict[str, Any] = {}
+    cache_basis = price_basis.get("price_basis", "unknown")
+    basis_confirmed = (
+        cache_basis == "raw"
+        and price_basis.get("ex_date_behavior") == "adjusted_series_removes_ex_date_drop"
+    )
+    kis_blocked_error: str | None = None
     for ticker in sorted({row["ticker"] for row in all_events}):
         events = [
             row
@@ -1337,19 +1685,115 @@ def run(
         price_path = cache_dir / f"{ticker}.parquet"
         if not events or not price_path.exists():
             continue
-        price = load_price(cache_dir, ticker)
-        window_start = min(row["ex_date"] for row in events)
-        price = slice_from_prior_trading_day(price, date.fromisoformat(window_start))
+        cache_price = load_price(cache_dir, ticker)
+        window_start = date.fromisoformat(min(row["ex_date"] for row in events))
+        price_slice = slice_from_prior_trading_day(cache_price, window_start)
         window_events = [
             row
             for row in events
-            if window_start <= row["ex_date"] <= price["date"].iloc[-1].date().isoformat()
+            if window_start.isoformat()
+            <= row["ex_date"]
+            <= price_slice["date"].iloc[-1].date().isoformat()
         ]
-        if not window_events or len(price) < 2:
+        if not window_events or len(price_slice) < 2:
             continue
+
+        if price_basis.get("rate_limited"):
+            kis_blocked_error = str(price_basis.get("reason") or "kis_rate_limited")
+        result = total_return_e2e(price_slice, window_events, price_basis=f"cache_{cache_basis}")
+        result["total_return_valid"] = basis_confirmed
+        result["price_source_error"] = ""
+
+        adjusted_check: dict[str, Any] = {"status": "unavailable"}
+        confirmation_dates: list[str] = []
+        if kis_blocked_error is not None:
+            adjusted_check = {"status": "skipped_blocked", "reason": kis_blocked_error}
+        try:
+            if kis_blocked_error is not None:
+                raise RuntimeError(kis_blocked_error)
+            adjusted = kis_daily_series(
+                ticker,
+                price_slice["date"].iloc[0].date(),
+                BACKTEST_END,
+                org_adj_prc="0",
+            )
+            adjusted = (
+                adjusted[["date", "close"]]
+                .assign(date=pd.to_datetime(adjusted["date"]), ticker=ticker)
+                .sort_values("date")
+                .reset_index(drop=True)
+            )
+            if len(adjusted) >= 2:
+                aligned = (
+                    adjusted.set_index("date")["close"]
+                    .reindex(price_slice["date"])
+                    .astype(float)
+                )
+                all_ok = bool(not aligned.isna().any())
+                start_ok = all_ok and not pd.isna(aligned.iloc[0])
+                end_ok = all_ok and not pd.isna(aligned.iloc[-1])
+                adjusted_return = (
+                    float(aligned.iloc[-1] / aligned.iloc[0]) - 1
+                ) * 100 if start_ok and end_ok else float("nan")
+                diff = abs(adjusted_return - result["total_return_pct"])
+                adjusted_slice = price_slice[["date", "ticker"]].assign(
+                    close=aligned.to_numpy()
+                )
+                adjusted_check = {
+                    "status": (
+                        "pass"
+                        if diff < 1.0 and all_ok
+                        else ("incomplete" if not all_ok else "review")
+                    ),
+                    "kis_flag0_price_return_pct": round(adjusted_return, 4),
+                    "abs_diff_vs_tr_pct_points": round(diff, 4),
+                    "window_aligned": all_ok,
+                    "note": (
+                        "분배조정 계열(flag0)은 분배금이 이미 반영되어 있어 가산하지 않고 "
+                        "TR과 비교한다. 별도 원천의 독립 검산"
+                    ),
+                }
+                if all_ok:
+                    double_count = total_return_e2e(
+                        adjusted_slice,
+                        window_events,
+                        OUTPUT_DIR / "double_count_illustration",
+                        price_basis="kis_flag0_adjusted",
+                    )
+                    result["double_count_illustration"] = {
+                        "total_return_pct": double_count["total_return_pct"],
+                        "note": (
+                            "조정 계열에 분배금을 다시 더한 값(이중 계상). "
+                            "승인 근거로 사용하지 않음"
+                        ),
+                    }
+            raw_flag = kis_daily_series(
+                ticker,
+                price_slice["date"].iloc[0].date(),
+                BACKTEST_END,
+                org_adj_prc="1",
+            )
+            raw_flag = raw_flag[["date", "close"]].assign(date=pd.to_datetime(raw_flag["date"]))
+            raw_flag = raw_flag.sort_values("date").reset_index(drop=True)
+            raw_flag["ret"] = raw_flag["close"].pct_change()
+            confirmation_dates = [
+                str(value.date())
+                for value in raw_flag.loc[raw_flag["ret"].abs().gt(0.15).fillna(False), "date"]
+            ]
+        except KIS_ERRORS as exc:
+            reason = str(exc)[:160]
+            if adjusted_check.get("status") != "skipped_blocked":
+                adjusted_check = {"status": "unavailable", "reason": reason}
+            if is_rate_limit_error(exc):
+                kis_blocked_error = f"kis_rate_limited: {reason}"
+
+        result["adjusted_price_check"] = adjusted_check
+        result["anomaly_confirmed"] = sorted(
+            set(result["anomaly_detected"]) & set(confirmation_dates)
+        )
         e2e[ticker] = {
-            "total_return": total_return_e2e(price, window_events),
-            "entitlement": entitlement_case(window_events, price),
+            "total_return": result,
+            "entitlement": entitlement_case(window_events, price_slice),
             "receivable": receivable_case(window_events),
         }
 
@@ -1383,7 +1827,23 @@ def run(
             "counts": status_counts,
             "tickers": coverage_frame.to_dict(orient="records"),
         },
-        "crosscheck": {"checks": checks, "notice": notice_meta, "krx_adjustment": adjustment},
+        "crosscheck": {
+            "checks": checks,
+            "notice": notice_meta,
+            "krx_field": field_evidence,
+            "price_basis": price_basis,
+        },
+        "fetch_status": fetch_status,
+        "ex_date_provenance": {
+            "rule": "분배락일 = 지급기준일 직전 거래일(국내 T+2 결제)",
+            "calendar_source": "가격 캐시 거래일(동결 16종 union)",
+            "calendar_start": calendar[0].isoformat() if calendar else "",
+            "calendar_end": calendar[-1].isoformat() if calendar else "",
+            "calendar_days": len(calendar),
+            "official_calendar_verified": False,
+            "official_ex_date_verified": False,
+            "note": "거래소 공식 캘린더/운용사 배당락일 공시로 검증하지 않은 파생값",
+        },
         "e2e": e2e,
         "ledger": ledger,
         "total_return_approvable": False,
@@ -1396,7 +1856,15 @@ def run(
             {
                 "code": "EX-DATE-DERIVED",
                 "status": "open",
-                "message": "배당락일은 원천 필드가 아니라 기준일 다음 거래일로 파생",
+                "message": "배당락일은 원천 필드가 아니라 기준일 직전 거래일로 파생(공식 검증 없음)",
+            },
+            {
+                "code": "PRICE-BASIS",
+                "status": "watch",
+                "message": (
+                    "캐시는 원주가로 확인됨(이중 계상 없음). 다만 조정 계열에 분배금을 더하면 "
+                    "이중 계상되므로 엔진/CSV 입력의 가격 기준을 고정해야 함"
+                ),
             },
             {
                 "code": "PAYMENT-TIMING",
@@ -1415,7 +1883,7 @@ def run(
             },
         ],
         "limits": [
-            "KODEX API는 펀드별 최근 20건(약 5년)만 제공",
+            "KODEX API는 펀드별 최근 5년만 제공",
             "TIGER(403)/ACE(API 타임아웃)/PLUS·RISE(연결 실패)는 이 환경에서 미확보",
             "배당락일 파생 규칙은 KRX/운용사 관행에 기반하며 원천 문서로 확인하지 않음",
             "세후 수치는 15.4% 가정 시나리오이며 계좌·상품 유형에 따라 달라짐",
@@ -1431,6 +1899,32 @@ def run(
     provenance = {
         "run_id": run_id,
         "generated_at": retrieved_at,
+        "git_commit": git_commit(),
+        "code_sha256": {
+            "scripts/p2a2a_etf_distributions.py": sha256_file(Path(__file__)),
+            "strategy_freeze.json": sha256_file(ROOT / "strategy_freeze.json"),
+        },
+        "price_cache": {
+            ticker: {
+                "sha256": sha256_file(cache_dir / f"{ticker}.parquet"),
+                "bytes": (cache_dir / f"{ticker}.parquet").stat().st_size,
+            }
+            for ticker in universe
+            if (cache_dir / f"{ticker}.parquet").exists()
+        },
+        "raw_responses": {
+            ticker: {
+                "first_collected_at": item.get("first_collected_at"),
+                "sha256": item.get("sha256"),
+                "origin": item.get("origin"),
+            }
+            for ticker, item in fetch_status.items()
+            if item.get("status") == "ok"
+        },
+        "kis_raw": {
+            path.name: {"sha256": sha256_file(path), "bytes": path.stat().st_size}
+            for path in sorted(KIS_RAW_DIR.glob("*.csv"))
+        },
         "sources": [
             {
                 "source_id": item["source_id"],
@@ -1479,6 +1973,19 @@ def sanitize_json(value: Any) -> Any:
     if isinstance(value, (pd.Timestamp, date, datetime)):
         return value.isoformat()
     return value
+
+
+def git_commit() -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or "unknown"
 
 
 def _issuer(ticker: str) -> str:

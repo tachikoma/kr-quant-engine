@@ -268,6 +268,47 @@ def check_missing_year_not_verified() -> None:
     assert result["recent_actual_events"] == result["recent_expected_events"]
 
 
+def check_rate_limit_detection() -> None:
+    class FakeError(Exception):
+        def __init__(self, msg_cd: str = "", http_status: int = 0):
+            self.msg_cd = msg_cd
+            self.http_status = http_status
+            super().__init__(f"[{msg_cd}] error")
+
+    assert evidence.is_rate_limit_error(FakeError("EGW00201"))
+    assert evidence.is_rate_limit_error(FakeError("EGW00215"))
+    assert evidence.is_rate_limit_error(FakeError(http_status=429))
+    assert not evidence.is_rate_limit_error(FakeError("EGW00123"))
+
+
+def check_price_basis_decision() -> None:
+    basis, behavior = evidence.decide_price_basis(0, 10, 10, -0.2, 0.0)
+    assert basis == "raw" and behavior == "adjusted_series_removes_ex_date_drop"
+    basis, behavior = evidence.decide_price_basis(10, 0, 10, 0.0, 0.0)
+    assert basis == "adjusted" and behavior == "not_observed"
+    basis, _ = evidence.decide_price_basis(5, 5, 10, -0.2, 0.0)
+    assert basis == "mixed_or_unknown"
+    _, behavior = evidence.decide_price_basis(0, 10, 10, -0.01, 0.0)
+    assert behavior == "not_observed"
+
+
+def check_reinvesting_ledger() -> None:
+    price = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-06"]),
+            "close": [100.0, 95.0, 96.0],
+        }
+    )
+    distributions = pd.DataFrame(
+        {"ex_date": pd.to_datetime(["2026-05-04"]), "amount_per_share": [5.0]}
+    )
+    result = evidence.reinvesting_ledger_check(price, distributions, quantity=100)
+    # 100주 * (95+5)/95 = 105.263...주, 최종 105.263 * 96 = 10105.26
+    assert abs(result["final_equity"] - 10105.26) < 0.01, result
+    assert abs(result["equity_over_start"] - 1.0105263157894737) < 1e-9
+    assert result["unreinvested_cash"] == 0.0
+
+
 def check_total_return_e2e() -> None:
     price = pd.DataFrame(
         {
@@ -294,6 +335,9 @@ def check_total_return_e2e() -> None:
     assert result["equity_check"]["identity_abs_diff"] < 1e-6
     # total return은 분배금을 재투자하므로 가격수익률보다 높아야 한다.
     assert result["total_return_pct"] > result["price_return_pct"]
+    assert result["equity_check"]["independent_ledger"]["abs_diff_vs_tr_index"] < 1e-9
+    assert result["anomaly_detected"] == [] and result["anomaly_confirmed"] == []
+    assert result["price_basis"] == "unknown"
 
     slice_price = pd.DataFrame(
         {
@@ -413,6 +457,9 @@ def main() -> None:
         ("coverage status", check_coverage_status),
         ("build coverage", check_build_coverage),
         ("missing year not verified", check_missing_year_not_verified),
+        ("rate limit detection", check_rate_limit_detection),
+        ("price basis decision", check_price_basis_decision),
+        ("reinvesting ledger", check_reinvesting_ledger),
         ("total return e2e", check_total_return_e2e),
         ("entitlement", check_entitlement),
         ("receivable", check_receivable),
