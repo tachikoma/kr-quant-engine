@@ -82,6 +82,9 @@ def check_price_status() -> None:
             "max_abs_close_diff": [0.0, 0.0],
             "max_abs_volume_diff": [0.0, 0.0],
             "max_abs_value_diff": [0.0, 0.0],
+            "date_set_match": [True, True],
+            "official_calendar_verified": [False, False],
+            "validation_errors": ["", ""],
         }
     )
     if evidence.classify_price_path(meta_ok, comparison_ok) != "verified_same_origin":
@@ -110,6 +113,9 @@ def check_price_status() -> None:
             "max_abs_close_diff": [0.0],
             "max_abs_volume_diff": [0.0],
             "max_abs_value_diff": [0.0],
+            "date_set_match": [True],
+            "official_calendar_verified": [False],
+            "validation_errors": [""],
         }
     )
     if evidence.classify_price_path([{"status": "ok"}], full) != "verified_same_origin":
@@ -120,6 +126,15 @@ def check_price_status() -> None:
         raise AssertionError("거래량 불일치가 partial이 아닙니다")
     if evidence.classify_price_path([{"status": "ok"}], full.assign(max_abs_close_diff=[None])) != "partial":
         raise AssertionError("결측 diff가 partial이 아닙니다")
+    if evidence.classify_price_path([{"status": "ok"}], full.assign(date_set_match=[False])) != "partial":
+        raise AssertionError("날짜 집합 불일치가 partial이 아닙니다")
+    if (
+        evidence.classify_price_path(
+            [{"status": "ok"}], full, expected_tickers={"069500", "360750"}
+        )
+        != "partial"
+    ):
+        raise AssertionError("파일럿 티커 누락이 partial이 아닙니다")
 
 
 def check_independent_source() -> None:
@@ -168,7 +183,7 @@ def check_price_frames_nan() -> None:
     cache = krx.copy()
     cache.loc[1, "volume"] = np.nan
     result = evidence.compare_price_frames(krx, cache)
-    if result["status"] != "nan_in_source" or result["diffs"]["volume"] is not None:
+    if result["status"] != "nonfinite_values" or result["diffs"]["volume"] is not None:
         raise AssertionError(f"캐시 NaN이 검출되지 않았습니다: {result}")
     missing = evidence.compare_price_frames(krx.drop(columns=["close"]), krx)
     if missing["status"] != "missing_fields":
@@ -176,9 +191,61 @@ def check_price_frames_nan() -> None:
     cache_missing = evidence.compare_price_frames(krx, cache.drop(columns=["volume"]))
     if cache_missing["status"] != "missing_fields":
         raise AssertionError("캐시 필드 누락이 검출되지 않았습니다")
+
+    clean_cache = krx.copy()
+    no_overlap = evidence.compare_price_frames(
+        krx, clean_cache.assign(date=pd.to_datetime(["2023-02-01", "2023-02-02"]))
+    )
+    if no_overlap["status"] != "no_overlap" or no_overlap["diffs"]["close"] is not None:
+        raise AssertionError(f"no_overlap 처리 오류: {no_overlap}")
+    duplicate = evidence.compare_price_frames(
+        pd.concat([krx, krx.iloc[[0]]], ignore_index=True), cache
+    )
+    if duplicate["status"] != "invalid_dates":
+        raise AssertionError("중복 날짜가 검출되지 않았습니다")
+    nat = evidence.compare_price_frames(
+        krx.assign(date=[pd.Timestamp("NaT"), krx["date"].iloc[1]]), cache
+    )
+    if nat["status"] != "invalid_dates":
+        raise AssertionError("NaT 날짜가 검출되지 않았습니다")
+    inf = evidence.compare_price_frames(krx.assign(close=[np.inf, 2.0]), clean_cache)
+    if inf["status"] != "nonfinite_values":
+        raise AssertionError("Inf 값이 검출되지 않았습니다")
+    mismatch = evidence.compare_price_frames(krx, clean_cache.iloc[:1])
+    if mismatch["status"] != "date_set_mismatch":
+        raise AssertionError("날짜 집합 불일치가 검출되지 않았습니다")
+
+    missing_date = evidence.compare_price_frames(krx.drop(columns=["date"]), clean_cache)
+    if missing_date["status"] != "invalid_dates":
+        raise AssertionError("날짜 열 누락이 상태로 반환되지 않았습니다")
+    bad_date = evidence.compare_price_frames(
+        krx.assign(date=["not-a-date", "2023-01-03"]), clean_cache
+    )
+    if bad_date["status"] != "invalid_dates":
+        raise AssertionError("잘못된 날짜 문자열이 상태로 반환되지 않았습니다")
+    bad_number = evidence.compare_price_frames(
+        krx.assign(close=["x", "2"]), clean_cache
+    )
+    if bad_number["status"] != "nonfinite_values":
+        raise AssertionError("비수치 가격이 상태로 반환되지 않았습니다")
+
+    membership = evidence.compare_membership(["A", "B"], ["B", "C"])
+    if membership["ticker_set_match"] or membership["intersection"] != 1:
+        raise AssertionError("membership 비교 오류")
+    if not evidence.compare_membership(["A"], ["A"])["ticker_set_match"]:
+        raise AssertionError("membership 일치 오류")
     ok = evidence.compare_price_frames(krx, krx)
     if ok["status"] != "compared" or any(value != 0.0 for value in ok["diffs"].values()):
         raise AssertionError(f"정상 비교가 실패했습니다: {ok}")
+
+
+def check_membership() -> None:
+    matched = evidence.compare_membership(["069500", "360750"], ["360750", "069500"])
+    if not matched["ticker_set_match"] or matched["krx_only"] or matched["snapshot_only"]:
+        raise AssertionError(f"membership 일치 오류: {matched}")
+    mismatched = evidence.compare_membership(["069500", "360750"], ["069500", "411060"])
+    if mismatched["ticker_set_match"] or mismatched["intersection"] != 1:
+        raise AssertionError(f"membership 불일치 오류: {mismatched}")
 
 
 def check_empty_comparison() -> None:
@@ -319,6 +386,7 @@ def main() -> int:
         ("secret redaction", check_secret_redaction),
         ("empty comparison", check_empty_comparison),
         ("price frames nan", check_price_frames_nan),
+        ("membership compare", check_membership),
         ("price status", check_price_status),
         ("json sanitize", check_json_sanitize),
         ("snapshot status", check_snapshot_status),

@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -115,7 +116,9 @@ def dump_json(payload: Any) -> str:
 
 
 def classify_price_path(
-    pilot_meta: list[dict[str, Any]], comparison: pd.DataFrame
+    pilot_meta: list[dict[str, Any]],
+    comparison: pd.DataFrame,
+    expected_tickers: set[str] | None = None,
 ) -> str:
     """파일럿 조회·캐시 대조 결과로 상태를 계산한다(상수 성공 금지)."""
     if not pilot_meta or all(item.get("status") != "ok" for item in pilot_meta):
@@ -130,18 +133,48 @@ def classify_price_path(
         "max_abs_volume_diff",
         "max_abs_value_diff",
     ]
-    required = {"status", "expected_rows", "overlap_rows", *diff_columns}
+    required = {
+        "ticker",
+        "status",
+        "expected_rows",
+        "overlap_rows",
+        "date_set_match",
+        "official_calendar_verified",
+        *diff_columns,
+    }
     if comparison.empty or not required.issubset(comparison.columns):
+        return "partial"
+    if expected_tickers is not None and set(comparison["ticker"].astype(str)) != set(
+        expected_tickers
+    ):
         return "partial"
     if (comparison["status"] != "compared").any():
         return "partial"
     if (comparison["overlap_rows"] != comparison["expected_rows"]).any():
+        return "partial"
+    if not comparison["date_set_match"].fillna(False).all():
         return "partial"
     if comparison[diff_columns].isna().any().any():
         return "partial"
     if comparison[diff_columns].abs().gt(0).any().any():
         return "partial"
     return "verified_same_origin"
+
+
+def compare_membership(
+    krx_tickers: Iterable[str], snapshot_tickers: Iterable[str]
+) -> dict[str, Any]:
+    """KRX 조회 ticker 집합과 스냅샷 ticker 집합을 비교한다."""
+    krx = {str(ticker) for ticker in krx_tickers}
+    snapshot = {str(ticker) for ticker in snapshot_tickers}
+    return {
+        "krx_count": len(krx),
+        "snapshot_count": len(snapshot),
+        "intersection": len(krx & snapshot),
+        "krx_only": sorted(krx - snapshot),
+        "snapshot_only": sorted(snapshot - krx),
+        "ticker_set_match": krx == snapshot,
+    }
 
 
 def classify_snapshot(probe: list[dict[str, Any]]) -> str:
@@ -239,6 +272,9 @@ def krx_snapshot_probe() -> dict[str, Any]:
         try:
             tickers = stock.get_etf_ticker_list(date)
             list_count = len(tickers)
+            list_sha = hashlib.sha256(
+                ",".join(sorted(map(str, tickers))).encode("utf-8")
+            ).hexdigest()
         except Exception as exc:  # noqa: BLE001
             list_count = None
             tickers = []
@@ -259,11 +295,18 @@ def krx_snapshot_probe() -> dict[str, Any]:
                 }
             )
             continue
+        ohlcv_tickers = sorted({str(item) for item in ohlcv.reset_index().iloc[:, 0]})
         results.append(
             {
                 "date": date,
                 "ticker_list_count": list_count,
+                "ticker_list_sha256": list_sha,
                 "ohlcv_count": ohlcv_count,
+                "ohlcv_ticker_set_sha256": hashlib.sha256(
+                    ",".join(ohlcv_tickers).encode("utf-8")
+                ).hexdigest(),
+                "tickers": list(map(str, tickers)),
+                "ohlcv_tickers": ohlcv_tickers,
                 "ohlcv_columns": columns,
                 "has_nav": "NAV" in columns,
                 "has_value": "거래대금" in columns,
@@ -372,6 +415,9 @@ COMPARISON_COLUMNS = [
     "max_abs_close_diff",
     "max_abs_volume_diff",
     "max_abs_value_diff",
+    "date_set_match",
+    "official_calendar_verified",
+    "validation_errors",
     "cache_sha256",
     "source_independence",
 ]
@@ -384,14 +430,62 @@ def empty_comparison_frame() -> pd.DataFrame:
 COMPARISON_FIELDS = ("open", "high", "low", "close", "volume", "trading_value")
 
 
+def validate_price_frame(frame: pd.DataFrame, label: str) -> list[str]:
+    """날짜 중복/NaT, 수치 Inf/NaN, 필수 열 존재를 검증한다."""
+    errors: list[str] = []
+    if "date" not in frame.columns:
+        return [f"{label}:date_missing"]
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    if dates.isna().any():
+        errors.append(f"{label}:nat_date")
+    if dates.dropna().duplicated().any():
+        errors.append(f"{label}:duplicate_date")
+    for column in COMPARISON_FIELDS:
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            errors.append(f"{label}:nonfinite_{column}")
+    return errors
+
+
 def compare_price_frames(krx: pd.DataFrame, cache: pd.DataFrame) -> dict[str, Any]:
-    """KRX 추출과 캐시 프레임을 6개 필드·전 기간 기준으로 비교한다(결측 포함)."""
+    """KRX 추출과 캐시 프레임을 6개 필드·전 기간·날짜 집합 기준으로 비교한다."""
+    errors = validate_price_frame(krx, "krx") + validate_price_frame(cache, "cache")
+    if errors:
+        status = (
+            "invalid_dates"
+            if any("date" in error or "nat" in error for error in errors)
+            else "nonfinite_values"
+        )
+        return {
+            "status": status,
+            "overlap_rows": 0,
+            "missing_fields": [],
+            "nan_fields": [],
+            "validation_errors": errors,
+            "date_set_match": False,
+            "official_calendar_verified": False,
+            "diffs": {column: None for column in COMPARISON_FIELDS},
+        }
     missing_inputs = [
         column
         for column in COMPARISON_FIELDS
         if column not in krx.columns or column not in cache.columns
     ]
     select_fields = [column for column in COMPARISON_FIELDS if column not in missing_inputs]
+    krx_dates = pd.to_datetime(krx["date"], errors="coerce").dropna()
+    cache_dates = pd.to_datetime(cache["date"], errors="coerce").dropna()
+    window_start = krx_dates.min() if not krx_dates.empty else None
+    window_end = krx_dates.max() if not krx_dates.empty else None
+    if window_start is not None:
+        cache_dates = cache_dates[
+            (cache_dates >= window_start) & (cache_dates <= window_end)
+        ]
+    date_set_match = bool(
+        window_start is not None
+        and set(krx_dates) == set(cache_dates)
+    )
     merged = krx[["date", *select_fields]].merge(
         cache[["date", *select_fields]],
         on="date",
@@ -418,13 +512,17 @@ def compare_price_frames(krx: pd.DataFrame, cache: pd.DataFrame) -> dict[str, An
     ]
     if missing_fields:
         status = "missing_fields"
+    elif merged.empty:
+        status = "no_overlap"
+    elif not date_set_match:
+        status = "date_set_mismatch"
     elif nan_fields:
         status = "nan_in_source"
     else:
         status = "compared"
     diffs: dict[str, float | None] = {}
     for column in COMPARISON_FIELDS:
-        if column in missing_fields or column in nan_fields:
+        if column in missing_fields or column in nan_fields or merged.empty:
             diffs[column] = None
         else:
             diffs[column] = float(
@@ -435,7 +533,66 @@ def compare_price_frames(krx: pd.DataFrame, cache: pd.DataFrame) -> dict[str, An
         "overlap_rows": len(merged),
         "missing_fields": missing_fields,
         "nan_fields": nan_fields,
+        "validation_errors": errors,
+        "date_set_match": date_set_match,
+        "official_calendar_verified": False,
         "diffs": diffs,
+    }
+
+
+def pit_membership_probe(snapshot_probe: list[dict[str, Any]]) -> dict[str, Any]:
+    """스냅샷 캐시가 있으면 ticker 집합을 비교하고, 없으면 부분 검증으로 기록한다."""
+    snapshot_path = ROOT / "data_cache" / "pit_universe" / "pit_universe_snapshots.parquet"
+    if not snapshot_path.exists():
+        return {
+            "status": "partial_no_snapshot_cache",
+            "snapshot_path": str(snapshot_path.relative_to(ROOT)),
+            "ticker_set_comparison": False,
+            "note": (
+                "스냅샷 캐시가 없어 ticker 집합 비교를 수행하지 않았다. "
+                "OHLCV 행 수 일치는 membership 재현성의 부분 근거일 뿐이다."
+            ),
+            "probe_dates": [item.get("date") for item in snapshot_probe],
+        }
+    snapshots = pd.read_parquet(snapshot_path)
+    date_column = "snapshot_date" if "snapshot_date" in snapshots.columns else "date"
+    ticker_column = "ticker" if "ticker" in snapshots.columns else "isu_cd"
+    snapshots[date_column] = pd.to_datetime(snapshots[date_column]).dt.normalize()
+    results = []
+    for item in snapshot_probe:
+        target = pd.Timestamp(item["date"])
+        available = snapshots[snapshots[date_column] <= target]
+        if available.empty:
+            results.append({"date": item["date"], "status": "no_snapshot_asof"})
+            continue
+        asof = available[date_column].max()
+        snapshot_tickers = set(
+            snapshots.loc[snapshots[date_column] == asof, ticker_column].astype(str)
+        )
+        krx_tickers = set(item.get("ohlcv_tickers") or [])
+        comparison = compare_membership(krx_tickers, snapshot_tickers)
+        results.append(
+            {
+                "date": item["date"],
+                "asof_snapshot": str(asof.date()),
+                "status": "compared" if comparison["ticker_set_match"] else "mismatch",
+                **{key: value for key, value in comparison.items() if key != "krx_only"},
+                "krx_only_count": len(comparison["krx_only"]),
+                "snapshot_only_count": len(comparison["snapshot_only"]),
+            }
+        )
+    statuses = [item.get("status") for item in results]
+    return {
+        "status": (
+            "verified" if statuses and all(item == "compared" for item in statuses) else "partial"
+        ),
+        "snapshot_path": str(snapshot_path.relative_to(ROOT)),
+        "ticker_set_comparison": True,
+        "results": [
+            {key: value for key, value in item.items() if key not in {"krx_only", "snapshot_only"}}
+            for item in results
+        ],
+        "note": "스냅샷 as-of ticker 집합과 KRX OHLCV ticker 집합을 비교했다.",
     }
 
 
@@ -449,11 +606,6 @@ def cross_check_cache(prices: pd.DataFrame) -> pd.DataFrame:
         cache = pd.read_parquet(cache_path)
         cache["date"] = pd.to_datetime(cache["date"])
         comparison = compare_price_frames(group, cache)
-        if comparison["overlap_rows"] == 0:
-            rows.append(
-                {"ticker": ticker, "status": "no_overlap", "cache_sha256": file_sha256(cache_path)}
-            )
-            continue
         diffs = comparison["diffs"]
         rows.append(
             {
@@ -467,6 +619,9 @@ def cross_check_cache(prices: pd.DataFrame) -> pd.DataFrame:
                 "max_abs_close_diff": diffs["close"],
                 "max_abs_volume_diff": diffs["volume"],
                 "max_abs_value_diff": diffs["trading_value"],
+                "date_set_match": comparison["date_set_match"],
+                "official_calendar_verified": comparison["official_calendar_verified"],
+                "validation_errors": ";".join(comparison["validation_errors"]) or "none",
                 "cache_sha256": file_sha256(cache_path),
                 "source_independence": "same_origin(KRX via pykrx vs KRX-built cache)",
             }
@@ -878,8 +1033,17 @@ def main() -> int:
     comparison.to_csv(
         OUTPUT_DIR / "cross_source_comparison.csv", index=False, encoding="utf-8-sig"
     )
-    price_status = classify_price_path(pilot_meta, comparison)
+    expected_tickers = {ticker for ticker, _ in PILOT_TICKERS}
+    price_status = classify_price_path(pilot_meta, comparison, expected_tickers)
     snapshot_status = classify_snapshot(snapshots["snapshot_probe"])
+    membership = pit_membership_probe(snapshots["snapshot_probe"])
+    snapshot_output = {
+        **snapshots,
+        "snapshot_probe": [
+            {key: value for key, value in item.items() if key not in {"tickers", "ohlcv_tickers"}}
+            for item in snapshots["snapshot_probe"]
+        ],
+    }
 
     dart = dart_probe()
     sources = source_inventory(
@@ -894,7 +1058,11 @@ def main() -> int:
         [
             {
                 "dataset": "거래일별 ETF 목록",
-                "available": snapshot_status if snapshot_status != "failed" else "not_available",
+                "available": (
+                    "verified_ticker_set"
+                    if membership.get("status") == "verified"
+                    else ("partial_row_count_only" if membership.get("status") == "partial_no_snapshot_cache" else "partial_snapshot_mismatch")
+                ),
                 "basis": "derived:sample_probe",
                 "coverage": "2016-08-01 220종목(OHLCV rows), 2026-07-21 전종목",
                 "fields": "ticker, name, OHLCV, NAV, 거래대금",
@@ -1050,8 +1218,22 @@ def main() -> int:
                 "note": "KRX 외 구조화 원천 미확보. pykrx와 캐시는 동일 원천.",
             },
         },
-        "krx_snapshot_probe": snapshots,
+        "krx_snapshot_probe": snapshot_output,
         "krx_snapshot_status": snapshot_status,
+        "pit_membership": membership,
+        "pilot_completeness": {
+            "expected_tickers": sorted(expected_tickers),
+            "queried_ok": sorted(item["ticker"] for item in pilot_meta if item.get("status") == "ok"),
+            "compared_tickers": sorted(comparison["ticker"].astype(str).tolist())
+            if not comparison.empty
+            else [],
+            "all_expected_queried_and_compared": bool(
+                not comparison.empty
+                and set(comparison["ticker"].astype(str)) == expected_tickers
+                and all(item.get("status") == "ok" for item in pilot_meta)
+                and len(pilot_meta) == len(PILOT_TICKERS)
+            ),
+        },
         "dart_probe": dart,
         "sources": sources.to_dict(orient="records"),
         "blockers": blockers.to_dict(orient="records"),
