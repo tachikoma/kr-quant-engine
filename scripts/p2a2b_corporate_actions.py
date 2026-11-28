@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -244,16 +245,17 @@ def validate_events(events: pd.DataFrame, universe: list[str]) -> list[str]:
         frame["ex_date"].astype(str), errors="coerce", format="%Y-%m-%d"
     )
     amounts = pd.to_numeric(frame["amount_per_share"], errors="coerce")
-    if amounts.isna().any() or (amounts <= 0).any():
+    numeric = amounts.to_numpy(dtype=float)
+    if not np.isfinite(numeric).all() or (numeric <= 0).any():
         issues.append("bad_amount")
     if not dates["record_date"].isna().any() and (dates["payment_date"] < dates["record_date"]).any():
         issues.append("payment_before_record")
     if (
         not dates["record_date"].isna().any()
         and not dates["ex_date"].isna().all()
-        and (dates["ex_date"] > dates["record_date"]).any()
+        and (dates["ex_date"] >= dates["record_date"]).any()
     ):
-        issues.append("ex_after_record")
+        issues.append("ex_not_before_record")
     duplicated = frame.duplicated(subset=["ticker", "record_date"], keep=False)
     if duplicated.any():
         issues.append(f"duplicate_ticker_record:{int(duplicated.sum())}")
@@ -579,16 +581,28 @@ def gate_report_file(report_path: Path, started: str) -> tuple[dict[str, Any], b
         return {}, False, "invalid_json"
     if not isinstance(report, dict):
         return {}, False, "invalid_shape"
+    required = {"status", "approval_valid", "blockers"}
+    if not required.issubset(report) or not isinstance(report.get("blockers"), list):
+        return {}, False, "invalid_shape"
+    status = report.get("status")
+    valid = report.get("approval_valid")
+    if status not in {"APPROVED", "BLOCKED"} or not isinstance(valid, bool):
+        return {}, False, "invalid_shape"
+    if valid != (status == "APPROVED"):
+        return {}, False, "inconsistent_status"
     return report, True, "ok"
 
 
-def run_preflight(ledger_path: Path, manifest_path: Path) -> dict[str, Any]:
+def run_preflight(
+    ledger_path: Path, manifest_path: Path, *, output_root: Path | None = None
+) -> dict[str, Any]:
     """실행별 고유 디렉터리에서 preflight를 돌리고 이번 실행 보고서만 유효 처리한다."""
     import subprocess
     import uuid
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
-    output_dir = OUTPUT_DIR / "approval_preflight" / f"run_{run_id}"
+    root = output_root or OUTPUT_DIR
+    output_dir = root / "approval_preflight" / f"run_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=False)
     command = [
         sys.executable,

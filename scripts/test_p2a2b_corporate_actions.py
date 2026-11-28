@@ -109,6 +109,9 @@ def check_validate_events() -> None:
     bad_amount = good.copy()
     bad_amount.loc[0, "amount_per_share"] = 0
     assert "bad_amount" in ca.validate_events(bad_amount, universe)
+    inf_amount = good.copy()
+    inf_amount.loc[0, "amount_per_share"] = float("inf")
+    assert "bad_amount" in ca.validate_events(inf_amount, universe)
 
     duplicate = pd.concat([good, good.iloc[[0]]], ignore_index=True)
     assert any(
@@ -124,6 +127,12 @@ def check_validate_events() -> None:
     assert any(
         "in_backtest_window_mismatch" in issue
         for issue in ca.validate_events(mismatch, universe)
+    )
+
+    same_day = good.copy()
+    same_day.loc[0, "ex_date"] = same_day.loc[0, "record_date"]
+    assert any(
+        "ex_not_before_record" in issue for issue in ca.validate_events(same_day, universe)
     )
 
     missing_ex = good.copy()
@@ -231,6 +240,22 @@ def check_preflight_report_file() -> None:
         assert (written, reason) == (False, "invalid_json")
 
         path.write_text(json.dumps({"status": "BLOCKED"}), encoding="utf-8")
+        os.utime(path, (now, now))
+        report, written, reason = ca.gate_report_file(path, started)
+        assert (written, reason) == (False, "invalid_shape")
+
+        path.write_text(
+            json.dumps({"status": "BLOCKED", "approval_valid": True, "blockers": []}),
+            encoding="utf-8",
+        )
+        os.utime(path, (now, now))
+        report, written, reason = ca.gate_report_file(path, started)
+        assert (written, reason) == (False, "inconsistent_status")
+
+        path.write_text(
+            json.dumps({"status": "BLOCKED", "approval_valid": False, "blockers": []}),
+            encoding="utf-8",
+        )
         os.utime(path, (now, now))
         report, written, reason = ca.gate_report_file(path, started)
         assert (written, reason) == (True, "ok")
