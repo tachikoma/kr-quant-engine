@@ -375,6 +375,8 @@ def serialize_state(state: dict[str, Any]) -> dict[str, Any]:
                 "amount": str(item.amount),
                 "payment_date": item.payment_date.isoformat(),
                 "paid": bool(item.paid),
+                "tax_amount": str(item.tax_amount),
+                "tax_policy_id": item.tax_policy_id,
             }
             for item in state.get("pending_receivables", ())
         ],
@@ -402,12 +404,16 @@ def serialize_state(state: dict[str, Any]) -> dict[str, Any]:
             for item in state.get("strict_action_blockers", ())
         ],
         "research_only": bool(state.get("research_only")),
+        "tax_policy_id": state.get("tax_policy_id"),
+        "tax_policy_signature": state.get("tax_policy_signature"),
         "corporate_action_ledger_sha256": state.get("corporate_action_ledger_sha256"),
         "final_equity": float(state.get("final_equity", 0.0) or 0.0),
     }
 
 
-def deserialize_state(payload: dict[str, Any], ledger: Any) -> dict[str, Any]:
+def deserialize_state(
+    payload: dict[str, Any], ledger: Any, tax_policy: Any | None = None
+) -> dict[str, Any]:
     """직렬화된 연구 상태를 복원하고 같은 ledger인지 fail-closed로 검증한다."""
     from decimal import Decimal
 
@@ -480,6 +486,8 @@ def deserialize_state(payload: dict[str, Any], ledger: Any) -> dict[str, Any]:
                 Decimal(str(item["amount"])),
                 date.fromisoformat(item["payment_date"]),
                 bool(item["paid"]),
+                Decimal(str(item.get("tax_amount", "0"))),
+                item.get("tax_policy_id"),
             )
             for item in payload.get("pending_receivables", ())
         ),
@@ -507,10 +515,12 @@ def deserialize_state(payload: dict[str, Any], ledger: Any) -> dict[str, Any]:
             for item in payload.get("strict_action_blockers", ())
         ),
         "research_only": bool(payload.get("research_only")),
+        "tax_policy_id": payload.get("tax_policy_id"),
+        "tax_policy_signature": payload.get("tax_policy_signature"),
         "corporate_action_ledger_sha256": payload.get("corporate_action_ledger_sha256"),
         "final_equity": float(payload.get("final_equity", 0.0) or 0.0),
     }
-    _validate_research_state(state, ledger, state["holdings"])
+    _validate_research_state(state, ledger, state["holdings"], tax_policy)
     return state
 
 
