@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,54 @@ POLICY_DOC = {
 }
 
 
+def validate_taxable_base_input(events: pd.DataFrame) -> dict[str, int]:
+    """과세표준액의 누락·NaN·Inf·음수·분배금 초과를 fail-closed로 검증한다."""
+    counts = {
+        "total": len(events),
+        "missing": 0,
+        "nan": 0,
+        "inf": 0,
+        "negative": 0,
+        "excess": 0,
+    }
+    issues: list[str] = []
+    for row in events.itertuples():
+        raw = getattr(row, "taxable_base_per_share", None)
+        label = f"{row.ticker}:{row.record_date}"
+        if raw is None or str(raw).strip() == "":
+            counts["missing"] += 1
+            issues.append(f"{label}:missing")
+            continue
+        try:
+            base = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError):
+            counts["missing"] += 1
+            issues.append(f"{label}:non_numeric")
+            continue
+        if not base.is_finite():
+            if base.is_nan():
+                counts["nan"] += 1
+                issues.append(f"{label}:NaN")
+            else:
+                counts["inf"] += 1
+                issues.append(f"{label}:Inf")
+            continue
+        if base < 0:
+            counts["negative"] += 1
+            issues.append(f"{label}:negative")
+        amount = Decimal(str(row.amount_per_share))
+        if not amount.is_finite():
+            issues.append(f"{label}:invalid_amount")
+        elif amount < 0:
+            issues.append(f"{label}:negative_amount")
+        elif base > amount:
+            counts["excess"] += 1
+            issues.append(f"{label}:excess")
+    if issues:
+        raise ValueError(f"과세표준액 입력 검증 실패: {issues[:10]}")
+    return counts
+
+
 def load_events(p2a2a_dir: Path) -> pd.DataFrame:
     path = p2a2a_dir / "distribution_events.csv"
     provenance_path = p2a2a_dir / "provenance.json"
@@ -132,7 +181,7 @@ def build_tax_ledger(
                 "source_sha256": row.source_sha256,
                 "notes": f"P2-A-2a 실데이터. 최초수집 {row.retrieved_at}",
                 "taxable_base_per_share": base,
-                "tax_policy_id": "" if drop_taxable else POLICY_ID,
+                "tax_policy_id": POLICY_ID,
             }
         )
     pd.DataFrame(rows, columns=LEDGER_COLUMNS).to_csv(ledger_path, index=False)
@@ -222,6 +271,25 @@ def expected_tax(amount: float, base: float, quantity: int, rate: Decimal) -> di
     }
 
 
+def classify_base_type(base: float, amount: float, row: Any) -> str:
+    """비정상 과세표준이 정상 partial로 분류되지 않도록 fail-closed."""
+    if (
+        not math.isfinite(base)
+        or not math.isfinite(amount)
+        or base < 0
+        or base > amount
+    ):
+        raise ValueError(
+            f"비정상 과세표준액의 partial 분류 차단: {row.ticker} {row.record_date} "
+            f"base={base} amount={amount}"
+        )
+    if base == amount:
+        return "equal"
+    if base == 0:
+        return "zero"
+    return "partial"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -236,7 +304,11 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     run_id = ca.dist.utc_now()
     events = load_events(args.p2a2a_dir)
-    in_window = events[events["in_backtest_window"].astype(bool)].reset_index(drop=True)
+    base_validation = validate_taxable_base_input(events)
+    flags = events["in_backtest_window"].map(ca._parse_bool)
+    if flags.isna().any():
+        raise ValueError("비정상 in_backtest_window 값이 있습니다")
+    in_window = events[flags.astype(bool)].reset_index(drop=True)
     price = load_etf_price(["069500", "091160", "091170", "498400"])
     index_df = pd.read_parquet(args.cache_dir / "index.parquet")
     index_df["date"] = pd.to_datetime(index_df["date"])
@@ -256,12 +328,8 @@ def main() -> None:
                 "payment_date": row.payment_date,
                 "amount_per_share": float(row.amount_per_share),
                 "taxable_base_per_share": float(row.taxable_base_per_share),
-                "base_type": (
-                    "equal"
-                    if float(row.taxable_base_per_share) == float(row.amount_per_share)
-                    else "zero"
-                    if float(row.taxable_base_per_share) == 0
-                    else "partial"
+                "base_type": classify_base_type(
+                    float(row.taxable_base_per_share), float(row.amount_per_share), row
                 ),
                 "gross_100": float(values["gross"]),
                 "taxable_100": float(values["taxable"]),
@@ -332,7 +400,28 @@ def main() -> None:
             if pay_idx is not None and pay_idx > 0
             else None
         )
-        trade_count = len(run["trades"])
+        trades_df = run["trades"]
+        trade_count = len(trades_df)
+        # engine_net_match는 무체결 시나리오 전용이다. 체결이 있는 매도/매수는
+        # 아래 sell_before_payment_* / buy_on_ex_no_entitlement로 별도 검증한다.
+        sell_rows = trades_df[trades_df["side"] == "SELL"] if trade_count else trades_df
+        buy_rows = trades_df[trades_df["side"] == "BUY"] if trade_count else trades_df
+        sell_qty = int(sell_rows["qty"].sum()) if len(sell_rows) else 0
+        buy_qty = int(buy_rows["qty"].sum()) if len(buy_rows) else 0
+        sell_dates = (
+            [pd.Timestamp(value).date().isoformat() for value in sell_rows["date"]]
+            if len(sell_rows)
+            else []
+        )
+        buy_dates = (
+            [pd.Timestamp(value).date().isoformat() for value in buy_rows["date"]]
+            if len(buy_rows)
+            else []
+        )
+        receivable_rows = curve[curve["receivables"] > 0]
+        first_receivable = (
+            float(receivable_rows.iloc[0]["receivables"]) if len(receivable_rows) else 0.0
+        )
         net_match = (
             trade_count == 0
             and receivable_on_ex is not None
@@ -366,6 +455,11 @@ def main() -> None:
                 "cash_before_payment": cash_before,
                 "cash_on_payment": cash_on_pay,
                 "cash_delta_on_payment": cash_delta_on_pay,
+                "first_receivable": first_receivable,
+                "sell_qty": sell_qty,
+                "sell_dates": sell_dates,
+                "buy_qty": buy_qty,
+                "buy_dates": buy_dates,
                 "engine_net_match": net_match,
                 "trades": trade_count,
             }
@@ -516,6 +610,34 @@ def main() -> None:
             < scenario_rows[1]["expected_gross"] * 0.154
         ),
         "pre_tax_no_withholding": scenario_rows[3]["expected_withholding"] == 0.0,
+        "sell_before_payment_entitlement": (
+            scenario_rows[4]["sell_qty"] == 1000
+            and all(
+                pd.Timestamp(value).date() < pd.Timestamp("2026-09-02").date()
+                for value in scenario_rows[4]["sell_dates"]
+            )
+            and abs(
+                scenario_rows[4]["first_receivable"]
+                - scenario_rows[4]["expected_net"]
+            )
+            < 1e-6
+        ),
+        "sell_before_payment_net_paid": (
+            scenario_rows[4]["cash_delta_on_payment"] is not None
+            and abs(
+                scenario_rows[4]["cash_delta_on_payment"]
+                - scenario_rows[4]["expected_net"]
+            )
+            < 1e-6
+        ),
+        "buy_on_ex_no_entitlement": (
+            scenario_rows[5]["buy_qty"] > 0
+            and "2026-08-28" in scenario_rows[5]["buy_dates"]
+            and scenario_rows[5]["receivable_on_ex"] == 0.0
+            and scenario_rows[5]["first_receivable"] == 0.0
+            and scenario_rows[5]["cash_delta_on_payment"] == 0.0
+            and scenario_rows[5]["expected_withholding"] == 0.0
+        ),
         "missing_taxable_blocked": missing_blocked,
         "different_policy_restore_blocked": policy_mismatch_blocked,
         "restart_before_payment_net_match": all(
@@ -534,6 +656,7 @@ def main() -> None:
         "policy": POLICY_DOC,
         "events_total": len(events),
         "events_in_window": len(in_window),
+        "taxable_base_input_validation": base_validation,
         "event_type_counts": comparison["base_type"].value_counts().to_dict(),
         "comparison_totals": {
             "withholding_gross": float(comparison["withholding_gross_100"].sum()),

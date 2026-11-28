@@ -96,10 +96,12 @@ def check_receivable_tax() -> None:
     again, cash_again = process_distribution_payment(paid, date(2026, 9, 18))
     assert cash_again == 0 and again.paid is True
 
-    # 과세표준 누락은 fail-closed
+    # 과세표준 누락은 fail-closed (정책 ID는 일치시켜 누락 검증에 도달)
+    missing_base = _action(None)
+    object.__setattr__(missing_base, "tax_policy_id", tax.POLICY_ID)
     try:
         create_distribution_receivable(
-            _action(None),
+            missing_base,
             100,
             held_on_record_date=True,
             held_on_ex_date=True,
@@ -302,6 +304,99 @@ def check_research_seam_required() -> None:
         raise AssertionError("세금 정책이 승인 경로로 유출되었습니다")
 
 
+def check_policy_id_match() -> None:
+    # 이벤트 정책 ID가 실행 정책과 다르면 차단
+    wrong = _action()
+    object.__setattr__(wrong, "tax_policy_id", "other_policy")
+    try:
+        create_distribution_receivable(
+            wrong, 100, held_on_record_date=True, held_on_ex_date=True, tax_policy=tax.POLICY
+        )
+    except CorporateActionBlocked as exc:
+        assert exc.blocker.code == "TAX_POLICY_MISMATCH"
+    else:
+        raise AssertionError("정책 ID 불일치가 차단되지 않았습니다")
+
+    # 이벤트에 정책 ID가 없어도 차단
+    missing = _action()
+    object.__setattr__(missing, "tax_policy_id", None)
+    try:
+        create_distribution_receivable(
+            missing, 100, held_on_record_date=True, held_on_ex_date=True, tax_policy=tax.POLICY
+        )
+    except CorporateActionBlocked as exc:
+        assert exc.blocker.code == "TAX_POLICY_MISMATCH"
+    else:
+        raise AssertionError("정책 ID 누락이 차단되지 않았습니다")
+
+
+def check_direct_call_taxable_base() -> None:
+    # loader를 거치지 않은 직접 호출에서 비정상 과세표준을 차단
+    for bad in [
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal(-1),
+        Decimal(301),
+    ]:
+        action = _action(bad)
+        try:
+            create_distribution_receivable(
+                action, 100, held_on_record_date=True, held_on_ex_date=True, tax_policy=tax.POLICY
+            )
+        except CorporateActionBlocked as exc:
+            assert exc.blocker.code == "INVALID_TAXABLE_BASE"
+        else:
+            raise AssertionError(f"직접 호출 비정상 과세표준이 통과했습니다: {bad}")
+
+
+def check_input_validation() -> None:
+    # 정상 74건 형태는 통과
+    good = pd.DataFrame(
+        {
+            "ticker": ["498400", "091170"],
+            "record_date": ["2026-09-15", "2026-10-30"],
+            "amount_per_share": [300.0, 53.0],
+            "taxable_base_per_share": [2.0, 0.0],
+        }
+    )
+    counts = tax.validate_taxable_base_input(good)
+    assert counts["total"] == 2 and counts["excess"] == 0
+
+    # 누락/NaN/Inf/음수/초과는 fail-closed
+    for bad in [None, float("nan"), float("inf"), -1.0, 301.0]:
+        frame = good.copy()
+        frame.loc[0, "taxable_base_per_share"] = bad
+        try:
+            tax.validate_taxable_base_input(frame)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"비정상 입력이 통과했습니다: {bad}")
+
+    # 음수 분배금도 차단
+    negative_amount = good.copy()
+    negative_amount.loc[0, "amount_per_share"] = -300.0
+    try:
+        tax.validate_taxable_base_input(negative_amount)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("음수 분배금이 통과했습니다")
+
+    # 비정상값이 partial로 분류되지 않음
+    row = SimpleNamespace(ticker="498400", record_date="2026-09-15")
+    for bad in [float("nan"), float("inf"), -1.0, 301.0]:
+        try:
+            tax.classify_base_type(bad, 300.0, row)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"비정상값이 partial로 분류되었습니다: {bad}")
+    assert tax.classify_base_type(2.0, 300.0, row) == "partial"
+    assert tax.classify_base_type(0.0, 53.0, row) == "zero"
+    assert tax.classify_base_type(300.0, 300.0, row) == "equal"
+
+
 def main() -> None:
     checks = [
         ("tax policy validation", check_tax_policy_validation),
@@ -312,6 +407,9 @@ def main() -> None:
         ("serialization roundtrip", check_serialization_roundtrip),
         ("taxable base bounds", check_taxable_base_bounds),
         ("research seam required", check_research_seam_required),
+        ("event policy id match", check_policy_id_match),
+        ("direct-call taxable base", check_direct_call_taxable_base),
+        ("input validation", check_input_validation),
     ]
     for name, check in checks:
         try:

@@ -1208,6 +1208,8 @@ def _validate_research_state(
         if type(receivable.paid) is not bool:
             raise TypeError("미수금 paid는 boolean이어야 합니다")
         if tax_policy is not None:
+            if event.tax_policy_id != tax_policy.policy_id:
+                raise ValueError("ledger 이벤트의 세금 정책이 현재 정책과 다릅니다")
             if receivable.tax_policy_id != tax_policy.policy_id:
                 raise ValueError("미수금의 세금 정책이 현재 정책과 다릅니다")
             if event.taxable_base_per_share is None:

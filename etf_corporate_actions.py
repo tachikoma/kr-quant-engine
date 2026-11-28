@@ -327,6 +327,23 @@ def _decimal(value: object, field: str) -> Decimal | None:
     return parsed
 
 
+def _taxable_base_issues(
+    taxable_base: Decimal | None, cash_amount: Decimal | None
+) -> list[str]:
+    """과세표준액의 비정상 값을 검증한다(loader/직접 호출 공용)."""
+    issues: list[str] = []
+    if taxable_base is None:
+        return issues
+    if not isinstance(taxable_base, Decimal) or not taxable_base.is_finite():
+        issues.append("taxable_base_per_share must be a finite Decimal")
+        return issues
+    if taxable_base < 0:
+        issues.append("taxable_base_per_share must not be negative")
+    if cash_amount is not None and taxable_base > cash_amount:
+        issues.append("taxable_base_per_share must not exceed cash_amount")
+    return issues
+
+
 def _integer(value: object, field: str) -> int | None:
     parsed = _decimal(value, field)
     if parsed is None:
@@ -370,16 +387,9 @@ def _event_from_row(row: Mapping[str, str]) -> tuple[CorporateAction, list[Appro
     ratio_den = _integer(row.get("ratio_den"), "ratio_den")
     cash_amount = _decimal(row.get("cash_amount"), "cash_amount")
     taxable_base = _decimal(row.get("taxable_base_per_share"), "taxable_base_per_share")
-    if taxable_base is not None and taxable_base < 0:
-        raise CorporateActionValidationError("taxable_base_per_share must not be negative")
-    if (
-        taxable_base is not None
-        and cash_amount is not None
-        and taxable_base > cash_amount
-    ):
-        raise CorporateActionValidationError(
-            "taxable_base_per_share must not exceed cash_amount"
-        )
+    base_issues = _taxable_base_issues(taxable_base, cash_amount)
+    if base_issues:
+        raise CorporateActionValidationError("; ".join(base_issues))
     currency = _text(row.get("currency"))
     if currency not in {None, "KRW"}:
         raise CorporateActionValidationError("currency must be KRW")
@@ -698,9 +708,23 @@ def create_distribution_receivable(
         )
     tax_amount = Decimal(0)
     if tax_policy is not None:
+        if action.tax_policy_id != tax_policy.policy_id:
+            raise CorporateActionBlocked(
+                _blocker(
+                    "TAX_POLICY_MISMATCH",
+                    "event tax_policy_id does not match the execution tax policy",
+                    action,
+                )
+            )
         if action.taxable_base_per_share is None:
             raise CorporateActionBlocked(
                 _blocker("MISSING_TAXABLE_BASE", "taxable base is required for tax policy", action)
+            )
+        # loader를 거치지 않은 직접 호출에서도 비정상 과세표준을 차단한다.
+        base_issues = _taxable_base_issues(action.taxable_base_per_share, action.cash_amount)
+        if base_issues:
+            raise CorporateActionBlocked(
+                _blocker("INVALID_TAXABLE_BASE", "; ".join(base_issues), action)
             )
         tax_amount = quantity * action.taxable_base_per_share * tax_policy.rate
     return DistributionReceivable(

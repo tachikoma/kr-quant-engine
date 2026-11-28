@@ -32,7 +32,7 @@
 
 ## 3. 실제 변경 범위
 
-- `etf_corporate_actions.py`: `TaxPolicy`, `taxable_base_per_share`/`tax_policy_id`, `DistributionReceivable.tax_amount`, 지급 시 세후 현금, legacy canonical hash 호환(과세 필드는 값이 있을 때만 해시에 포함).
+- `etf_corporate_actions.py`: `TaxPolicy`, `taxable_base_per_share`/`tax_policy_id`, `DistributionReceivable.tax_amount`, 지급 시 세후 현금, legacy canonical hash 호환(과세 필드는 값이 있을 때만 해시에 포함). 이벤트 `tax_policy_id`와 실행 정책 ID 불일치 차단, loader 우회 직접 호출에서도 NaN/Inf/음수/분배금 초과 과세표준 차단.
 - `run_etf_backtest.py`: `distribution_tax_policy` 연구 인자(기본 `None` → 기존 세전 경로 동일), 미수금 평가액을 세후로 계산, 다른 세금 정책 상태 복원 차단.
 - `scripts/p2a2d1_distribution_accounting.py`: 직렬화에 세금 필드 추가(하위 호환).
 - 신규 harness·fixture·문서.
@@ -67,6 +67,8 @@
 | 세전 경로(정책 None) | 300,000 | - | 0 | 300,000 | 기존 총액 경로와 동일 |
 
 - E2E 검사는 기대값 부등식이 아니라 **엔진 실측값**(배당락일 미수금·지급일 현금 증가분)을 기대 세후액과 대조합니다. 4개 무체결 시나리오 전부 일치(최대 차이 <1e-6).
+- 매도 시나리오: 091170 1,000좌를 배당락일(08-28) 이후 08-31에 매도했으나 권리(세후 미수금 49,914원)는 유지, 지급일(09-02)에 현금 49,914원이 정확히 입금.
+- 배당락일 매수 시나리오: 08-28에 31좌 매수했으나 미수금·원천징수·분배금 현금 증가 모두 0으로 권리 미발생을 명시 검증.
 - 과세표준 누락은 `MISSING_TAXABLE_BASE` blocker로 fail-closed, 다른 정책 상태 복원은 차단됩니다.
 
 ## 7. 상태 복원·중복 과세
@@ -98,10 +100,11 @@
 
 ## 11. 테스트·리뷰
 
-- `scripts/test_p2a2d2_distribution_tax.py` 8개 PASS: 정책 검증, 미수금 세액, 0 vs 누락, canonical hash 호환, 정책 복원 차단(다른 ID·같은 ID 다른 세율), 직렬화 왕복, 과세표준 상한, 연구 seam 필수.
-- `outputs_p2a2d2/pilot_validation.json` 11개 검사 PASS(엔진 실측 대조 4건 포함).
+- `scripts/test_p2a2d2_distribution_tax.py` 11개 PASS: 정책 검증, 미수금 세액, 0 vs 누락, canonical hash 호환, 정책 복원 차단(다른 ID·같은 ID 다른 세율), 직렬화 왕복, 과세표준 상한, 연구 seam 필수, 이벤트 정책 ID 일치, 직접 호출 과세표준 검증, 전체 입력 검증.
+- `outputs_p2a2d2/pilot_validation.json` 14개 검사 PASS(엔진 실측 대조 4건 + 매도 후 지급·배당락일 매수 제외 3건 포함).
 - 회귀 PASS: p2a2d1, p2a2b, corporate_actions, approval_outputs, backtest_integrity, total_return, pit_universe.
-- Codex 독립 리뷰 3건(P1 승인 경로 유출, P2 같은 ID 다른 세율 복원, P2 E2E 실측 미검증) 모두 수정 후 재리뷰.
+- Codex 독립 리뷰 3건(P1 승인 경로 유출, P2 같은 ID 다른 세율 복원, P2 E2E 실측 미검증) 모두 수정. Codex 재리뷰는 사용량 한도로 불가(새 세션·지원 모델 2종 동일 오류)하여 **Codex 최종 APPROVE는 없음**.
+- 독립 리뷰 @oracle(Iceman Free, `opencode/iceman-free`) 2회: 1차 P1(별칭 오인)·P2(음수 분배금) 지적 → P1 철회, P2 수정 후 **재판정 APPROVE**. 검증 범위는 미커밋 5개 파일 read-only, 전체 백테스트·네트워크·파일 수정 없음.
 
 ## 12. 한계
 
