@@ -42,6 +42,9 @@ CSV_COLUMNS = (
     "source_sha256",
     "notes",
 )
+TAX_COLUMNS = ("taxable_base_per_share", "tax_policy_id")
+LEGACY_CSV_COLUMNS = CSV_COLUMNS
+CSV_COLUMNS = LEGACY_CSV_COLUMNS + TAX_COLUMNS
 COMMON_COLUMNS = {"event_id", "ticker", "event_type", "event_date"}
 
 
@@ -135,6 +138,27 @@ class CorporateAction:
     source_url: str | None = None
     source_sha256: str | None = None
     notes: str = ""
+    taxable_base_per_share: Decimal | None = None
+    tax_policy_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TaxPolicy:
+    """연구용 명시 세율 정책. 범용 세금 엔진이 아니다."""
+
+    policy_id: str
+    rate: Decimal
+    basis: str = "taxable_base"
+
+    def __post_init__(self) -> None:
+        if not self.policy_id.strip():
+            raise CorporateActionValidationError("tax policy_id is required")
+        if not isinstance(self.rate, Decimal) or not self.rate.is_finite():
+            raise CorporateActionValidationError("tax rate must be a finite Decimal")
+        if not (Decimal(0) <= self.rate <= Decimal(1)):
+            raise CorporateActionValidationError("tax rate must be between 0 and 1")
+        if self.basis != "taxable_base":
+            raise CorporateActionValidationError("unsupported tax basis")
 
 
 @dataclass(frozen=True)
@@ -154,6 +178,8 @@ class DistributionReceivable:
     amount: Decimal
     payment_date: date
     paid: bool = False
+    tax_amount: Decimal = Decimal(0)
+    tax_policy_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +369,17 @@ def _event_from_row(row: Mapping[str, str]) -> tuple[CorporateAction, list[Appro
     ratio_num = _integer(row.get("ratio_num"), "ratio_num")
     ratio_den = _integer(row.get("ratio_den"), "ratio_den")
     cash_amount = _decimal(row.get("cash_amount"), "cash_amount")
+    taxable_base = _decimal(row.get("taxable_base_per_share"), "taxable_base_per_share")
+    if taxable_base is not None and taxable_base < 0:
+        raise CorporateActionValidationError("taxable_base_per_share must not be negative")
+    if (
+        taxable_base is not None
+        and cash_amount is not None
+        and taxable_base > cash_amount
+    ):
+        raise CorporateActionValidationError(
+            "taxable_base_per_share must not exceed cash_amount"
+        )
     currency = _text(row.get("currency"))
     if currency not in {None, "KRW"}:
         raise CorporateActionValidationError("currency must be KRW")
@@ -365,6 +402,8 @@ def _event_from_row(row: Mapping[str, str]) -> tuple[CorporateAction, list[Appro
         ratio_den=ratio_den,
         cash_amount=cash_amount,
         currency=currency,
+        taxable_base_per_share=taxable_base,
+        tax_policy_id=_text(row.get("tax_policy_id")),
         source_document_id=_text(row.get("source_document_id")),
         source_document=_text(row.get("source_document")),
         source_url=_text(row.get("source_url")),
@@ -444,10 +483,18 @@ def _canonical_value(value: object) -> str | None:
 
 
 def _event_payload(event: CorporateAction) -> dict[str, str | None]:
-    return {
-        column: _canonical_value(getattr(event, column))
-        for column in CSV_COLUMNS
+    # 기존 17개 열은 그대로 유지해 legacy canonical hash를 보존한다.
+    payload = {
+        column: _canonical_value(getattr(event, column)) for column in LEGACY_CSV_COLUMNS
     }
+    if event.taxable_base_per_share is not None or event.tax_policy_id is not None:
+        payload.update(
+            {
+                column: _canonical_value(getattr(event, column))
+                for column in TAX_COLUMNS
+            }
+        )
+    return payload
 
 
 def canonical_ledger_sha256(events: Iterable[CorporateAction]) -> str:
@@ -636,6 +683,7 @@ def create_distribution_receivable(
     *,
     held_on_record_date: bool,
     held_on_ex_date: bool = True,
+    tax_policy: TaxPolicy | None = None,
 ) -> DistributionReceivable | None:
     """Create a receivable only for documented record/ex-date entitlement."""
     if action.event_type != EventType.CASH_DISTRIBUTION:
@@ -648,12 +696,22 @@ def create_distribution_receivable(
         raise CorporateActionBlocked(
             _blocker("MISSING_PAYMENT_DATE", "distribution payment date and amount are required", action)
         )
+    tax_amount = Decimal(0)
+    if tax_policy is not None:
+        if action.taxable_base_per_share is None:
+            raise CorporateActionBlocked(
+                _blocker("MISSING_TAXABLE_BASE", "taxable base is required for tax policy", action)
+            )
+        tax_amount = quantity * action.taxable_base_per_share * tax_policy.rate
     return DistributionReceivable(
         action.event_id,
         action.ticker,
         quantity,
         action.cash_amount * quantity,
         action.payment_date,
+        False,
+        tax_amount,
+        tax_policy.policy_id if tax_policy is not None else None,
     )
 
 
@@ -666,7 +724,7 @@ def process_distribution_payment(
         return receivable, Decimal(0)
     if _date(payment_date, "payment date") < receivable.payment_date:
         return receivable, Decimal(0)
-    return replace(receivable, paid=True), receivable.amount
+    return replace(receivable, paid=True), receivable.amount - receivable.tax_amount
 
 
 def process_pending_receivables(

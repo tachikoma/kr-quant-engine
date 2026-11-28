@@ -67,8 +67,9 @@ def _action(
 
 def _row(action: CorporateAction) -> dict[str, str]:
     row = {}
+    payload = _event_payload(action)
     for column in CSV_COLUMNS:
-        value = _event_payload(action)[column]
+        value = payload.get(column)
         row[column] = "" if value is None else value
     return row
 

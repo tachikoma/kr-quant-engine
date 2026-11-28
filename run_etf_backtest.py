@@ -37,6 +37,7 @@ from etf_corporate_actions import (
     EventType,
     HoldingState,
     LifecycleState,
+    TaxPolicy,
     apply_lifecycle_event,
     create_distribution_receivable,
     final_approval_report,
@@ -1131,6 +1132,12 @@ def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame
 
 
 
+def _tax_policy_signature(policy: TaxPolicy | None) -> str | None:
+    if policy is None:
+        return None
+    return f"{policy.policy_id}|{policy.rate}|{policy.basis}"
+
+
 # 연구 seam(allow_partial_ledger)이 허용하는 blocker는 coverage 부족뿐이다.
 PARTIAL_LEDGER_ALLOWED_BLOCKERS = frozenset({"INCOMPLETE_COVERAGE"})
 
@@ -1139,6 +1146,7 @@ def _validate_research_state(
     state: Mapping[str, Any],
     ledger: CorporateActionLedger,
     holdings: Mapping[str, int],
+    tax_policy: TaxPolicy | None = None,
 ) -> None:
     """복원 상태가 같은 ledger·보유·이벤트를 가리키는지 fail-closed로 검증한다."""
     events = {event.event_id: event for event in ledger.events}
@@ -1159,6 +1167,14 @@ def _validate_research_state(
         return
     if type(state.get("research_only")) is not bool:
         raise TypeError("research_only는 boolean이어야 합니다")
+    state_policy = state.get("tax_policy_id")
+    if tax_policy is not None:
+        if state_policy != tax_policy.policy_id:
+            raise ValueError("다른 세금 정책의 상태는 복원할 수 없습니다")
+        if state.get("tax_policy_signature") != _tax_policy_signature(tax_policy):
+            raise ValueError("같은 정책 ID라도 세율·과세기준이 다르면 복원할 수 없습니다")
+    elif state_policy is not None:
+        raise ValueError("세전 실행에 세금 정책 상태를 복원할 수 없습니다")
     state_sha = state.get("corporate_action_ledger_sha256")
     if not state_sha:
         raise ValueError("기업행위 상태에 ledger 식별 정보가 없습니다")
@@ -1191,6 +1207,20 @@ def _validate_research_state(
             raise TypeError("미수금 수량이 정수가 아닙니다")
         if type(receivable.paid) is not bool:
             raise TypeError("미수금 paid는 boolean이어야 합니다")
+        if tax_policy is not None:
+            if receivable.tax_policy_id != tax_policy.policy_id:
+                raise ValueError("미수금의 세금 정책이 현재 정책과 다릅니다")
+            if event.taxable_base_per_share is None:
+                raise ValueError("미수금 이벤트에 과세표준액이 없습니다")
+            expected_tax = (
+                Decimal(str(receivable.quantity))
+                * event.taxable_base_per_share
+                * tax_policy.rate
+            )
+            if receivable.tax_amount != expected_tax:
+                raise ValueError("미수금 원천징수액이 과세표준×세율과 다릅니다")
+        elif receivable.tax_amount != 0 or receivable.tax_policy_id is not None:
+            raise ValueError("세전 실행에 과세된 미수금을 복원할 수 없습니다")
         if receivable.quantity <= 0:
             raise ValueError("미수금 수량이 0 이하입니다")
         if receivable.payment_date is None or receivable.payment_date != event.payment_date:
@@ -1270,6 +1300,7 @@ def run_etf_strategy(
     approval_strict: bool = False,
     corporate_action_ledger: CorporateActionLedger | None = None,
     allow_partial_ledger: bool = False,
+    distribution_tax_policy: TaxPolicy | None = None,
     execution_mode: str = "legacy",
     participation_rate: float = 0.05,
     daily_risk_off_exit: bool = False,
@@ -1290,6 +1321,8 @@ def run_etf_strategy(
         allow_partial_ledger: **연구 전용**. manifest coverage가 PARTIAL이어도 strict
             회계 경로를 실행하되, 승인 결과로는 사용할 수 없다. ``approval_strict``와
             ledger가 함께 있을 때만 허용된다.
+        distribution_tax_policy: **연구 전용** 명시 세율 정책. ``None``이면 기존 세전
+            회계 경로와 완전히 동일하다.
         execution_mode: ``legacy`` or opt-in ``ohlcv_capacity`` scenario.
         participation_rate: OHLCV capacity participation fraction.
         daily_risk_off_exit: 연구용 opt-in. 매 거래일 KOSPI risk 신호를 확인해
@@ -1348,6 +1381,10 @@ def run_etf_strategy(
         raise ValueError(
             "allow_partial_ledger는 approval_strict와 corporate_action_ledger가 함께 있어야 합니다."
         )
+    if distribution_tax_policy is not None and not allow_partial_ledger:
+        raise ValueError(
+            "분배금 세금 정책은 연구 seam(allow_partial_ledger)에서만 사용할 수 있습니다"
+        )
     if initial_state and initial_state.get("research_only") and not allow_partial_ledger:
         raise ValueError(
             "research_only 상태는 allow_partial_ledger 연구 실행에서만 복원할 수 있습니다"
@@ -1371,7 +1408,10 @@ def run_etf_strategy(
             )
     if initial_state and approval_strict and corporate_action_ledger is not None:
         _validate_research_state(
-            initial_state, corporate_action_ledger, initial_state.get("holdings", {})
+            initial_state,
+            corporate_action_ledger,
+            initial_state.get("holdings", {}),
+            distribution_tax_policy,
         )
     if approval_strict and corporate_action_ledger is not None:
         ledger_report = corporate_action_ledger.approval_report()
@@ -2103,7 +2143,13 @@ def run_etf_strategy(
                 )
 
     def _strict_unpaid_receivables() -> float:
-        return float(sum(receivable.amount for receivable in pending_receivables if not receivable.paid))
+        return float(
+            sum(
+                receivable.amount - receivable.tax_amount
+                for receivable in pending_receivables
+                if not receivable.paid
+            )
+        )
 
     def _strict_process_actions(as_of: pd.Timestamp) -> float:
         """Apply ledger events and pay receivables before today's decisions."""
@@ -2187,6 +2233,7 @@ def run_etf_strategy(
                             entitlement_quantity,
                             held_on_record_date=int(record_holdings.get(ticker, 0) or 0) > 0,
                             held_on_ex_date=entitlement_quantity > 0,
+                            tax_policy=distribution_tax_policy,
                         )
                         if entitlement_quantity > 0
                         else None
@@ -2925,6 +2972,12 @@ def run_etf_strategy(
                         if corporate_action_ledger is not None
                         else None
                     ),
+                    "tax_policy_id": (
+                        distribution_tax_policy.policy_id
+                        if distribution_tax_policy is not None
+                        else None
+                    ),
+                    "tax_policy_signature": _tax_policy_signature(distribution_tax_policy),
                     "strict_action_blockers": tuple(strict_action_blockers),
                     "approval_stale_tickers": sorted(final_stale_tickers),
                     "blocked_orders": blocked_orders,
@@ -3411,6 +3464,7 @@ def run_single_mode(
     approval_strict: bool = False,
     corporate_action_ledger: CorporateActionLedger | None = None,
     allow_partial_ledger: bool = False,
+    distribution_tax_policy: TaxPolicy | None = None,
     initial_cash: float = INITIAL_CASH,
     execution_mode: str = "legacy",
     execution_participation_rate: float = 0.05,
@@ -3435,6 +3489,7 @@ def run_single_mode(
         approval_strict=approval_strict,
         corporate_action_ledger=corporate_action_ledger,
         allow_partial_ledger=allow_partial_ledger,
+        distribution_tax_policy=distribution_tax_policy,
         return_final_state=wants_final_state,
         execution_mode=execution_mode,
         participation_rate=execution_participation_rate,
