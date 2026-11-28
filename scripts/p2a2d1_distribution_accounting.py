@@ -418,6 +418,44 @@ def deserialize_state(payload: dict[str, Any], ledger: Any) -> dict[str, Any]:
         LifecycleState,
     )
 
+    required = (
+        "cash",
+        "holdings",
+        "holding_cost_basis",
+        "holding_peak_closes",
+        "last_valid_closes",
+        "pending_receivables",
+        "processed_action_ids",
+        "corporate_action_states",
+        "strict_action_blockers",
+        "research_only",
+        "corporate_action_ledger_sha256",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(f"재시작 상태 필수 필드 누락: {missing}")
+    if type(payload.get("research_only")) is not bool:
+        raise TypeError("research_only는 boolean이어야 합니다")
+    for ticker, quantity in payload["holdings"].items():
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise TypeError(f"보유수량이 정수가 아닙니다: {ticker}={quantity!r}")
+    receivable_ids = [item["event_id"] for item in payload.get("pending_receivables", ())]
+    if len(receivable_ids) != len(set(receivable_ids)):
+        raise ValueError("중복 미수금 이벤트가 있습니다")
+    processed_payload = [str(x) for x in payload.get("processed_action_ids", ())]
+    if len(processed_payload) != len(set(processed_payload)):
+        raise ValueError("중복 processed action id가 있습니다")
+    state_tickers = [item["ticker"] for item in payload.get("corporate_action_states", ())]
+    if len(state_tickers) != len(set(state_tickers)):
+        raise ValueError("중복 기업행위 상태 키가 있습니다")
+    for item in payload.get("pending_receivables", ()):
+        if isinstance(item.get("quantity"), bool) or not isinstance(item.get("quantity"), int):
+            raise TypeError("미수금 수량이 정수가 아닙니다")
+        if type(item.get("paid")) is not bool:
+            raise TypeError("미수금 paid는 boolean이어야 합니다")
+    for item in payload.get("corporate_action_states", ()):
+        if isinstance(item.get("quantity"), bool) or not isinstance(item.get("quantity"), int):
+            raise TypeError("기업행위 상태 수량이 정수가 아닙니다")
     state = {
         "cash": float(payload["cash"]),
         "holdings": {str(k): int(v) for k, v in payload["holdings"].items()},
@@ -596,20 +634,26 @@ def main() -> None:
             }
         )
 
-    # 분할 실행 연속성
+    # 분할 실행 연속성: 리밸런싱 위상이 맞는 경계(20거래일)에서 자른다.
     continuity_rows: list[dict[str, Any]] = []
-    single = runs["hold_before_ex"]
+    all_dates = [d for d in index_df["date"] if d <= pd.Timestamp("2026-09-10")]
     segments = [
-        ("split_before_payment", ("2026-08-24", "2026-08-31"), ("2026-09-01", "2026-09-04")),
-        ("split_after_payment", ("2026-08-24", "2026-09-02"), ("2026-09-03", "2026-09-04")),
+        ("split_before_payment", "2026-09-01"),
+        ("split_after_payment", "2026-09-03"),
     ]
-    for label, first_window, second_window in segments:
-        first_ledger = scenario_ledger(
-            full, ["091170"], date(2026, 8, 1), date(2026, 9, 10), f"{label}_a"
+    for label, second_start in segments:
+        split_day = pd.Timestamp(second_start)
+        split_index = all_dates.index(split_day)
+        aligned_start = all_dates[split_index - 20]
+        first_window = (
+            aligned_start.date().isoformat(),
+            all_dates[split_index - 1].date().isoformat(),
         )
-        second_ledger = scenario_ledger(
-            full, ["091170"], date(2026, 8, 1), date(2026, 9, 10), f"{label}_b"
-        )
+        second_window = (second_start, "2026-09-04")
+        ledger_start = (aligned_start - pd.Timedelta(days=10)).date()
+        ledger_end = date(2026, 9, 10)
+        first_ledger = scenario_ledger(full, ["091170"], ledger_start, ledger_end, f"{label}_a")
+        second_ledger = scenario_ledger(full, ["091170"], ledger_start, ledger_end, f"{label}_b")
         part_a = engine_run(
             window=first_window,
             initial_cash=0.0,
@@ -621,11 +665,25 @@ def main() -> None:
             ledger=first_ledger,
             use_market_filter=False,
         )
+        single_run = engine_run(
+            window=(aligned_start.date().isoformat(), second_window[1]),
+            initial_cash=0.0,
+            holdings={"091170": 1000},
+            cost_basis={"091170": 16_000.0},
+            universe=["091170"],
+            price=price[price["ticker"] == "091170"],
+            index_df=index_df,
+            ledger=first_ledger,
+            use_market_filter=False,
+        )
         restored = part_a["final"]
-        # part_a 상태에서 재시작한다(엔진 initial_state 경로).
         payload = json.loads(json.dumps(serialize_state(restored)))
         init_state = deserialize_state(payload, second_ledger)
-        dates_b = [d for d in index_df["date"] if pd.Timestamp(second_window[0]) <= d <= pd.Timestamp(second_window[1])]
+        dates_b = [
+            d
+            for d in index_df["date"]
+            if pd.Timestamp(second_window[0]) <= d <= pd.Timestamp(second_window[1])
+        ]
         resumed = run_etf_strategy(
             0.0,
             dates_b,
@@ -640,18 +698,39 @@ def main() -> None:
             return_final_state=True,
         )
         resumed_trades, resumed_final = resumed[1], resumed[-1]
-        single_sig = state_signature(single["final"])
+        single_sig = state_signature(single_run["final"])
         resumed_sig = state_signature(resumed_final)
         combined_trades = pd.concat([part_a["trades"], resumed_trades], ignore_index=True)
         same_trades = combined_trades.sort_values(["date", "ticker", "side", "qty"]).reset_index(
             drop=True
         ).equals(
-            single["trades"].sort_values(["date", "ticker", "side", "qty"]).reset_index(drop=True)
+            single_run["trades"].sort_values(["date", "ticker", "side", "qty"]).reset_index(drop=True)
         )
+        single_curve = single_run["curve"].set_index("date")
+        daily_equity_diff = 0.0
+        daily_cash_diff = 0.0
+        daily_mv_diff = 0.0
+        for row in resumed[0].itertuples():
+            day = pd.Timestamp(row.date)
+            if day not in single_curve.index:
+                continue
+            reference = single_curve.loc[day]
+            daily_equity_diff = max(daily_equity_diff, abs(float(row.equity) - float(reference["equity"])))
+            daily_cash_diff = max(daily_cash_diff, abs(float(row.cash) - float(reference["cash"])))
+            daily_mv_diff = max(
+                daily_mv_diff, abs(float(row.market_value) - float(reference["market_value"]))
+            )
+        phase_aligned = (split_index - all_dates.index(aligned_start)) % 20 == 0
         continuity_rows.append(
             {
                 "scenario": label,
                 "split_at": first_window[1],
+                "phase_aligned": phase_aligned,
+                "boundary_trading_day_gap": all_dates.index(split_day)
+                - all_dates.index(pd.Timestamp(first_window[1])),
+                "daily_equity_max_diff": daily_equity_diff,
+                "daily_cash_max_diff": daily_cash_diff,
+                "daily_mv_max_diff": daily_mv_diff,
                 "single_cash": single_sig["cash"],
                 "split_cash": resumed_sig["cash"],
                 "cash_match": abs(single_sig["cash"] - resumed_sig["cash"]) < 1e-9,
@@ -664,6 +743,7 @@ def main() -> None:
                 "trades_match": bool(same_trades),
                 "single_receivable_count": len(single_sig["receivables"]),
                 "split_receivable_count": len(resumed_sig["receivables"]),
+                "scope": "distribution_accounting_continuity",
             }
         )
 
@@ -935,6 +1015,7 @@ def main() -> None:
                 "lifecycle_match",
                 "equity_match",
                 "trades_match",
+                "phase_aligned",
             ]
         ].all(axis=1),
         "scenario",
@@ -943,6 +1024,10 @@ def main() -> None:
         failed.append(f"reconciliation:{recon_failed}")
     if continuity_failed:
         failed.append(f"continuity:{continuity_failed}")
+    if continuity["daily_equity_max_diff"].max() > 1e-6 or continuity[
+        "daily_cash_max_diff"
+    ].max() > 1e-6 or continuity["daily_mv_max_diff"].max() > 1e-6:
+        failed.append("continuity_daily_mismatch")
     if not preflight_blocked:
         failed.append("strict_preflight_not_blocked")
     if not frozen.get("matches_reported_precision"):

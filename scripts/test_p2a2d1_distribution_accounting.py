@@ -301,6 +301,7 @@ def check_restore_validation() -> None:
         "corporate_action_states": {
             "091170": HoldingState("091170", 1000, __import__("decimal").Decimal("16000000"))
         },
+        "strict_action_blockers": (),
         "research_only": True,
         "corporate_action_ledger_sha256": "a" * 64,
     }
@@ -358,6 +359,79 @@ def check_restore_validation() -> None:
             raise AssertionError(f"잘못된 상태가 통과했습니다: {needle}")
 
 
+def check_required_state_fields() -> None:
+    event = _event()
+    ledger = _fake_ledger(events=[event], sha="a" * 64)
+    base = {
+        "cash": 0.0,
+        "holdings": {"091170": 1000},
+        "pending_receivables": (
+            DistributionReceivable("P2A2B-091170-2026-08-31", "091170", 1000, 59000, date(2026, 9, 2), False),
+        ),
+        "processed_action_ids": ("P2A2B-091170-2026-08-31",),
+        "corporate_action_states": {
+            "091170": HoldingState("091170", 1000, __import__("decimal").Decimal("16000000"))
+        },
+        "strict_action_blockers": (),
+        "research_only": True,
+        "corporate_action_ledger_sha256": "a" * 64,
+    }
+    acc._validate_research_state(base, ledger, base["holdings"])
+
+    for missing in (
+        "pending_receivables",
+        "processed_action_ids",
+        "corporate_action_states",
+        "strict_action_blockers",
+        "research_only",
+        "corporate_action_ledger_sha256",
+    ):
+        broken = dict(base)
+        broken.pop(missing)
+        try:
+            acc._validate_research_state(broken, ledger, broken["holdings"])
+        except ValueError as exc:
+            assert "필수 필드 누락" in str(exc), (missing, exc)
+        else:
+            raise AssertionError(f"필수 필드 누락이 통과했습니다: {missing}")
+
+    # 최초 실행 상태(cash/holdings만)는 허용한다.
+    acc._validate_research_state(
+        {"cash": 0.0, "holdings": {"091170": 1000}}, ledger, {"091170": 1000}
+    )
+
+    # 타입 위반
+    for broken, needle in [
+        ({**base, "research_only": "false"}, "boolean"),
+        (
+            {
+                **base,
+                "pending_receivables": (
+                    DistributionReceivable("P2A2B-091170-2026-08-31", "091170", 1000, 59000, date(2026, 9, 2), "false"),
+                ),
+            },
+            "paid",
+        ),
+        (
+            {
+                **base,
+                "pending_receivables": (
+                    DistributionReceivable("P2A2B-091170-2026-08-31", "091170", 1000.0, 59000, date(2026, 9, 2), False),
+                ),
+            },
+            "정수",
+        ),
+        ({**base, "holdings": {"091170": 1000.0}}, "정수"),
+        ({**base, "holdings": {"091170": True}}, "정수"),
+    ]:
+        try:
+            acc._validate_research_state(broken, ledger, broken.get("holdings", {}))
+        except (TypeError, ValueError) as exc:
+            assert needle in str(exc), (needle, exc)
+        else:
+            raise AssertionError(f"타입 위반이 통과했습니다: {needle}")
+
+
 def check_lifecycle_consistency() -> None:
     event = CorporateAction(
         event_id="SYNTH-SUSP-1",
@@ -380,6 +454,7 @@ def check_lifecycle_consistency() -> None:
                 LifecycleState.ACTIVE, None,
             )
         },
+        "strict_action_blockers": (),
         "research_only": True,
         "corporate_action_ledger_sha256": "a" * 64,
     }
@@ -440,6 +515,53 @@ def check_serialization_roundtrip() -> None:
     assert acc.state_signature(restored) == acc.state_signature(state)
     assert restored["strict_action_blockers"][0].code == "MISSING_PAYMENT_DATE"
 
+    duplicated = dict(payload)
+    duplicated["corporate_action_states"] = payload["corporate_action_states"] * 2
+    try:
+        acc.deserialize_state(json.loads(json.dumps(duplicated)), ledger)
+    except ValueError as exc:
+        assert "중복" in str(exc)
+    else:
+        raise AssertionError("중복 상태 키가 통과했습니다")
+
+    duplicate_receivables = dict(payload)
+    duplicate_receivables["pending_receivables"] = payload["pending_receivables"] * 2
+    try:
+        acc.deserialize_state(json.loads(json.dumps(duplicate_receivables)), ledger)
+    except ValueError as exc:
+        assert "중복" in str(exc)
+    else:
+        raise AssertionError("중복 미수금이 통과했습니다")
+
+    bad_bool = dict(payload)
+    bad_bool["research_only"] = "false"
+    try:
+        acc.deserialize_state(json.loads(json.dumps(bad_bool)), ledger)
+    except TypeError as exc:
+        assert "boolean" in str(exc)
+    else:
+        raise AssertionError("문자열 research_only가 통과했습니다")
+
+    for missing_key in ("pending_receivables", "strict_action_blockers"):
+        broken_payload = dict(payload)
+        broken_payload.pop(missing_key)
+        try:
+            acc.deserialize_state(json.loads(json.dumps(broken_payload)), ledger)
+        except ValueError as exc:
+            assert "필수 필드" in str(exc), (missing_key, exc)
+        else:
+            raise AssertionError(f"필수 필드 누락이 통과했습니다: {missing_key}")
+
+    for bad_quantity in (1000.0, True):
+        bad_holdings = dict(payload)
+        bad_holdings["holdings"] = {"091170": bad_quantity}
+        try:
+            acc.deserialize_state(json.loads(json.dumps(bad_holdings)), ledger)
+        except TypeError as exc:
+            assert "정수" in str(exc)
+        else:
+            raise AssertionError(f"보유수량 타입 위반이 통과했습니다: {bad_quantity}")
+
     other = _fake_ledger(events=[event], sha="c" * 64)
     try:
         acc.deserialize_state(payload, other)
@@ -464,6 +586,7 @@ def main() -> None:
         ("partial seam whitelist", check_partial_seam_whitelist),
         ("research state gate", check_research_state_gate),
         ("restore validation", check_restore_validation),
+        ("required state fields", check_required_state_fields),
         ("lifecycle consistency", check_lifecycle_consistency),
         ("serialization roundtrip", check_serialization_roundtrip),
         ("frozen expectations", check_frozen_expectations),

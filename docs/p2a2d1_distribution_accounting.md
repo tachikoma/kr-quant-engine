@@ -74,6 +74,13 @@
 - 지급 전 분할에서 미수금이 유지되어 다음 구간에서 지급되었다.
 - **lifecycle 복원**: 합성 `SUSPENSION_START` fixture로 분할 실행 후 상태가 `SUSPENDED`로
   유지되는지 확인했다(복원 순서 결함 수정).
+- **경계·위상**: 분할 지점을 20거래일 리밸런싱 위상에 맞춰 잘라 `phase_aligned=True`,
+  거래일 경계 간격 1을 확인했다. 분할 후 구간의 일별 equity/cash/mv를 단일 실행과 비교해
+  **최대 차이 0.0**이다.
+- **범위**: 이 연속성 검증은 분배금 회계(현금·미수금·보유·lifecycle·일별 평가액)에 대한
+  것이며, 주문 대기·부분체결·전역 리밸런싱 인덱스까지 포함한 일반 거래 상태 재시작 검증은
+  아니다. 엔진은 전역 리밸런싱 인덱스를 상태에 저장하지 않으므로, 위상이 어긋난 분할은
+  리밸런싱 일정이 달라질 수 있다.
 - **직렬화**: 상태를 JSON으로 직렬화·역직렬화해 전달한다(메모리 객체 전달 아님). 복원 시
   ledger SHA·processed id·미수금 이벤트 유형/수량×단가/지급일/중복·보유수량·lifecycle
   이력을 검증하고 불일치는 fail-closed.
@@ -119,21 +126,26 @@ P0-B 기준 실행(`--phases cost`, 동결 설정 cap 0.85·spread 2bp, `ohlcv_c
 
 ## 9. 테스트·리뷰
 
-- `scripts/test_p2a2d1_distribution_accounting.py` 11개 PASS: 보유 타임라인, 독립 미수금
+- `scripts/test_p2a2d1_distribution_accounting.py` 12개 PASS: 보유 타임라인, 독립 미수금
   (배당락일 매수 제외·매도 포함·지급 제거), 상태 시그니처(lifecycle 포함), 연구 seam guard,
-  빈 거래일 연구 보고서 BLOCKED, lifecycle 일관성, 기대값 상수.
+  빈 거래일 연구 보고서 BLOCKED, 필수 상태 필드/타입, lifecycle 일관성, 기대값 상수.
 - `scripts/test_p2a2b_corporate_actions.py` PASS(후속 보완 포함).
 - 회귀 PASS: corporate_actions, approval_outputs, backtest_integrity, total_return, pit_universe,
   p2a2a fixtures, p2a1 fixture.
-- Codex 독립 리뷰 5회: P1 5건(lifecycle 복원 소실, seam의 APPROVED 반환, 미수금 금액·지급일
-  미대조, 중복 미수금, lifecycle 불일치)과 P2 5건(독립 현금·평가 재구성, 실패 종료,
-  미수금 차단 시나리오, CLI 전달, 빈 거래일 보고서) → 전부 수정 후
+- Codex 독립 리뷰 7회: P1 6건(lifecycle 복원 소실, seam의 APPROVED 반환, 미수금 금액·지급일
+  미대조, 중복 미수금, lifecycle 불일치, 필수 필드 누락 허용)과 P2 6건(독립 현금·평가 재구성,
+  실패 종료, 미수금 차단 시나리오, CLI 전달, 빈 거래일 보고서, 수량 타입 우회) → 전부 수정 후
   **최종 APPROVE(P0/P1/P2 없음)**.
 
 ## 10. 한계
 
 - 실데이터 E2E는 091170·498400의 2026년 이벤트에 한정(전체 74건 전 기간 실행 아님).
 - 배당락일은 파생값이며 세전 회계만 검증했다.
+- 필수 필드: 재시작 상태는 `pending_receivables`·`processed_action_ids`·
+  `corporate_action_states`·`strict_action_blockers`·`research_only`·ledger SHA를 모두
+  가져야 하며, 일부만 있으면 복원을 거부한다. 최초 실행 상태(cash/holdings만)와 구분한다.
+- 타입: `research_only`/`paid`는 실제 boolean만, 수량은 실제 정수만 허용한다("false" 문자열,
+  실수·bool 수량 거부). JSON 복원의 중복 상태 키·중복 미수금/processed id도 거부한다.
 - 행 단위 대조는 legacy 예산 설정(cap 0.85, spread 2bp)에서 수행했으며, P0-B의
   `ohlcv_capacity` 기준선 자체의 거래 원장 diff는 저장된 원장이 없어 수행하지 않았다.
 - 브로커 정산·실계좌 연계는 범위 밖이다.

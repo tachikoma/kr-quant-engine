@@ -1142,19 +1142,31 @@ def _validate_research_state(
 ) -> None:
     """복원 상태가 같은 ledger·보유·이벤트를 가리키는지 fail-closed로 검증한다."""
     events = {event.event_id: event for event in ledger.events}
-    strict_keys = (
+    required_keys = (
         "pending_receivables",
         "processed_action_ids",
         "corporate_action_states",
         "strict_action_blockers",
         "research_only",
+        "corporate_action_ledger_sha256",
     )
-    if any(key in state for key in strict_keys):
-        state_sha = state.get("corporate_action_ledger_sha256")
-        if not state_sha:
-            raise ValueError("기업행위 상태에 ledger 식별 정보가 없습니다")
-        if str(state_sha) != str(ledger.ledger_sha256):
-            raise ValueError("다른 ledger의 기업행위 상태는 복원할 수 없습니다")
+    present = [key for key in required_keys if key in state]
+    if present and len(present) != len(required_keys):
+        missing = sorted(set(required_keys) - set(present))
+        raise ValueError(f"재시작 상태 필수 필드 누락: {missing}")
+    if not present:
+        # 최초 실행용 상태(cash/holdings만)는 기업행위 상태가 아니다.
+        return
+    if type(state.get("research_only")) is not bool:
+        raise TypeError("research_only는 boolean이어야 합니다")
+    state_sha = state.get("corporate_action_ledger_sha256")
+    if not state_sha:
+        raise ValueError("기업행위 상태에 ledger 식별 정보가 없습니다")
+    if str(state_sha) != str(ledger.ledger_sha256):
+        raise ValueError("다른 ledger의 기업행위 상태는 복원할 수 없습니다")
+    for ticker, quantity in dict(holdings).items():
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise TypeError(f"보유수량이 정수가 아닙니다: {ticker}={quantity!r}")
     processed = {str(event_id) for event_id in state.get("processed_action_ids", ())}
     unknown = sorted(processed - set(events))
     if unknown:
@@ -1173,7 +1185,13 @@ def _validate_research_state(
             raise ValueError("미수금 이벤트 유형이 CASH_DISTRIBUTION이 아닙니다")
         if event.ticker != receivable.ticker:
             raise ValueError("미수금과 ledger 이벤트의 ticker가 다릅니다")
-        if int(receivable.quantity) <= 0:
+        if isinstance(receivable.quantity, bool) or not isinstance(
+            receivable.quantity, int
+        ):
+            raise TypeError("미수금 수량이 정수가 아닙니다")
+        if type(receivable.paid) is not bool:
+            raise TypeError("미수금 paid는 boolean이어야 합니다")
+        if receivable.quantity <= 0:
             raise ValueError("미수금 수량이 0 이하입니다")
         if receivable.payment_date is None or receivable.payment_date != event.payment_date:
             raise ValueError("미수금 지급일이 ledger와 다릅니다")
@@ -1207,7 +1225,10 @@ def _validate_research_state(
         EventType.REDEMPTION: LifecycleState.SETTLED,
     }
     for ticker, item in states.items():
-        if int(getattr(item, "quantity", 0)) != int(holdings.get(ticker, 0)):
+        state_quantity = getattr(item, "quantity", 0)
+        if isinstance(state_quantity, bool) or not isinstance(state_quantity, int):
+            raise TypeError(f"기업행위 상태 수량이 정수가 아닙니다: {ticker}")
+        if state_quantity != int(holdings.get(ticker, 0)):
             raise ValueError(f"보유수량과 기업행위 상태가 다릅니다: {ticker}")
         if getattr(item, "lifecycle", None) is None:
             raise ValueError(f"lifecycle이 없는 기업행위 상태: {ticker}")
