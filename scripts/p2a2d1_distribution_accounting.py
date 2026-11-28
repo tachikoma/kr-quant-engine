@@ -31,7 +31,11 @@ from etf_corporate_actions import (
     canonical_ledger_sha256,
     load_corporate_action_ledger,
 )
-from run_etf_backtest import load_etf_price, run_etf_strategy
+from run_etf_backtest import (
+    _validate_research_state,
+    load_etf_price,
+    run_etf_strategy,
+)
 
 OUTPUT_DIR = ROOT / "outputs_p2a2d1"
 LEDGER_COLUMNS = [
@@ -345,6 +349,133 @@ def reconcile(
     }
 
 
+def serialize_state(state: dict[str, Any]) -> dict[str, Any]:
+    """연구 상태를 JSON 안전 dict로 직렬화한다(범용 저장 시스템 아님)."""
+    return {
+        "cash": float(state.get("cash", 0.0)),
+        "holdings": {str(k): int(v) for k, v in dict(state.get("holdings", {})).items()},
+        "holding_cost_basis": {
+            str(k): str(v) for k, v in dict(state.get("holding_cost_basis", {})).items()
+        },
+        "holding_peak_closes": {
+            str(k): float(v) for k, v in dict(state.get("holding_peak_closes", {})).items()
+        },
+        "portfolio_peak_equity": state.get("portfolio_peak_equity"),
+        "last_valid_closes": {
+            str(k): float(v) for k, v in dict(state.get("last_valid_closes", {})).items()
+        },
+        "rebalance_phase_offset": int(state.get("rebalance_phase_offset", 0)),
+        "exit_phase_offset": int(state.get("exit_phase_offset", 0)),
+        "pending_daily_risk_off_exits": dict(state.get("pending_daily_risk_off_exits", {}) or {}),
+        "pending_receivables": [
+            {
+                "event_id": item.event_id,
+                "ticker": item.ticker,
+                "quantity": int(item.quantity),
+                "amount": str(item.amount),
+                "payment_date": item.payment_date.isoformat(),
+                "paid": bool(item.paid),
+            }
+            for item in state.get("pending_receivables", ())
+        ],
+        "processed_action_ids": sorted(str(x) for x in state.get("processed_action_ids", ())),
+        "corporate_action_states": [
+            {
+                "ticker": item.ticker,
+                "quantity": int(item.quantity),
+                "total_cost_basis": str(item.total_cost_basis),
+                "lifecycle": item.lifecycle.value,
+                "last_event_date": item.last_event_date.isoformat()
+                if item.last_event_date
+                else None,
+            }
+            for item in dict(state.get("corporate_action_states", {})).values()
+        ],
+        "strict_action_blockers": [
+            {
+                "code": item.code,
+                "message": item.message,
+                "event_id": item.event_id,
+                "ticker": item.ticker,
+                "event_date": item.event_date.isoformat() if item.event_date else None,
+            }
+            for item in state.get("strict_action_blockers", ())
+        ],
+        "research_only": bool(state.get("research_only")),
+        "corporate_action_ledger_sha256": state.get("corporate_action_ledger_sha256"),
+        "final_equity": float(state.get("final_equity", 0.0) or 0.0),
+    }
+
+
+def deserialize_state(payload: dict[str, Any], ledger: Any) -> dict[str, Any]:
+    """직렬화된 연구 상태를 복원하고 같은 ledger인지 fail-closed로 검증한다."""
+    from decimal import Decimal
+
+    from etf_corporate_actions import (
+        ApprovalBlocker,
+        DistributionReceivable,
+        HoldingState,
+        LifecycleState,
+    )
+
+    state = {
+        "cash": float(payload["cash"]),
+        "holdings": {str(k): int(v) for k, v in payload["holdings"].items()},
+        "holding_cost_basis": {
+            str(k): float(v) for k, v in payload["holding_cost_basis"].items()
+        },
+        "holding_peak_closes": {
+            str(k): float(v) for k, v in payload["holding_peak_closes"].items()
+        },
+        "portfolio_peak_equity": payload.get("portfolio_peak_equity"),
+        "last_valid_closes": {
+            str(k): float(v) for k, v in payload["last_valid_closes"].items()
+        },
+        "rebalance_phase_offset": int(payload.get("rebalance_phase_offset", 0)),
+        "exit_phase_offset": int(payload.get("exit_phase_offset", 0)),
+        "pending_daily_risk_off_exits": dict(payload.get("pending_daily_risk_off_exits", {})),
+        "pending_receivables": tuple(
+            DistributionReceivable(
+                item["event_id"],
+                item["ticker"],
+                int(item["quantity"]),
+                Decimal(str(item["amount"])),
+                date.fromisoformat(item["payment_date"]),
+                bool(item["paid"]),
+            )
+            for item in payload.get("pending_receivables", ())
+        ),
+        "processed_action_ids": tuple(payload.get("processed_action_ids", ())),
+        "corporate_action_states": {
+            item["ticker"]: HoldingState(
+                item["ticker"],
+                int(item["quantity"]),
+                Decimal(str(item["total_cost_basis"])),
+                LifecycleState(item["lifecycle"]),
+                date.fromisoformat(item["last_event_date"])
+                if item.get("last_event_date")
+                else None,
+            )
+            for item in payload.get("corporate_action_states", ())
+        },
+        "strict_action_blockers": tuple(
+            ApprovalBlocker(
+                item["code"],
+                item["message"],
+                item.get("event_id"),
+                item.get("ticker"),
+                date.fromisoformat(item["event_date"]) if item.get("event_date") else None,
+            )
+            for item in payload.get("strict_action_blockers", ())
+        ),
+        "research_only": bool(payload.get("research_only")),
+        "corporate_action_ledger_sha256": payload.get("corporate_action_ledger_sha256"),
+        "final_equity": float(payload.get("final_equity", 0.0) or 0.0),
+    }
+    _validate_research_state(state, ledger, state["holdings"])
+    return state
+
+
 def state_signature(state: dict[str, Any]) -> dict[str, Any]:
     receivables = [
         (item.event_id, item.ticker, int(item.quantity), float(item.amount), str(item.payment_date), item.paid)
@@ -492,17 +623,8 @@ def main() -> None:
         )
         restored = part_a["final"]
         # part_a 상태에서 재시작한다(엔진 initial_state 경로).
-        init_state = {
-            "cash": float(restored["cash"]),
-            "holdings": dict(restored["holdings"]),
-            "holding_cost_basis": dict(restored["holding_cost_basis"]),
-            "holding_peak_closes": dict(restored["holding_peak_closes"]),
-            "portfolio_peak_equity": restored.get("portfolio_peak_equity"),
-            "last_valid_closes": dict(restored["last_valid_closes"]),
-            "pending_receivables": tuple(restored.get("pending_receivables", ())),
-            "processed_action_ids": tuple(restored.get("processed_action_ids", ())),
-            "corporate_action_states": dict(restored.get("corporate_action_states", {})),
-        }
+        payload = json.loads(json.dumps(serialize_state(restored)))
+        init_state = deserialize_state(payload, second_ledger)
         dates_b = [d for d in index_df["date"] if pd.Timestamp(second_window[0]) <= d <= pd.Timestamp(second_window[1])]
         resumed = run_etf_strategy(
             0.0,
@@ -559,17 +681,8 @@ def main() -> None:
         use_market_filter=False,
     )
     susp_restored = susp_a["final"]
-    susp_init = {
-        "cash": float(susp_restored["cash"]),
-        "holdings": dict(susp_restored["holdings"]),
-        "holding_cost_basis": dict(susp_restored["holding_cost_basis"]),
-        "holding_peak_closes": dict(susp_restored["holding_peak_closes"]),
-        "portfolio_peak_equity": susp_restored.get("portfolio_peak_equity"),
-        "last_valid_closes": dict(susp_restored["last_valid_closes"]),
-        "pending_receivables": tuple(susp_restored.get("pending_receivables", ())),
-        "processed_action_ids": tuple(susp_restored.get("processed_action_ids", ())),
-        "corporate_action_states": dict(susp_restored.get("corporate_action_states", {})),
-    }
+    susp_payload = json.loads(json.dumps(serialize_state(susp_restored)))
+    susp_init = deserialize_state(susp_payload, susp_ledger)
     dates_b = [d for d in index_df["date"] if pd.Timestamp("2026-08-27") <= d <= pd.Timestamp("2026-08-28")]
     susp_resumed = run_etf_strategy(
         0.0,
@@ -687,6 +800,53 @@ def main() -> None:
         and preflight.get("status") == "BLOCKED"
         and any(item["code"] == "INCOMPLETE_COVERAGE" for item in preflight.get("blockers", []))
     )
+    baseline_dir = OUTPUT_DIR / "baseline_compare"
+    baseline = {"status": "not_available"}
+    if all(
+        (baseline_dir / name).exists()
+        for name in ("baseline_equity.csv", "pr_equity.csv", "baseline_trades.csv", "pr_trades.csv")
+    ):
+        base_eq = pd.read_csv(baseline_dir / "baseline_equity.csv")
+        pr_eq = pd.read_csv(baseline_dir / "pr_equity.csv")
+        base_tr = pd.read_csv(baseline_dir / "baseline_trades.csv")
+        pr_tr = pd.read_csv(baseline_dir / "pr_trades.csv")
+        columns = ["equity_strategy", "cash", "market_value", "distribution_cash"]
+        equity_diff = (
+            max(float((base_eq[col] - pr_eq[col]).abs().max()) for col in columns)
+            if base_eq["date"].equals(pr_eq["date"])
+            else float("inf")
+        )
+        merged = base_tr.merge(
+            pr_tr,
+            on=["date", "ticker", "side", "qty"],
+            suffixes=("_b", "_p"),
+            how="outer",
+            indicator=True,
+        )
+        trade_row_match = bool((merged["_merge"] == "both").all())
+        trade_diff = (
+            max(
+                float((merged[f"{col}_b"] - merged[f"{col}_p"]).abs().max())
+                for col in ("price", "net_value", "cash_flow")
+            )
+            if trade_row_match
+            else float("inf")
+        )
+        baseline = {
+            "status": "ok",
+            "equity_rows": len(base_eq),
+            "trade_rows": len(base_tr),
+            "date_axis_match": bool(base_eq["date"].equals(pr_eq["date"])),
+            "equity_max_abs_diff": equity_diff,
+            "trade_rows_match": trade_row_match,
+            "trade_max_abs_diff": trade_diff,
+            "holdings_match": bool(
+                base_eq["holdings"].fillna("").equals(pr_eq["holdings"].fillna(""))
+            ),
+            "row_by_row_match": bool(
+                equity_diff == 0.0 and trade_diff == 0.0 and trade_row_match
+            ),
+        }
     frozen_summary = OUTPUT_DIR / "frozen_baseline" / "p0b_summary.json"
     frozen = {"status": "not_run"}
     if frozen_summary.exists():
@@ -726,6 +886,7 @@ def main() -> None:
         },
         "continuity": continuity.to_dict(orient="records"),
         "frozen_baseline": frozen,
+        "baseline_row_comparison": baseline,
         "limits": [
             "배당락일은 파생값이며 세전 회계만 검증",
             "실데이터 E2E는 091170/498400 두 종목의 2026년 이벤트에 한정",
@@ -786,6 +947,8 @@ def main() -> None:
         failed.append("strict_preflight_not_blocked")
     if not frozen.get("matches_reported_precision"):
         failed.append("frozen_baseline_mismatch")
+    if baseline.get("status") == "ok" and not baseline.get("row_by_row_match"):
+        failed.append("baseline_row_mismatch")
     print(
         f"[p2a2d1] 완료: {OUTPUT_DIR} checks={len(checks)-len(failed)}/{len(checks)} "
         f"continuity={int(continuity[['cash_match','holdings_match','receivables_match','processed_ids_match','equity_match','trades_match']].all(axis=1).sum())}/{len(continuity)} "

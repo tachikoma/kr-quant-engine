@@ -2,10 +2,11 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -1130,6 +1131,96 @@ def load_etf_price(ticker_universe: Sequence[str] | None = None) -> pd.DataFrame
 
 
 
+# 연구 seam(allow_partial_ledger)이 허용하는 blocker는 coverage 부족뿐이다.
+PARTIAL_LEDGER_ALLOWED_BLOCKERS = frozenset({"INCOMPLETE_COVERAGE"})
+
+
+def _validate_research_state(
+    state: Mapping[str, Any],
+    ledger: CorporateActionLedger,
+    holdings: Mapping[str, int],
+) -> None:
+    """복원 상태가 같은 ledger·보유·이벤트를 가리키는지 fail-closed로 검증한다."""
+    events = {event.event_id: event for event in ledger.events}
+    strict_keys = (
+        "pending_receivables",
+        "processed_action_ids",
+        "corporate_action_states",
+        "strict_action_blockers",
+        "research_only",
+    )
+    if any(key in state for key in strict_keys):
+        state_sha = state.get("corporate_action_ledger_sha256")
+        if not state_sha:
+            raise ValueError("기업행위 상태에 ledger 식별 정보가 없습니다")
+        if str(state_sha) != str(ledger.ledger_sha256):
+            raise ValueError("다른 ledger의 기업행위 상태는 복원할 수 없습니다")
+    processed = {str(event_id) for event_id in state.get("processed_action_ids", ())}
+    unknown = sorted(processed - set(events))
+    if unknown:
+        raise ValueError(f"ledger에 없는 처리 완료 이벤트 ID: {unknown[:5]}")
+    seen_receivables: set[str] = set()
+    for receivable in state.get("pending_receivables", ()):
+        event = events.get(receivable.event_id)
+        if event is None:
+            raise ValueError(f"ledger에 없는 미수금 이벤트: {receivable.event_id}")
+        if receivable.event_id in seen_receivables:
+            raise ValueError(f"중복 미수금 이벤트: {receivable.event_id}")
+        seen_receivables.add(receivable.event_id)
+        if receivable.event_id not in processed:
+            raise ValueError(f"처리 완료로 기록되지 않은 미수금: {receivable.event_id}")
+        if event.event_type != EventType.CASH_DISTRIBUTION:
+            raise ValueError("미수금 이벤트 유형이 CASH_DISTRIBUTION이 아닙니다")
+        if event.ticker != receivable.ticker:
+            raise ValueError("미수금과 ledger 이벤트의 ticker가 다릅니다")
+        if int(receivable.quantity) <= 0:
+            raise ValueError("미수금 수량이 0 이하입니다")
+        if receivable.payment_date is None or receivable.payment_date != event.payment_date:
+            raise ValueError("미수금 지급일이 ledger와 다릅니다")
+        amount = float(receivable.amount)
+        expected_amount = Decimal(str(event.cash_amount)) * int(receivable.quantity)
+        if not math.isfinite(amount) or Decimal(str(receivable.amount)) != expected_amount:
+            raise ValueError("미수금 금액이 ledger 수량×단가와 다릅니다")
+    states = dict(state.get("corporate_action_states", {}) or {})
+    lifecycle_events = [
+        event
+        for event in events.values()
+        if event.event_id in processed
+        and event.event_type
+        in {
+            EventType.SUSPENSION_START,
+            EventType.SUSPENSION_END,
+            EventType.DELISTING,
+            EventType.CASH_SETTLEMENT,
+            EventType.REDEMPTION,
+        }
+    ]
+    lifecycle_tickers = {event.ticker for event in lifecycle_events}
+    for ticker in sorted(lifecycle_tickers):
+        if ticker not in states:
+            raise ValueError(f"lifecycle 이벤트가 있는데 상태가 없습니다: {ticker}")
+    lifecycle_map = {
+        EventType.SUSPENSION_START: LifecycleState.SUSPENDED,
+        EventType.SUSPENSION_END: LifecycleState.ACTIVE,
+        EventType.DELISTING: LifecycleState.DELISTED_UNSETTLED,
+        EventType.CASH_SETTLEMENT: LifecycleState.SETTLED,
+        EventType.REDEMPTION: LifecycleState.SETTLED,
+    }
+    for ticker, item in states.items():
+        if int(getattr(item, "quantity", 0)) != int(holdings.get(ticker, 0)):
+            raise ValueError(f"보유수량과 기업행위 상태가 다릅니다: {ticker}")
+        if getattr(item, "lifecycle", None) is None:
+            raise ValueError(f"lifecycle이 없는 기업행위 상태: {ticker}")
+        expected = LifecycleState.ACTIVE
+        for event in sorted(
+            (event for event in lifecycle_events if event.ticker == ticker),
+            key=lambda event: (event.event_date, event.event_id),
+        ):
+            expected = lifecycle_map[event.event_type]
+        if item.lifecycle != expected:
+            raise ValueError(f"lifecycle이 이벤트 이력과 다릅니다: {ticker}")
+
+
 @_restore_ticker_groups_on_exit
 def run_etf_strategy(
     initial_cash: float,
@@ -1236,10 +1327,44 @@ def run_etf_strategy(
         raise ValueError(
             "allow_partial_ledger는 approval_strict와 corporate_action_ledger가 함께 있어야 합니다."
         )
+    if initial_state and initial_state.get("research_only") and not allow_partial_ledger:
+        raise ValueError(
+            "research_only 상태는 allow_partial_ledger 연구 실행에서만 복원할 수 있습니다"
+        )
+    if initial_state and not approval_strict:
+        leaked = [
+            key
+            for key in (
+                "pending_receivables",
+                "processed_action_ids",
+                "corporate_action_states",
+                "strict_action_blockers",
+                "research_only",
+                "corporate_action_ledger_sha256",
+            )
+            if key in initial_state
+        ]
+        if leaked:
+            raise ValueError(
+                f"strict 기업행위 상태는 비승인 실행에 전달할 수 없습니다: {leaked}"
+            )
+    if initial_state and approval_strict and corporate_action_ledger is not None:
+        _validate_research_state(
+            initial_state, corporate_action_ledger, initial_state.get("holdings", {})
+        )
     if approval_strict and corporate_action_ledger is not None:
         ledger_report = corporate_action_ledger.approval_report()
-        if not ledger_report.approval_valid and not allow_partial_ledger:
-            raise CorporateActionBlocked(ledger_report.blockers[0])
+        if not ledger_report.approval_valid:
+            if not allow_partial_ledger:
+                raise CorporateActionBlocked(ledger_report.blockers[0])
+            # 연구 seam은 coverage 부족만 허용한다. 구조적/lifecycle 실패는 차단한다.
+            disallowed = [
+                blocker
+                for blocker in ledger_report.blockers
+                if blocker.code not in PARTIAL_LEDGER_ALLOWED_BLOCKERS
+            ]
+            if disallowed:
+                raise CorporateActionBlocked(disallowed[0])
     ensure_no_current_prefix_columns(price_data, context="run_etf_strategy(price_data)")
     if universe_tickers is None:
         ensure_universe_initialized()
@@ -1332,6 +1457,13 @@ def run_etf_strategy(
         processed_action_ids.update(
             str(event_id) for event_id in initial_state.get("processed_action_ids", ())
         )
+        restored_blockers = tuple(initial_state.get("strict_action_blockers", ()))
+        for item in restored_blockers:
+            if not isinstance(item, ApprovalBlocker):
+                raise TypeError(
+                    "initial_state.strict_action_blockers 항목이 ApprovalBlocker가 아닙니다"
+                )
+        strict_action_blockers.extend(restored_blockers)
     historical_holdings: dict[pd.Timestamp, dict[str, int]] = {}
     if approval_strict:
         strict_states = {
@@ -2710,6 +2842,7 @@ def run_etf_strategy(
         empty_blockers = [
             ApprovalBlocker("EMPTY_STRATEGY_CALENDAR", "strategy common_dates is empty")
         ]
+        empty_blockers.extend(strict_action_blockers)
         if allow_partial_ledger:
             empty_blockers.append(
                 ApprovalBlocker(
@@ -2725,8 +2858,8 @@ def run_etf_strategy(
         final_report = ApprovalReport(
             "BLOCKED",
             tuple(empty_blockers),
-            base_report.event_count if base_report is not None else 0,
-            base_report.ledger_sha256 if base_report is not None else "",
+            getattr(base_report, "event_count", 0) if base_report is not None else 0,
+            getattr(base_report, "ledger_sha256", "") if base_report is not None else "",
         )
 
     if execution_mode == "ohlcv_capacity" and common_dates:
@@ -2766,6 +2899,12 @@ def run_etf_strategy(
                     "processed_action_ids": tuple(sorted(processed_action_ids)),
                     "approval_report": final_report,
                     "research_only": bool(allow_partial_ledger),
+                    "corporate_action_ledger_sha256": (
+                        corporate_action_ledger.ledger_sha256
+                        if corporate_action_ledger is not None
+                        else None
+                    ),
+                    "strict_action_blockers": tuple(strict_action_blockers),
                     "approval_stale_tickers": sorted(final_stale_tickers),
                     "blocked_orders": blocked_orders,
                 }
